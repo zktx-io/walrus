@@ -1,45 +1,59 @@
 //! Core functionality for Walrus.
 pub mod merkle;
 
-use fastcrypto::bls12381::min_pk::BLS12381Signature;
+use encoding::{PrimarySliver, SecondarySliver};
 use serde::{Deserialize, Serialize};
+
+pub mod messages;
 
 /// Erasure encoding and decoding.
 pub mod encoding;
 
 /// The epoch number.
 pub type Epoch = u64;
-
 /// The ID of a blob.
 pub type BlobId = [u8; 32];
-
 /// Represents the index of a shard.
 pub type ShardIndex = u32;
 
-/// Confirmation from a storage node that it has stored the sliver pairs for a given blob.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum StorageConfirmation {
-    /// Confirmation based on the storage node's signature.
-    Signed(SignedConfirmation),
+/// A sliver of an erasure-encoded blob.
+///
+/// Can be either a [`PrimarySliver`] or [`SecondarySliver`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sliver {
+    /// A primary sliver.
+    Primary(PrimarySliver),
+    /// A secondary sliver.
+    Secondary(SecondarySliver),
 }
 
-/// A signed [`Confirmation`] from a storage node.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SignedConfirmation {
-    /// The blob and shards associated with this confirmation.
-    pub confirmation: Confirmation,
-    /// The signature over the BCS encoded confirmation.
-    pub signature: BLS12381Signature,
+impl Sliver {
+    /// Returns true iff this sliver is a [`Sliver::Primary`].
+    #[inline]
+    pub fn is_primary(&self) -> bool {
+        matches!(self, Sliver::Primary(_))
+    }
+
+    /// Returns true iff this sliver is a [`Sliver::Secondary`].
+    #[inline]
+    pub fn is_secondary(&self) -> bool {
+        matches!(self, Sliver::Secondary(_))
+    }
+
+    /// Returns the associated [`SliverType`] of this sliver.
+    pub fn r#type(&self) -> SliverType {
+        match self {
+            Sliver::Primary(_) => SliverType::Primary,
+            Sliver::Secondary(_) => SliverType::Secondary,
+        }
+    }
 }
 
-/// A list of shards, confirmed as storing their sliver pairs for the given blob_id, as of the
-/// specified epoch.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Confirmation {
-    /// The ID of the Blob whose sliver pairs are confirmed as being stored.
-    pub blob_id: BlobId,
-    /// The epoch in which this confirmation is generated.
-    pub epoch: Epoch,
-    /// The shards that are confirmed to be storing their slivers.
-    pub shards: Vec<ShardIndex>,
+/// A type indicating either a primary or secondary sliver.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SliverType {
+    /// Enum indicating a primary sliver.
+    Primary,
+    /// Enum indicating a secondary sliver.
+    Secondary,
 }
