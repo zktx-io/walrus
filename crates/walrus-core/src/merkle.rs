@@ -8,7 +8,8 @@ use fastcrypto::hash::{Blake2b256, Digest, HashFunction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const DIGEST_LEN: usize = 32;
+/// The length of the digests used in the merkle tree.
+pub const DIGEST_LEN: usize = 32;
 
 const LEAF_PREFIX: [u8; 1] = [0];
 const INNER_PREFIX: [u8; 1] = [1];
@@ -47,6 +48,15 @@ impl From<Digest<DIGEST_LEN>> for Node {
 impl From<[u8; DIGEST_LEN]> for Node {
     fn from(value: [u8; DIGEST_LEN]) -> Self {
         Self::Digest(value)
+    }
+}
+
+impl AsRef<[u8]> for Node {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Node::Empty => EMPTY_NODE.as_ref(),
+            Node::Digest(val) => val.as_ref(),
+        }
     }
 }
 
@@ -119,34 +129,48 @@ impl<T> MerkleTree<T>
 where
     T: HashFunction<DIGEST_LEN>,
 {
-    /// Create the [`MerkleTree`] as a commitment to the data vector `data`.
-    pub fn build(data: &[&[u8]]) -> MerkleTree<T> {
-        let n_leaves = data.len();
-        let mut nodes = Vec::with_capacity(n_nodes(n_leaves));
-        let mut lvl_nodes = n_leaves;
-        for leaf in data {
-            // Hash each leaf prefixed with `LEAF_PREFIX` and insert the hash into `nodes`
-            nodes.push(leaf_hash::<T>(leaf));
-        }
-        let mut prev_level_idx = 0;
+    /// Create the [`MerkleTree`] as a commitment to the provided data.
+    pub fn build<I>(iter: I) -> Self
+    where
+        I: IntoIterator,
+        I::IntoIter: ExactSizeIterator,
+        I::Item: AsRef<[u8]>,
+    {
+        let iter = iter.into_iter();
+
+        // Create the capacity that we know will be needed, since the vec will be
+        // reused by the call to from_leaf_nodes.
+        let mut nodes = Vec::with_capacity(n_nodes(iter.len()));
+
+        // Hash each leaf prefixed with `LEAF_PREFIX` and insert the hash into `nodes`
+        nodes.extend(iter.map(|leaf| leaf_hash::<T>(leaf.as_ref())));
+
+        let n_leaves = nodes.len();
+        let mut level_nodes = n_leaves;
+        let mut prev_level_index = 0;
+
         // Fill all other nodes of the Merkle Tree
-        while lvl_nodes > 1 {
-            if lvl_nodes % 2 == 1 {
+        while level_nodes > 1 {
+            if level_nodes % 2 == 1 {
                 // We need an empty sibling for the last node on the previous level
                 nodes.push(Node::Empty);
-                lvl_nodes += 1;
+                level_nodes += 1;
             }
-            let new_level_idx = prev_level_idx + lvl_nodes;
-            (prev_level_idx..new_level_idx)
+
+            let new_level_index = prev_level_index + level_nodes;
+
+            (prev_level_index..new_level_index)
                 .step_by(2)
-                .for_each(|idx| nodes.push(inner_hash::<T>(&nodes[idx], &nodes[idx + 1])));
-            prev_level_idx = new_level_idx;
-            lvl_nodes /= 2;
+                .for_each(|index| nodes.push(inner_hash::<T>(&nodes[index], &nodes[index + 1])));
+
+            prev_level_index = new_level_index;
+            level_nodes /= 2;
         }
-        MerkleTree {
-            _hash_type: PhantomData,
+
+        Self {
             nodes,
             n_leaves,
+            _hash_type: PhantomData,
         }
     }
 
@@ -244,7 +268,7 @@ mod test {
 
     #[test]
     fn test_merkle_tree_empty() {
-        let mt: MerkleTree = MerkleTree::build(&[]);
+        let mt: MerkleTree = MerkleTree::build::<[&[u8]; 0]>([]);
         assert_eq!(mt.root().bytes(), EMPTY_NODE);
     }
 
