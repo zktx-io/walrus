@@ -3,7 +3,13 @@
 
 //! Test utilities shared between various crates.
 
+use fastcrypto::{
+    bls12381::min_pk::BLS12381KeyPair,
+    traits::{KeyPair, Signer},
+};
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tempfile::TempDir;
+use walrus_core::{encoding, messages::SignedStorageConfirmation, BlobId, Sliver};
 
 /// A result type useful in tests, that wraps any error implementation.
 pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -47,7 +53,7 @@ pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 ///     ]
 /// }
 /// fn test_parses(to_parse: &str, expected: i32) -> Result<(), Box<dyn Error>> {
-///     assert_eq!(expected, to_parse.parse()?);
+///     assert_eq!(expected, to_parse.parse::<i32>()?);
 ///     Ok(())
 /// }
 /// ```
@@ -65,7 +71,7 @@ pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 ///     ]
 /// }
 /// fn test_parses(to_parse: &str, expected: i32) -> Result<(), Box<dyn Error>> {
-///     assert_eq!(expected, to_parse.parse()?);
+///     assert_eq!(expected, to_parse.parse::<i32>()?);
 ///     Ok(())
 /// }
 /// ```
@@ -155,6 +161,40 @@ impl<T> AsMut<T> for WithTempDir<T> {
     fn as_mut(&mut self) -> &mut T {
         &mut self.inner
     }
+}
+
+/// A deterministic fixed keypair for testing. Various testing facilities can use this key and
+/// unit-test can re-generate it to verify the correctness of inputs and outputs.
+pub fn test_keypair() -> BLS12381KeyPair {
+    let mut rng = StdRng::seed_from_u64(0);
+    BLS12381KeyPair::generate(&mut rng)
+}
+
+/// Returns an arbitrary sliver for testing.
+pub fn test_sliver() -> Sliver {
+    Sliver::Primary(encoding::Sliver::new_empty(1, 1, 1))
+}
+
+/// An arbitrary storage confirmation for tests.
+pub fn test_signed_storage_confirmation() -> SignedStorageConfirmation {
+    let mut rng = StdRng::seed_from_u64(0);
+    let mut confirmation = vec![0; 32];
+    rng.fill_bytes(&mut confirmation);
+
+    let signer = test_keypair();
+    let signature = signer.sign(&confirmation);
+    SignedStorageConfirmation {
+        confirmation,
+        signature,
+    }
+}
+
+/// An arbitrary blob ID for testing.
+pub fn test_blob_id() -> BlobId {
+    let mut rng = StdRng::seed_from_u64(0);
+    let mut bytes = [0; BlobId::LENGTH];
+    rng.fill_bytes(&mut bytes);
+    BlobId(bytes)
 }
 
 /// Asserts that two sequences that implement [`std::iter::IntoIterator`], and whose items

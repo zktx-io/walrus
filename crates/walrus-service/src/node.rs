@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{num::NonZeroUsize, path::Path, sync::Arc};
+use std::{future::Future, num::NonZeroUsize, path::Path, sync::Arc};
 
 use anyhow::Context;
 use fastcrypto::{bls12381::min_pk::BLS12381PrivateKey, traits::Signer};
@@ -23,6 +23,26 @@ pub enum StoreMetadataError {
     InvalidMetadata(#[from] VerificationError),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+pub trait ServiceState {
+    /// Stores the metadata associated with a blob.
+    fn store_blob_metadata(&self, metadata: BlobMetadataWithId) -> Result<(), StoreMetadataError>;
+
+    /// Store the primary or secondary encoding for a blob for a shard held by this storage node.
+    fn store_sliver(
+        &self,
+        shard: ShardIndex,
+        blob_id: &BlobId,
+        sliver: &Sliver,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Get a signed confirmation over the identifiers of the shards storing their respective
+    /// sliver-pairs for their BlobIds.
+    fn get_storage_confirmation(
+        &self,
+        blob_id: &BlobId,
+    ) -> impl Future<Output = Result<Option<StorageConfirmation>, anyhow::Error>> + Send;
 }
 
 /// A Walrus storage node, responsible for 1 or more shards on Walrus.
@@ -52,12 +72,10 @@ impl StorageNode {
             n_shards: NonZeroUsize::new(100).unwrap(),
         }
     }
+}
 
-    /// Stores the metadata associated with a blob.
-    pub fn store_blob_metadata(
-        &self,
-        metadata: BlobMetadataWithId,
-    ) -> Result<(), StoreMetadataError> {
+impl ServiceState for StorageNode {
+    fn store_blob_metadata(&self, metadata: BlobMetadataWithId) -> Result<(), StoreMetadataError> {
         let verified_metadata = metadata.verify(self.n_shards)?;
 
         self.storage
@@ -67,8 +85,7 @@ impl StorageNode {
         Ok(())
     }
 
-    /// Store the primary or secondary encoding for a blob for a shard held by this storage node.
-    pub fn store_sliver(
+    fn store_sliver(
         &self,
         shard: ShardIndex,
         blob_id: &BlobId,
@@ -84,9 +101,7 @@ impl StorageNode {
             .context("unable to store sliver")
     }
 
-    /// Get a signed confirmation over the identifiers of the shards storing their respective
-    /// sliver-pairs for their BlobIds.
-    pub async fn get_storage_confirmation(
+    async fn get_storage_confirmation(
         &self,
         blob_id: &BlobId,
     ) -> Result<Option<StorageConfirmation>, anyhow::Error> {

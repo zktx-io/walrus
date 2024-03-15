@@ -13,6 +13,8 @@ pub mod merkle;
 pub mod messages;
 pub mod metadata;
 
+pub use messages::SignedStorageConfirmation;
+
 /// The epoch number.
 pub type Epoch = u64;
 
@@ -23,7 +25,7 @@ pub struct BlobId(pub [u8; Self::LENGTH]);
 
 impl BlobId {
     /// The length of a blob ID in bytes.
-    const LENGTH: usize = 32;
+    pub const LENGTH: usize = 32;
 
     /// Returns the blob ID as a hash over the merkle root, encoding type,
     /// and unencoded_length of the blob.

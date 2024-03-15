@@ -11,6 +11,8 @@ pub mod crypto;
 pub mod encoding;
 /// Mapping from sliver pairs to shards.
 pub mod mapping;
+/// Server for the Walrus service.
+pub mod server;
 
 mod node;
 pub use node::StorageNode;
