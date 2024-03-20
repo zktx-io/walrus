@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 
-use crate::{config::StorageNodePrivateParameters, crypto::KeyPair};
+use walrus_core::test_utils;
+
+use crate::config::StorageNodePrivateParameters;
 
 /// Creates a new [`StorageNodePrivateParameters`] object for testing.
 pub fn storage_node_private_parameters() -> StorageNodePrivateParameters {
@@ -14,7 +16,7 @@ pub fn storage_node_private_parameters() -> StorageNodePrivateParameters {
     let metrics_address = metrics_listener.local_addr().unwrap();
 
     StorageNodePrivateParameters {
-        keypair: KeyPair::new(),
+        keypair: test_utils::keypair(),
         network_address,
         metrics_address,
         shards: HashMap::new(),

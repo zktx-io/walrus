@@ -1,12 +1,12 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::get,
     Json,
     Router,
 };
@@ -14,20 +14,22 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use walrus_core::{
     messages::StorageConfirmation,
-    metadata::BlobMetadataWithId,
+    metadata::{BlobMetadata, UnverifiedBlobMetadataWithId},
     BlobId,
-    ShardIndex,
     Sliver,
+    SliverType,
 };
 
-use crate::node::{ServiceState, StoreMetadataError};
+use crate::node::{ServiceState, StoreMetadataError, StoreSliverError};
 
-/// The path to the store metadata endpoint.
-pub const POST_STORE_BLOB_METADATA: &str = "/storage/metadata";
-/// The path to the store sliver endpoint.
-pub const POST_STORE_SLIVER: &str = "/storage/sliver";
-/// The path to the storage confirmation endpoint.
-pub const GET_STORAGE_CONFIRMATION: &str = "/storage/confirmation";
+/// The path to get and store blob metadata.
+pub const METADATA_ENDPOINT: &str = "/v1/blobs/:blobId/metadata";
+/// The path to get and store primary slivers.
+pub const PRIMARY_SLIVER_ENDPOINT: &str = "/v1/blobs/:blobId/slivers/:sliverPairIdx/primary";
+/// The path to get and store secondary slivers.
+pub const SECONDARY_SLIVER_ENDPOINT: &str = "/v1/blobs/:blobId/slivers/:sliverPairIdx/secondary";
+/// The path to get storage confirmations.
+pub const STORAGE_CONFIRMATION_ENDPOINT: &str = "/v1/blobs/:blobId/confirmation";
 
 /// Error message returned by the service.
 #[derive(Serialize, Deserialize)]
@@ -71,17 +73,11 @@ impl<T: Serialize> ServiceResponse<T> {
         };
         (code, Json(response))
     }
-}
 
-/// Represents a storage sliver request.
-#[derive(Serialize, Deserialize)]
-pub struct StoreSliverRequest {
-    /// The shard index.
-    shard: ShardIndex,
-    /// The blob identifier.
-    blob_id: BlobId,
-    /// The sliver to store.
-    sliver: Sliver,
+    /// Creates a new serialized bad request response for 'not found' errors.
+    pub fn serialized_not_found() -> (StatusCode, Json<Self>) {
+        Self::serialized_error(StatusCode::NOT_FOUND, "Not found")
+    }
 }
 
 /// Represents a user server.
@@ -102,11 +98,22 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
     /// Creates a new user server.
     pub async fn run(self, network_address: &SocketAddr) -> Result<(), std::io::Error> {
         let app = Router::new()
-            .route(POST_STORE_BLOB_METADATA, post(Self::store_blob_metadata))
-            .with_state(self.state.clone())
-            .route(POST_STORE_SLIVER, post(Self::store_sliver))
-            .with_state(self.state.clone())
-            .route(GET_STORAGE_CONFIRMATION, get(Self::storage_confirmation))
+            .route(
+                METADATA_ENDPOINT,
+                get(Self::retrieve_metadata).put(Self::store_metadata),
+            )
+            .route(
+                PRIMARY_SLIVER_ENDPOINT,
+                get(Self::retrieve_primary_sliver).put(Self::store_primary_sliver),
+            )
+            .route(
+                SECONDARY_SLIVER_ENDPOINT,
+                get(Self::retrieve_secondary_sliver).put(Self::store_secondary_sliver),
+            )
+            .route(
+                STORAGE_CONFIRMATION_ENDPOINT,
+                get(Self::retrieve_storage_confirmation),
+            )
             .with_state(self.state.clone());
 
         let listener = tokio::net::TcpListener::bind(network_address).await?;
@@ -117,13 +124,55 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
             .await
     }
 
-    async fn store_blob_metadata(
+    async fn retrieve_metadata(
         State(state): State<Arc<S>>,
-        Json(request): Json<BlobMetadataWithId>,
+        Path(encoded_blob_id): Path<String>,
+    ) -> (
+        StatusCode,
+        Json<ServiceResponse<UnverifiedBlobMetadataWithId>>,
+    ) {
+        let Ok(blob_id) = BlobId::from_str(&encoded_blob_id) else {
+            tracing::debug!("Invalid blob ID {encoded_blob_id}");
+            return ServiceResponse::serialized_error(StatusCode::BAD_REQUEST, "Invalid blob ID");
+        };
+
+        match state.retrieve_metadata(&blob_id) {
+            Ok(Some(metadata)) => {
+                tracing::debug!("Retrieved metadata for {blob_id:?}");
+                ServiceResponse::serialized_success(StatusCode::OK, metadata)
+            }
+            Ok(None) => {
+                tracing::debug!("Metadata not found for {blob_id:?}");
+                ServiceResponse::serialized_not_found()
+            }
+            Err(message) => {
+                tracing::error!("Internal server error: {message}");
+                ServiceResponse::serialized_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error",
+                )
+            }
+        }
+    }
+
+    async fn store_metadata(
+        State(state): State<Arc<S>>,
+        Path(encoded_blob_id): Path<String>,
+        Json(metadata): Json<BlobMetadata>,
     ) -> (StatusCode, Json<ServiceResponse<()>>) {
-        match state.store_blob_metadata(request) {
-            Ok(()) => ServiceResponse::serialized_success(StatusCode::OK, ()),
+        let Ok(blob_id) = BlobId::from_str(&encoded_blob_id) else {
+            tracing::debug!("Invalid blob ID {encoded_blob_id}");
+            return ServiceResponse::serialized_error(StatusCode::BAD_REQUEST, "Invalid blob ID");
+        };
+
+        let unverified_metadata_with_id = UnverifiedBlobMetadataWithId::new(blob_id, metadata);
+        match state.store_metadata(unverified_metadata_with_id) {
+            Ok(()) => {
+                tracing::debug!("Stored metadata for {blob_id:?}");
+                ServiceResponse::serialized_success(StatusCode::OK, ())
+            }
             Err(StoreMetadataError::InvalidMetadata(message)) => {
+                tracing::debug!("Received invalid metadata: {message}");
                 ServiceResponse::serialized_error(StatusCode::BAD_REQUEST, message.to_string())
             }
             Err(StoreMetadataError::Internal(message)) => {
@@ -136,12 +185,46 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
         }
     }
 
-    async fn store_sliver(
+    async fn retrieve_primary_sliver(
         State(state): State<Arc<S>>,
-        Json(request): Json<StoreSliverRequest>,
-    ) -> (StatusCode, Json<ServiceResponse<()>>) {
-        match state.store_sliver(request.shard, &request.blob_id, &request.sliver) {
-            Ok(()) => ServiceResponse::serialized_success(StatusCode::OK, ()),
+        Path((encoded_blob_id, sliver_pair_idx)): Path<(String, u16)>,
+    ) -> (StatusCode, Json<ServiceResponse<Sliver>>) {
+        Self::retrieve_sliver(state, encoded_blob_id, sliver_pair_idx, SliverType::Primary).await
+    }
+
+    async fn retrieve_secondary_sliver(
+        State(state): State<Arc<S>>,
+        Path((encoded_blob_id, sliver_pair_idx)): Path<(String, u16)>,
+    ) -> (StatusCode, Json<ServiceResponse<Sliver>>) {
+        Self::retrieve_sliver(
+            state,
+            encoded_blob_id,
+            sliver_pair_idx,
+            SliverType::Secondary,
+        )
+        .await
+    }
+
+    async fn retrieve_sliver(
+        state: Arc<S>,
+        encoded_blob_id: String,
+        sliver_pair_idx: u16,
+        sliver_type: SliverType,
+    ) -> (StatusCode, Json<ServiceResponse<Sliver>>) {
+        let Ok(blob_id) = BlobId::from_str(&encoded_blob_id) else {
+            tracing::debug!("Invalid blob ID {encoded_blob_id}");
+            return ServiceResponse::serialized_error(StatusCode::BAD_REQUEST, "Invalid blob ID");
+        };
+
+        match state.retrieve_sliver(&blob_id, sliver_pair_idx, sliver_type) {
+            Ok(Some(sliver)) => {
+                tracing::debug!("Retrieved {sliver_type:?} sliver for {blob_id:?}");
+                ServiceResponse::serialized_success(StatusCode::OK, sliver)
+            }
+            Ok(None) => {
+                tracing::debug!("{sliver_type:?} sliver not found for {blob_id:?}");
+                ServiceResponse::serialized_not_found()
+            }
             Err(message) => {
                 tracing::error!("Internal server error: {message}");
                 ServiceResponse::serialized_error(
@@ -152,15 +235,92 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
         }
     }
 
-    async fn storage_confirmation(
+    async fn store_primary_sliver(
         State(state): State<Arc<S>>,
-        Json(request): Json<BlobId>,
+        Path((encoded_blob_id, sliver_pair_idx)): Path<(String, u16)>,
+        Json(sliver): Json<Sliver>,
+    ) -> (StatusCode, Json<ServiceResponse<()>>) {
+        Self::store_sliver(
+            state,
+            encoded_blob_id,
+            sliver_pair_idx,
+            sliver,
+            SliverType::Primary,
+        )
+        .await
+    }
+
+    async fn store_secondary_sliver(
+        State(state): State<Arc<S>>,
+        Path((encoded_blob_id, sliver_pair_idx)): Path<(String, u16)>,
+        Json(sliver): Json<Sliver>,
+    ) -> (StatusCode, Json<ServiceResponse<()>>) {
+        Self::store_sliver(
+            state,
+            encoded_blob_id,
+            sliver_pair_idx,
+            sliver,
+            SliverType::Secondary,
+        )
+        .await
+    }
+
+    async fn store_sliver(
+        state: Arc<S>,
+        encoded_blob_id: String,
+        sliver_pair_idx: u16,
+        sliver: Sliver,
+        sliver_type: SliverType,
+    ) -> (StatusCode, Json<ServiceResponse<()>>) {
+        if sliver.r#type() != sliver_type {
+            return ServiceResponse::serialized_error(
+                StatusCode::MISDIRECTED_REQUEST,
+                "Invalid sliver type",
+            );
+        }
+
+        let Ok(blob_id) = BlobId::from_str(&encoded_blob_id) else {
+            tracing::debug!("Invalid blob ID {encoded_blob_id}");
+            return ServiceResponse::serialized_error(StatusCode::BAD_REQUEST, "Invalid blob ID");
+        };
+
+        match state.store_sliver(&blob_id, sliver_pair_idx, &sliver) {
+            Ok(()) => {
+                tracing::debug!("Stored {sliver_type:?} sliver for {blob_id:?}");
+                ServiceResponse::serialized_success(StatusCode::OK, ())
+            }
+            Err(StoreSliverError::Internal(message)) => {
+                tracing::error!("Internal server error: {message}");
+                ServiceResponse::serialized_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error",
+                )
+            }
+            Err(client_error) => {
+                tracing::debug!("Received invalid {sliver_type:?} sliver: {client_error}");
+                ServiceResponse::serialized_error(StatusCode::BAD_REQUEST, client_error.to_string())
+            }
+        }
+    }
+
+    async fn retrieve_storage_confirmation(
+        State(state): State<Arc<S>>,
+        Path(encoded_blob_id): Path<String>,
     ) -> (StatusCode, Json<ServiceResponse<StorageConfirmation>>) {
-        match state.get_storage_confirmation(&request).await {
+        let Ok(blob_id) = BlobId::from_str(&encoded_blob_id) else {
+            tracing::debug!("Invalid blob ID {encoded_blob_id}");
+            return ServiceResponse::serialized_error(StatusCode::BAD_REQUEST, "Invalid blob ID");
+        };
+
+        match state.compute_storage_confirmation(&blob_id).await {
             Ok(Some(confirmation)) => {
+                tracing::debug!("Retrieved storage confirmation for {blob_id:?}");
                 ServiceResponse::serialized_success(StatusCode::OK, confirmation)
             }
-            Ok(None) => ServiceResponse::serialized_error(StatusCode::NOT_FOUND, "Not found"),
+            Ok(None) => {
+                tracing::debug!("Storage confirmation not found for {blob_id:?}");
+                ServiceResponse::serialized_not_found()
+            }
             Err(message) => {
                 tracing::error!("Internal server error: {message}");
                 ServiceResponse::serialized_error(
@@ -176,26 +336,25 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
 mod test {
     use std::sync::Arc;
 
+    use anyhow::anyhow;
     use reqwest::StatusCode;
     use tokio::sync::oneshot;
     use walrus_core::{
         messages::StorageConfirmation,
-        metadata::BlobMetadataWithId,
-        test_utils as core_test_utils,
+        metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
         BlobId,
-        ShardIndex,
         Sliver,
+        SliverType,
     };
 
     use crate::{
-        node::{ServiceState, StoreMetadataError},
+        node::{RetrieveSliverError, ServiceState, StoreMetadataError, StoreSliverError},
         server::{
             ServiceResponse,
-            StoreSliverRequest,
             UserServer,
-            GET_STORAGE_CONFIRMATION,
-            POST_STORE_BLOB_METADATA,
-            POST_STORE_SLIVER,
+            METADATA_ENDPOINT,
+            PRIMARY_SLIVER_ENDPOINT,
+            STORAGE_CONFIRMATION_ENDPOINT,
         },
         test_utils,
     };
@@ -203,32 +362,56 @@ mod test {
     pub struct MockServiceState;
 
     impl ServiceState for MockServiceState {
-        fn store_blob_metadata(
+        fn retrieve_metadata(
             &self,
-            _metadata: BlobMetadataWithId,
-        ) -> Result<(), StoreMetadataError> {
-            Ok(())
-        }
-
-        fn store_sliver(
-            &self,
-            shard: ShardIndex,
-            _blob_id: &BlobId,
-            _sliver: &Sliver,
-        ) -> Result<(), anyhow::Error> {
-            if shard == ShardIndex(0) {
-                Ok(())
+            blob_id: &BlobId,
+        ) -> Result<Option<UnverifiedBlobMetadataWithId>, anyhow::Error> {
+            if blob_id.0[0] == 0 {
+                Ok(Some(
+                    walrus_core::test_utils::verified_blob_metadata().into_unverified(),
+                ))
+            } else if blob_id.0[0] == 1 {
+                Ok(None)
             } else {
                 Err(anyhow::anyhow!("Invalid shard"))
             }
         }
 
-        async fn get_storage_confirmation(
+        fn store_metadata(
+            &self,
+            _metadata: UnverifiedBlobMetadataWithId,
+        ) -> Result<(), StoreMetadataError> {
+            Ok(())
+        }
+
+        fn retrieve_sliver(
+            &self,
+            _blob_id: &BlobId,
+            _sliver_pair_idx: u16,
+            _sliver_type: SliverType,
+        ) -> Result<Option<Sliver>, RetrieveSliverError> {
+            Ok(Some(walrus_core::test_utils::sliver()))
+        }
+
+        fn store_sliver(
+            &self,
+            _blob_id: &BlobId,
+            sliver_pair_idx: u16,
+            _sliver: &Sliver,
+        ) -> Result<(), StoreSliverError> {
+            if sliver_pair_idx == 0 {
+                Ok(())
+            } else {
+                Err(StoreSliverError::Internal(anyhow!("Invalid shard")))
+            }
+        }
+
+        async fn compute_storage_confirmation(
             &self,
             blob_id: &BlobId,
         ) -> Result<Option<StorageConfirmation>, anyhow::Error> {
             if blob_id.0[0] == 0 {
-                let confirmation = core_test_utils::signed_storage_confirmation();
+                let confirmation = walrus_core::test_utils::signed_storage_confirmation();
                 Ok(Some(StorageConfirmation::Signed(confirmation)))
             } else if blob_id.0[0] == 1 {
                 Ok(None)
@@ -239,7 +422,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn store_blob_metadata() {
+    async fn retrieve_metadata() {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
         let test_private_parameters = test_utils::storage_node_private_parameters();
@@ -250,15 +433,128 @@ mod test {
 
         tokio::task::yield_now().await;
 
-        let client = reqwest::Client::new();
-        let url = format!(
-            "http://{}{}",
-            test_private_parameters.network_address, POST_STORE_BLOB_METADATA
-        );
-        let metadata = core_test_utils::unverified_blob_metadata();
+        let mut blob_id = walrus_core::test_utils::random_blob_id();
+        blob_id.0[0] = 0; // Triggers a valid response
+        let path = METADATA_ENDPOINT.replace(":blobId", &blob_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
 
-        let res = client.post(url).json(&metadata).send().await.unwrap();
+        let client = reqwest::Client::new();
+        let res = client.get(url).json(&blob_id).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+
+        let body = res
+            .json::<ServiceResponse<VerifiedBlobMetadataWithId>>()
+            .await;
+        match body.unwrap() {
+            ServiceResponse::Success { code, data: _data } => {
+                assert_eq!(code, StatusCode::OK.as_u16());
+            }
+            ServiceResponse::Error { code, message } => {
+                panic!("Unexpected error response: {code} {message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieve_metadata_not_found() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
+        let test_private_parameters = test_utils::storage_node_private_parameters();
+        let _handle = tokio::spawn(async move {
+            let network_address = test_private_parameters.network_address;
+            server.run(&network_address).await
+        });
+
+        tokio::task::yield_now().await;
+
+        let mut blob_id = walrus_core::test_utils::random_blob_id();
+        blob_id.0[0] = 1; // Triggers a not found response
+        let path = METADATA_ENDPOINT.replace(":blobId", &blob_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+
+        let client = reqwest::Client::new();
+        let res = client.get(url).json(&blob_id).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn retrieve_metadata_internal_error() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
+        let test_private_parameters = test_utils::storage_node_private_parameters();
+        let _handle = tokio::spawn(async move {
+            let network_address = test_private_parameters.network_address;
+            server.run(&network_address).await
+        });
+
+        tokio::task::yield_now().await;
+
+        let mut blob_id = walrus_core::test_utils::random_blob_id();
+        blob_id.0[0] = 2; // Triggers an internal server error
+        let path = METADATA_ENDPOINT.replace(":blobId", &blob_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+
+        let client = reqwest::Client::new();
+        let res = client.get(url).json(&blob_id).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn store_metadata() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
+        let test_private_parameters = test_utils::storage_node_private_parameters();
+        let _handle = tokio::spawn(async move {
+            let network_address = test_private_parameters.network_address;
+            server.run(&network_address).await
+        });
+
+        tokio::task::yield_now().await;
+
+        let metadata_with_blob_id = walrus_core::test_utils::unverified_blob_metadata();
+        let metadata = metadata_with_blob_id.metadata();
+
+        let blob_id = metadata_with_blob_id.blob_id().to_string();
+        let path = METADATA_ENDPOINT.replace(":blobId", &blob_id);
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+
+        let client = reqwest::Client::new();
+        let res = client.put(url).json(metadata).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn retrieve_sliver() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
+        let test_private_parameters = test_utils::storage_node_private_parameters();
+        let _handle = tokio::spawn(async move {
+            let network_address = test_private_parameters.network_address;
+            server.run(&network_address).await
+        });
+
+        tokio::task::yield_now().await;
+
+        let blob_id = walrus_core::test_utils::random_blob_id();
+        let sliver_pair_id = 0; // Triggers an valid response
+        let path = PRIMARY_SLIVER_ENDPOINT
+            .replace(":blobId", &blob_id.to_string())
+            .replace(":sliverPairIdx", &sliver_pair_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+
+        let client = reqwest::Client::new();
+        let res = client.get(url).json(&blob_id).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = res.json::<ServiceResponse<Sliver>>().await;
+        match body.unwrap() {
+            ServiceResponse::Success { code, data: _data } => {
+                assert_eq!(code, StatusCode::OK.as_u16());
+            }
+            ServiceResponse::Error { code, message } => {
+                panic!("Unexpected error response: {code} {message}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -273,18 +569,17 @@ mod test {
 
         tokio::task::yield_now().await;
 
-        let client = reqwest::Client::new();
-        let url = format!(
-            "http://{}{}",
-            test_private_parameters.network_address, POST_STORE_SLIVER
-        );
-        let request = StoreSliverRequest {
-            shard: ShardIndex(0), // Triggers a valid response
-            blob_id: core_test_utils::random_blob_id(),
-            sliver: core_test_utils::sliver(),
-        };
+        let sliver = walrus_core::test_utils::sliver();
 
-        let res = client.post(url).json(&request).send().await.unwrap();
+        let blob_id = walrus_core::test_utils::random_blob_id();
+        let sliver_pair_id = 0; // Triggers an ok response
+        let path = PRIMARY_SLIVER_ENDPOINT
+            .replace(":blobId", &blob_id.to_string())
+            .replace(":sliverPairIdx", &sliver_pair_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+
+        let client = reqwest::Client::new();
+        let res = client.put(url).json(&sliver).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
     }
 
@@ -297,26 +592,25 @@ mod test {
             let network_address = test_private_parameters.network_address;
             server.run(&network_address).await
         });
+
         tokio::task::yield_now().await;
 
-        let client = reqwest::Client::new();
-        let url = format!(
-            "http://{}{}",
-            test_private_parameters.network_address, POST_STORE_SLIVER
-        );
-        let request = StoreSliverRequest {
-            shard: ShardIndex(1), // Triggers a 'shard not found' response
-            blob_id: core_test_utils::random_blob_id(),
-            sliver: core_test_utils::sliver(),
-        };
+        let sliver = walrus_core::test_utils::sliver();
 
-        let res = client.post(url).json(&request).send().await.unwrap();
-        println!("{:?}", res.status());
+        let blob_id = walrus_core::test_utils::random_blob_id();
+        let sliver_pair_id = 1; // Triggers an internal server error
+        let path = PRIMARY_SLIVER_ENDPOINT
+            .replace(":blobId", &blob_id.to_string())
+            .replace(":sliverPairIdx", &sliver_pair_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+
+        let client = reqwest::Client::new();
+        let res = client.put(url).json(&sliver).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
-    async fn get_storage_confirmation() {
+    async fn retrieve_storage_confirmation() {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
         let test_private_parameters = test_utils::storage_node_private_parameters();
@@ -327,14 +621,12 @@ mod test {
 
         tokio::task::yield_now().await;
 
-        let client = reqwest::Client::new();
-        let url = format!(
-            "http://{}{}",
-            test_private_parameters.network_address, GET_STORAGE_CONFIRMATION
-        );
-        let mut blob_id = core_test_utils::random_blob_id();
+        let mut blob_id = walrus_core::test_utils::random_blob_id();
         blob_id.0[0] = 0; // Triggers a valid response
+        let path = STORAGE_CONFIRMATION_ENDPOINT.replace(":blobId", &blob_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
 
+        let client = reqwest::Client::new();
         let res = client.get(url).json(&blob_id).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
@@ -345,13 +637,13 @@ mod test {
                 assert!(matches!(data, StorageConfirmation::Signed(_)));
             }
             ServiceResponse::Error { code, message } => {
-                panic!("Unexpected error response: {} {}", code, message);
+                panic!("Unexpected error response: {code} {message}");
             }
         }
     }
 
     #[tokio::test]
-    async fn get_storage_confirmation_not_found() {
+    async fn retrieve_storage_confirmation_not_found() {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
         let test_private_parameters = test_utils::storage_node_private_parameters();
@@ -362,20 +654,18 @@ mod test {
 
         tokio::task::yield_now().await;
 
-        let client = reqwest::Client::new();
-        let url = format!(
-            "http://{}{}",
-            test_private_parameters.network_address, GET_STORAGE_CONFIRMATION
-        );
-        let mut blob_id = core_test_utils::random_blob_id();
-        blob_id.0[0] = 1; // Triggers not found response
+        let mut blob_id = walrus_core::test_utils::random_blob_id();
+        blob_id.0[0] = 1; // Triggers a not found response
+        let path = STORAGE_CONFIRMATION_ENDPOINT.replace(":blobId", &blob_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
 
+        let client = reqwest::Client::new();
         let res = client.get(url).json(&blob_id).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn get_storage_confirmation_error() {
+    async fn retrieve_storage_confirmation_internal_error() {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let server = UserServer::new(Arc::new(MockServiceState), shutdown_rx);
         let test_private_parameters = test_utils::storage_node_private_parameters();
@@ -386,14 +676,12 @@ mod test {
 
         tokio::task::yield_now().await;
 
-        let client = reqwest::Client::new();
-        let url = format!(
-            "http://{}{}",
-            test_private_parameters.network_address, GET_STORAGE_CONFIRMATION
-        );
-        let mut blob_id = core_test_utils::random_blob_id();
-        blob_id.0[0] = 2; // Triggers internal error response
+        let mut blob_id = walrus_core::test_utils::random_blob_id();
+        blob_id.0[0] = 2; // Triggers an internal server error
+        let path = STORAGE_CONFIRMATION_ENDPOINT.replace(":blobId", &blob_id.to_string());
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
 
+        let client = reqwest::Client::new();
         let res = client.get(url).json(&blob_id).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }

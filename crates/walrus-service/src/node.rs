@@ -7,15 +7,18 @@ use anyhow::Context;
 use fastcrypto::{bls12381::min_pk::BLS12381PrivateKey, traits::Signer};
 use typed_store::rocks::MetricConf;
 use walrus_core::{
+    encoding::{get_encoding_config, Primary, RecoveryError, Secondary},
+    ensure,
     messages::{Confirmation, SignedStorageConfirmation, StorageConfirmation},
-    metadata::{BlobMetadataWithId, VerificationError},
+    metadata::{UnverifiedBlobMetadataWithId, VerificationError},
     BlobId,
     Epoch,
     ShardIndex,
     Sliver,
+    SliverType,
 };
 
-use crate::storage::Storage;
+use crate::{mapping::shard_index_for_pair, storage::Storage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreMetadataError {
@@ -25,21 +28,66 @@ pub enum StoreMetadataError {
     Internal(#[from] anyhow::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RetrieveSliverError {
+    #[error("Invalid shard {0:?}")]
+    InvalidShard(ShardIndex),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreSliverError {
+    #[error("Missing metadata for {0:?}")]
+    MissingMetadata(BlobId),
+    #[error("Invalid sliver pair id {0} for {1:?}")]
+    InvalidSliverPairId(u16, BlobId),
+    #[error("Invalid sliver id {0} for {1:?}")]
+    InvalidSliver(u16, BlobId),
+    #[error("Invalid sliver size {0} for {1:?}")]
+    IncorrectSize(usize, BlobId),
+    #[error("Invalid shard type {0:?} for {1:?}")]
+    InvalidSliverType(SliverType, BlobId),
+    #[error("Invalid shard {0:?}")]
+    InvalidShard(ShardIndex),
+    #[error(transparent)]
+    MalformedSliver(#[from] RecoveryError),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
 pub trait ServiceState {
+    /// Retrieves the metadata associated with a blob.
+    fn retrieve_metadata(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<Option<UnverifiedBlobMetadataWithId>, anyhow::Error>;
+
     /// Stores the metadata associated with a blob.
-    fn store_blob_metadata(&self, metadata: BlobMetadataWithId) -> Result<(), StoreMetadataError>;
+    fn store_metadata(
+        &self,
+        metadata: UnverifiedBlobMetadataWithId,
+    ) -> Result<(), StoreMetadataError>;
+
+    /// Retrieves a primary or secondary sliver for a blob for a shard held by this storage node.
+    fn retrieve_sliver(
+        &self,
+        blob_id: &BlobId,
+        sliver_pair_idx: u16,
+        sliver_type: SliverType,
+    ) -> Result<Option<Sliver>, RetrieveSliverError>;
 
     /// Store the primary or secondary encoding for a blob for a shard held by this storage node.
     fn store_sliver(
         &self,
-        shard: ShardIndex,
         blob_id: &BlobId,
+        sliver_pair_idx: u16,
         sliver: &Sliver,
-    ) -> Result<(), anyhow::Error>;
+    ) -> Result<(), StoreSliverError>;
 
     /// Get a signed confirmation over the identifiers of the shards storing their respective
     /// sliver-pairs for their BlobIds.
-    fn get_storage_confirmation(
+    fn compute_storage_confirmation(
         &self,
         blob_id: &BlobId,
     ) -> impl Future<Output = Result<Option<StorageConfirmation>, anyhow::Error>> + Send;
@@ -75,33 +123,105 @@ impl StorageNode {
 }
 
 impl ServiceState for StorageNode {
-    fn store_blob_metadata(&self, metadata: BlobMetadataWithId) -> Result<(), StoreMetadataError> {
-        let verified_metadata = metadata.verify(self.n_shards)?;
+    fn retrieve_metadata(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<Option<UnverifiedBlobMetadataWithId>, anyhow::Error> {
+        let verified_metadata_with_id = self
+            .storage
+            .get_metadata(blob_id)
+            .context("unable to retrieve metadata")?;
 
+        // Format the metadata as unverified, as the client will have to re-verify them.
+        Ok(verified_metadata_with_id.map(|metadata| metadata.into_unverified()))
+    }
+
+    fn store_metadata(
+        &self,
+        metadata: UnverifiedBlobMetadataWithId,
+    ) -> Result<(), StoreMetadataError> {
+        let verified_metadata_with_id = metadata.verify(self.n_shards)?;
         self.storage
-            .put_verified_metadata(&verified_metadata)
+            .put_verified_metadata(&verified_metadata_with_id)
             .context("unable to store metadata")?;
-
         Ok(())
+    }
+
+    fn retrieve_sliver(
+        &self,
+        blob_id: &BlobId,
+        sliver_pair_idx: u16,
+        sliver_type: SliverType,
+    ) -> Result<Option<Sliver>, RetrieveSliverError> {
+        let shard = shard_index_for_pair(sliver_pair_idx, self.n_shards.get(), blob_id);
+        let sliver = self
+            .storage
+            .shard_storage(shard)
+            .ok_or_else(|| RetrieveSliverError::InvalidShard(shard))?
+            .get_sliver(blob_id, sliver_type)
+            .context("unable to retrieve sliver")?;
+        Ok(sliver)
     }
 
     fn store_sliver(
         &self,
-        shard: ShardIndex,
         blob_id: &BlobId,
+        sliver_pair_idx: u16,
         sliver: &Sliver,
-    ) -> Result<(), anyhow::Error> {
-        let Some(shard_storage) = self.storage.shard_storage(shard) else {
-            // Worth handling here, but can be more efficiently handled at the API layer by not
-            // having an HTTP endpoint accepting data for the shard.
-            unimplemented!("handle calls for unowned shard");
+    ) -> Result<(), StoreSliverError> {
+        // First determine if the shard that should store this sliver is managed by this node.
+        // If not, we can return early without touching the database.
+        let shard = shard_index_for_pair(sliver_pair_idx, self.n_shards.get(), blob_id);
+        let shard_storage = self
+            .storage
+            .shard_storage(shard)
+            .ok_or_else(|| StoreSliverError::InvalidShard(shard))?;
+
+        // Ensure we already received metadata for this sliver.
+        let metadata = self
+            .storage
+            .get_metadata(blob_id)
+            .context("unable to retrieve metadata")?
+            .ok_or_else(|| StoreSliverError::MissingMetadata(*blob_id))?;
+
+        // Ensure the received sliver has the expected size.
+        let blob_size = metadata
+            .metadata()
+            .unencoded_length
+            .try_into()
+            .expect("The maximum blob size is smaller than `usize::MAX`");
+        let expected_sliver_size = match sliver {
+            Sliver::Primary(_) => get_encoding_config().sliver_size_for_blob::<Primary>(blob_size),
+            Sliver::Secondary(_) => {
+                get_encoding_config().sliver_size_for_blob::<Secondary>(blob_size)
+            }
         };
+        ensure!(
+            expected_sliver_size == Some(sliver.len()),
+            StoreSliverError::IncorrectSize(sliver.len(), *blob_id)
+        );
+
+        // Ensure the received sliver matches the metadata we have in store.
+        let stored_sliver_hash = metadata
+            .metadata()
+            .get_sliver_hash(sliver_pair_idx, sliver.r#type())
+            .ok_or_else(|| StoreSliverError::InvalidSliverPairId(sliver_pair_idx, *blob_id))?;
+
+        let computed_sliver_hash = sliver.hash()?;
+        ensure!(
+            &computed_sliver_hash == stored_sliver_hash,
+            StoreSliverError::InvalidSliver(sliver_pair_idx, *blob_id)
+        );
+
+        // Finally store the sliver in the appropriate shard storage.
         shard_storage
             .put_sliver(blob_id, sliver)
-            .context("unable to store sliver")
+            .context("unable to store sliver")?;
+
+        Ok(())
     }
 
-    async fn get_storage_confirmation(
+    async fn compute_storage_confirmation(
         &self,
         blob_id: &BlobId,
     ) -> Result<Option<StorageConfirmation>, anyhow::Error> {
@@ -177,7 +297,7 @@ mod tests {
 
             let confirmation = storage_node
                 .as_ref()
-                .get_storage_confirmation(&BLOB_ID)
+                .compute_storage_confirmation(&BLOB_ID)
                 .await
                 .expect("should succeed");
 
@@ -195,7 +315,7 @@ mod tests {
 
             let confirmation = storage_node
                 .as_ref()
-                .get_storage_confirmation(&BLOB_ID)
+                .compute_storage_confirmation(&BLOB_ID)
                 .await?
                 .expect("should return Some confirmation");
 

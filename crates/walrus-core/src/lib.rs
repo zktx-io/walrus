@@ -2,8 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Core functionality for Walrus.
-use encoding::{PrimarySliver, SecondarySliver};
-use fastcrypto::hash::{Blake2b256, HashFunction};
+use std::{
+    fmt::{self, Debug, Display, LowerHex},
+    str::FromStr,
+};
+
+use encoding::{PrimarySliver, RecoveryError, SecondarySliver};
+use fastcrypto::{
+    bls12381::min_pk::{BLS12381KeyPair, BLS12381PublicKey, BLS12381Signature},
+    encoding::{Encoding, Hex},
+    hash::{Blake2b256, HashFunction},
+};
 use merkle::{MerkleTree, Node};
 use metadata::BlobMetadata;
 use serde::{Deserialize, Serialize};
@@ -18,6 +27,17 @@ pub use messages::SignedStorageConfirmation;
 
 pub mod metadata;
 
+/// A public key.
+pub type PublicKey = BLS12381PublicKey;
+/// A key pair.
+pub type KeyPair = BLS12381KeyPair;
+/// A signature for a blob.
+pub type Signature = BLS12381Signature;
+/// A certificate for a blob, represented as a list of signer-signature pairs.
+pub type Certificate = Vec<(PublicKey, Signature)>;
+/// The hash function used for building metadata.
+pub type DefaultHashFunction = Blake2b256;
+
 /// Utility functions for tests.
 ///
 /// These are available with the "test-utils" feature.
@@ -28,7 +48,7 @@ pub mod test_utils;
 pub type Epoch = u64;
 
 /// The ID of a blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct BlobId(pub [u8; Self::LENGTH]);
 
@@ -79,9 +99,49 @@ impl BlobId {
     }
 }
 
+impl LowerHex for BlobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", Hex::encode(self.0))
+    }
+}
+
 impl AsRef<[u8]> for BlobId {
     fn as_ref(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl Display for BlobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:#x}")
+    }
+}
+
+impl Debug for BlobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BlobId({self:#x})")
+    }
+}
+
+/// Error returned when unable to parse a blob ID.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("failed to parse a blob ID")]
+pub struct BlobIdParseError;
+
+impl<'a> TryFrom<&'a [u8]> for BlobId {
+    type Error = BlobIdParseError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let bytes = <[u8; Self::LENGTH]>::try_from(value).map_err(|_| BlobIdParseError)?;
+        Ok(Self(bytes))
+    }
+}
+
+impl FromStr for BlobId {
+    type Err = BlobIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        fastcrypto::encoding::decode_bytes_hex(s).map_err(|_| BlobIdParseError)
     }
 }
 
@@ -120,6 +180,27 @@ impl Sliver {
             Sliver::Primary(_) => SliverType::Primary,
             Sliver::Secondary(_) => SliverType::Secondary,
         }
+    }
+
+    /// Returns the hash of the sliver, i.e., the Merkle root of the tree computed over the symbols.
+    pub fn hash(&self) -> Result<Node, RecoveryError> {
+        match self {
+            Sliver::Primary(inner) => inner.get_merkle_root::<DefaultHashFunction>(),
+            Sliver::Secondary(inner) => inner.get_merkle_root::<DefaultHashFunction>(),
+        }
+    }
+
+    /// Returns the sliver size in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            Sliver::Primary(inner) => inner.len(),
+            Sliver::Secondary(inner) => inner.len(),
+        }
+    }
+
+    /// Returns true iff the sliver length is 0.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
