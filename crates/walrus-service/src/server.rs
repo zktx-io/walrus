@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use walrus_core::{
     messages::StorageConfirmation,
-    metadata::{BlobMetadata, UnverifiedBlobMetadataWithId},
+    metadata::{BlobMetadata, SliverPairIndex, UnverifiedBlobMetadataWithId},
     BlobId,
     DecodingSymbol,
     Sliver,
@@ -183,7 +183,7 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
         State(state): State<Arc<S>>,
         Path((HexBlobId(blob_id), sliver_pair_idx, sliver_type)): Path<(
             HexBlobId,
-            u16,
+            SliverPairIndex,
             SliverType,
         )>,
     ) -> (StatusCode, Json<ServiceResponse<Sliver>>) {
@@ -235,7 +235,7 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
         State(state): State<Arc<S>>,
         Path((HexBlobId(blob_id), sliver_pair_idx, sliver_type)): Path<(
             HexBlobId,
-            u16,
+            SliverPairIndex,
             SliverType,
         )>,
         Json(sliver): Json<Sliver>,
@@ -299,7 +299,7 @@ mod test {
     use tokio_util::sync::CancellationToken;
     use walrus_core::{
         messages::StorageConfirmation,
-        metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
+        metadata::{SliverPairIndex, UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
         BlobId,
         DecodingSymbol,
         Sliver,
@@ -353,7 +353,7 @@ mod test {
         fn retrieve_sliver(
             &self,
             _blob_id: &BlobId,
-            _sliver_pair_idx: u16,
+            _sliver_pair_idx: SliverPairIndex,
             _sliver_type: SliverType,
         ) -> Result<Option<Sliver>, RetrieveSliverError> {
             Ok(Some(walrus_core::test_utils::sliver()))
@@ -376,10 +376,10 @@ mod test {
         fn store_sliver(
             &self,
             _blob_id: &BlobId,
-            sliver_pair_idx: u16,
+            sliver_pair_idx: SliverPairIndex,
             _sliver: &Sliver,
         ) -> Result<(), StoreSliverError> {
-            if sliver_pair_idx == 0 {
+            if sliver_pair_idx.as_usize() == 0 {
                 Ok(())
             } else {
                 Err(StoreSliverError::Internal(anyhow!("Invalid shard")))
