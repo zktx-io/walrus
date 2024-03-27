@@ -178,19 +178,19 @@ pub(crate) fn blob_id_from_u256(input: U256) -> BlobId {
 }
 
 macro_rules! call_arg_pure {
-    ($value: expr) => {
+    ($value:expr) => {
         CallArg::Pure(bcs::to_bytes($value)?)
     };
 }
 
 macro_rules! match_for_correct_type {
-    ($value: expr, $field_type: path) => {
+    ($value:expr, $field_type:path) => {
         match $value {
             Some($field_type(x)) => Some(x),
             _ => None,
         }
     };
-    ($value: expr, $field_type: path { $var: ident }) => {
+    ($value:expr, $field_type:path { $var:ident }) => {
         match $value {
             Some($field_type { $var }) => Some($var),
             _ => None,
@@ -199,7 +199,7 @@ macro_rules! match_for_correct_type {
 }
 
 macro_rules! get_dynamic_field {
-    ($struct: expr, $field_name: expr, $field_type: path $({ $var: ident })*) => {
+    ($struct:expr, $field_name:expr, $field_type:path $({ $var:ident })*) => {
         match_for_correct_type!(
             $struct.read_dynamic_field_value($field_name),
             $field_type $({ $var })*
@@ -213,19 +213,19 @@ macro_rules! get_dynamic_field {
 }
 
 macro_rules! get_dynamic_objectid_field {
-    ($struct: expr) => {
+    ($struct:expr) => {
         get_dynamic_field!($struct, "id", SuiMoveValue::UID { id })
     };
 }
 
 macro_rules! get_dynamic_u64_field {
-    ($struct: expr, $field_name: expr) => {
+    ($struct:expr, $field_name:expr) => {
         get_dynamic_field!($struct, $field_name, SuiMoveValue::String)?.parse()
     };
 }
 
 macro_rules! get_field_from_event {
-    ($event_object: expr, $field_name: expr, $field_type: path) => {
+    ($event_object:expr, $field_name:expr, $field_type:path) => {
         match_for_correct_type!($event_object.get($field_name), $field_type).ok_or(anyhow!(
             "Event does not contain field {} with expected type {}: {:?}",
             $field_name,

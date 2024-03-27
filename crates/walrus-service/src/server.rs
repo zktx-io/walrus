@@ -18,6 +18,7 @@ use walrus_core::{
     messages::StorageConfirmation,
     metadata::{BlobMetadata, UnverifiedBlobMetadataWithId},
     BlobId,
+    DecodingSymbol,
     Sliver,
     SliverType,
 };
@@ -30,6 +31,8 @@ pub const METADATA_ENDPOINT: &str = "/v1/blobs/:blobId/metadata";
 pub const SLIVER_ENDPOINT: &str = "/v1/blobs/:blobId/slivers/:sliverPairIdx/:sliverType";
 /// The path to get storage confirmations.
 pub const STORAGE_CONFIRMATION_ENDPOINT: &str = "/v1/blobs/:blobId/confirmation";
+/// The path to get recovery symbols.
+pub const RECOVERY_ENDPOINT: &str = "/v1/blobs/:blobId/slivers/:sliverPairIdx/:sliverType/:index";
 
 /// A blob ID encoded as a hex string designed to be used in URLs.
 #[serde_as]
@@ -115,6 +118,7 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
                 STORAGE_CONFIRMATION_ENDPOINT,
                 get(Self::retrieve_storage_confirmation),
             )
+            .route(RECOVERY_ENDPOINT, get(Self::retrieve_recovery_symbol))
             .with_state(self.state.clone())
             .layer(TraceLayer::new_for_http());
 
@@ -202,6 +206,31 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
         }
     }
 
+    /// Retrieves a recovery symbol for a shard held by this storage node.
+    /// The sliver_type is the target type of the sliver that will be recovered
+    /// The sliver_pair_idx is the index of the sliver pair that we want to access
+    /// Index is the requesters index in the established order of storage nodes
+    async fn retrieve_recovery_symbol(
+        State(state): State<Arc<S>>,
+        Path((HexBlobId(blob_id), sliver_pair_idx, sliver_type, index)): Path<(
+            HexBlobId,
+            u16,
+            SliverType,
+            u32,
+        )>,
+    ) -> (StatusCode, Json<ServiceResponse<DecodingSymbol>>) {
+        match state.retrieve_recovery_symbol(&blob_id, sliver_pair_idx, sliver_type, index) {
+            Ok(symbol) => {
+                tracing::debug!("Retrieved recovery symbol for {blob_id:?}");
+                ServiceResponse::serialized_success(StatusCode::OK, symbol)
+            }
+            Err(message) => {
+                tracing::debug!("Symbol not found with error {message}");
+                ServiceResponse::serialized_not_found()
+            }
+        }
+    }
+
     async fn store_sliver(
         State(state): State<Arc<S>>,
         Path((HexBlobId(blob_id), sliver_pair_idx, sliver_type)): Path<(
@@ -272,13 +301,27 @@ mod test {
         messages::StorageConfirmation,
         metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
         BlobId,
+        DecodingSymbol,
         Sliver,
         SliverType,
     };
 
-    use super::*;
     use crate::{
-        node::{RetrieveSliverError, ServiceState, StoreMetadataError, StoreSliverError},
+        node::{
+            RetrieveSliverError,
+            RetrieveSymbolError,
+            ServiceState,
+            StoreMetadataError,
+            StoreSliverError,
+        },
+        server::{
+            ServiceResponse,
+            UserServer,
+            METADATA_ENDPOINT,
+            RECOVERY_ENDPOINT,
+            SLIVER_ENDPOINT,
+            STORAGE_CONFIRMATION_ENDPOINT,
+        },
         test_utils,
     };
 
@@ -314,6 +357,20 @@ mod test {
             _sliver_type: SliverType,
         ) -> Result<Option<Sliver>, RetrieveSliverError> {
             Ok(Some(walrus_core::test_utils::sliver()))
+        }
+
+        fn retrieve_recovery_symbol(
+            &self,
+            _blob_id: &BlobId,
+            sliver_pair_idx: u16,
+            _sliver_type: SliverType,
+            _index: u32,
+        ) -> Result<DecodingSymbol, RetrieveSymbolError> {
+            if sliver_pair_idx == 0 {
+                Ok(walrus_core::test_utils::recovery_symbol())
+            } else {
+                Err(RetrieveSymbolError::Internal(anyhow!("Invalid shard")))
+            }
         }
 
         fn store_sliver(
@@ -614,5 +671,67 @@ mod test {
 
         cancel_token.cancel();
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_decoding_symbol() {
+        let server = UserServer::new(Arc::new(MockServiceState), CancellationToken::new());
+        let test_private_parameters = test_utils::storage_node_private_parameters();
+        let _handle = tokio::spawn(async move {
+            let network_address = test_private_parameters.network_address;
+            server.run(&network_address).await
+        });
+
+        tokio::task::yield_now().await;
+
+        let blob_id = walrus_core::test_utils::random_blob_id();
+        let sliver_pair_id = 0; // Triggers an valid response
+        let path = RECOVERY_ENDPOINT
+            .replace(":blobId", &blob_id.to_string())
+            .replace(":sliverPairIdx", &sliver_pair_id.to_string())
+            .replace(":sliverType", "primary")
+            .replace(":index", "0");
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+        // TODO(lef): Extract the path creation into a function with optional arguments
+
+        let client = reqwest::Client::new();
+        let res = client.get(url).json(&blob_id).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = res.json::<ServiceResponse<DecodingSymbol>>().await;
+        match body.unwrap() {
+            ServiceResponse::Success { code, data: _data } => {
+                assert_eq!(code, StatusCode::OK.as_u16());
+            }
+            ServiceResponse::Error { code, message } => {
+                panic!("Unexpected error response: {code} {message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decoding_symbol_not_found() {
+        // TODO(lef): Extract booting the server into a function
+        let server = UserServer::new(Arc::new(MockServiceState), CancellationToken::new());
+        let test_private_parameters = test_utils::storage_node_private_parameters();
+        let _handle = tokio::spawn(async move {
+            let network_address = test_private_parameters.network_address;
+            server.run(&network_address).await
+        });
+
+        tokio::task::yield_now().await;
+
+        let blob_id = walrus_core::test_utils::random_blob_id();
+
+        let sliver_pair_id = 1; // Triggers a not found response
+        let path = RECOVERY_ENDPOINT
+            .replace(":blobId", &blob_id.to_string())
+            .replace(":sliverPairIdx", &sliver_pair_id.to_string())
+            .replace(":sliverType", "primary")
+            .replace(":index", "0");
+        let url = format!("http://{}{path}", test_private_parameters.network_address);
+        let client = reqwest::Client::new();
+        let res = client.get(url).json(&blob_id).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }

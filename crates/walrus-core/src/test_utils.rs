@@ -17,6 +17,7 @@ use crate::{
         VerifiedBlobMetadataWithId,
     },
     BlobId,
+    DecodingSymbol,
     EncodingType,
     SignedStorageConfirmation,
     Sliver,
@@ -34,6 +35,11 @@ pub fn keypair() -> BLS12381KeyPair {
 /// Returns an arbitrary sliver for testing.
 pub fn sliver() -> Sliver {
     Sliver::Primary(encoding::Sliver::new([1, 2, 3, 4], 2, 1))
+}
+
+/// Returns an arbitrary decoding symbol for testing.
+pub fn recovery_symbol() -> DecodingSymbol {
+    DecodingSymbol::Primary(encoding::DecodingSymbol::new(0, vec![1]))
 }
 
 /// Returns an arbitrary storage confirmation for tests.

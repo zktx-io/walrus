@@ -443,7 +443,6 @@ impl<'a, T: EncodingAxis> BlobDecoder<'a, T> {
 
 #[cfg(test)]
 mod tests {
-
     use walrus_test_utils::{param_test, random_data, random_subset};
 
     use super::*;

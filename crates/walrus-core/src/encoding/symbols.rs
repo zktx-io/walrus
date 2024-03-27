@@ -264,7 +264,7 @@ impl AsMut<[u8]> for Symbols {
 /// symbol. It can either be `U = ()` -- representing "no proof" -- or `U: MerkeAuth`, and defaults
 /// to `()`. This type parameter can only be changed through the functions
 /// [`DecodingSymbol::with_proof`] and [`DecodingSymbol::remove_proof`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodingSymbol<T: EncodingAxis, U = ()> {
     /// The index of the symbol.
     ///
@@ -279,6 +279,12 @@ pub struct DecodingSymbol<T: EncodingAxis, U = ()> {
     /// Marker representing whether this symbol is used to decode primary or secondary slivers.
     _axis: PhantomData<T>,
 }
+
+/// A primary decoding symbol to recover a primary sliver
+pub type PrimaryDecodingSymbol = DecodingSymbol<Primary>;
+
+///  A secondary decoding symbol to recover a secondary sliver
+pub type SecondaryDecodingSymbol = DecodingSymbol<Secondary>;
 
 impl<T: EncodingAxis, U> DecodingSymbol<T, U> {
     /// Converts the `DecodingSymbol` to an [`EncodingPacket`] expected by the [`raptorq::Decoder`].

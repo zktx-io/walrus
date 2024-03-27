@@ -195,7 +195,6 @@ impl SliverPairMetadata {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     const BLOB_ID: BlobId = BlobId([7; 32]);
