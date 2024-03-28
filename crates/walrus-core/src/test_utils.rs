@@ -9,9 +9,10 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 use crate::{
     encoding,
-    merkle::Node,
+    merkle::{MerkleProof, Node},
     metadata::{
         BlobMetadata,
+        SliverIndex,
         SliverPairIndex,
         SliverPairMetadata,
         UnverifiedBlobMetadataWithId,
@@ -43,8 +44,16 @@ pub fn sliver() -> Sliver {
 }
 
 /// Returns an arbitrary decoding symbol for testing.
-pub fn recovery_symbol() -> DecodingSymbol {
-    DecodingSymbol::Primary(encoding::DecodingSymbol::new(0, vec![1]))
+
+pub fn recovery_symbol() -> DecodingSymbol<MerkleProof> {
+    encoding::initialize_encoding_config(1, 2, 4);
+    match sliver() {
+        Sliver::Primary(inner) => inner
+            .recovery_symbol_for_sliver_with_proof(SliverIndex::new(1))
+            .map(DecodingSymbol::Secondary)
+            .unwrap(),
+        Sliver::Secondary(_) => unreachable!("Primary sliver expected"),
+    }
 }
 
 /// Returns an arbitrary storage confirmation for tests.

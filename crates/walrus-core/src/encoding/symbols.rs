@@ -281,10 +281,10 @@ pub struct DecodingSymbol<T: EncodingAxis, U = ()> {
 }
 
 /// A primary decoding symbol to recover a primary sliver
-pub type PrimaryDecodingSymbol = DecodingSymbol<Primary>;
+pub type PrimaryDecodingSymbol<U> = DecodingSymbol<Primary, U>;
 
 ///  A secondary decoding symbol to recover a secondary sliver
-pub type SecondaryDecodingSymbol = DecodingSymbol<Secondary>;
+pub type SecondaryDecodingSymbol<U> = DecodingSymbol<Secondary, U>;
 
 impl<T: EncodingAxis, U> DecodingSymbol<T, U> {
     /// Converts the `DecodingSymbol` to an [`EncodingPacket`] expected by the [`raptorq::Decoder`].

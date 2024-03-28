@@ -15,6 +15,7 @@ use serde_with::{serde_as, DisplayFromStr};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use walrus_core::{
+    merkle::MerkleProof,
     messages::StorageConfirmation,
     metadata::{BlobMetadata, SliverIndex, SliverPairIndex, UnverifiedBlobMetadataWithId},
     BlobId,
@@ -210,6 +211,7 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
     /// The sliver_type is the target type of the sliver that will be recovered
     /// The sliver_pair_idx is the index of the sliver pair that we want to access
     /// Index is the requesters index in the established order of storage nodes
+
     async fn retrieve_recovery_symbol(
         State(state): State<Arc<S>>,
         Path((HexBlobId(blob_id), sliver_pair_idx, sliver_type, index)): Path<(
@@ -218,7 +220,10 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
             SliverType,
             SliverIndex,
         )>,
-    ) -> (StatusCode, Json<ServiceResponse<DecodingSymbol>>) {
+    ) -> (
+        StatusCode,
+        Json<ServiceResponse<DecodingSymbol<MerkleProof>>>,
+    ) {
         match state.retrieve_recovery_symbol(&blob_id, sliver_pair_idx, sliver_type, index) {
             Ok(symbol) => {
                 tracing::debug!("Retrieved recovery symbol for {blob_id:?}");
@@ -298,6 +303,7 @@ mod test {
     use reqwest::StatusCode;
     use tokio_util::sync::CancellationToken;
     use walrus_core::{
+        merkle::MerkleProof,
         messages::StorageConfirmation,
         metadata::{
             SliverIndex,
@@ -370,7 +376,7 @@ mod test {
             sliver_pair_idx: SliverPairIndex,
             _sliver_type: SliverType,
             _index: SliverIndex,
-        ) -> Result<DecodingSymbol, RetrieveSymbolError> {
+        ) -> Result<DecodingSymbol<MerkleProof>, RetrieveSymbolError> {
             if sliver_pair_idx == SliverPairIndex::new(0) {
                 Ok(walrus_core::test_utils::recovery_symbol())
             } else {
@@ -679,6 +685,7 @@ mod test {
     }
 
     #[tokio::test]
+
     async fn get_decoding_symbol() {
         let server = UserServer::new(Arc::new(MockServiceState), CancellationToken::new());
         let test_private_parameters = test_utils::storage_node_private_parameters();
@@ -691,11 +698,12 @@ mod test {
 
         let blob_id = walrus_core::test_utils::random_blob_id();
         let sliver_pair_id = 0; // Triggers an valid response
+        let index = 0;
         let path = RECOVERY_ENDPOINT
             .replace(":blobId", &blob_id.to_string())
             .replace(":sliverPairIdx", &sliver_pair_id.to_string())
             .replace(":sliverType", "primary")
-            .replace(":index", "0");
+            .replace(":index", &index.to_string());
         let url = format!("http://{}{path}", test_private_parameters.network_address);
         // TODO(lef): Extract the path creation into a function with optional arguments
 
@@ -703,7 +711,9 @@ mod test {
         let res = client.get(url).json(&blob_id).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        let body = res.json::<ServiceResponse<DecodingSymbol>>().await;
+        let body = res
+            .json::<ServiceResponse<DecodingSymbol<MerkleProof>>>()
+            .await;
         match body.unwrap() {
             ServiceResponse::Success { code, data: _data } => {
                 assert_eq!(code, StatusCode::OK.as_u16());
