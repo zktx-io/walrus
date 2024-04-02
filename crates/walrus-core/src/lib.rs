@@ -4,15 +4,18 @@
 //! Core functionality for Walrus.
 use std::{
     fmt::{self, Debug, Display, LowerHex},
+    num::TryFromIntError,
     str::FromStr,
 };
 
 use encoding::{
+    EncodingAxis,
     PrimaryDecodingSymbol,
     PrimarySliver,
     RecoveryError,
     SecondaryDecodingSymbol,
     SecondarySliver,
+    WrongSliverVariantError,
 };
 use fastcrypto::{
     bls12381::min_pk::{BLS12381KeyPair, BLS12381PublicKey, BLS12381Signature},
@@ -163,6 +166,14 @@ impl Display for ShardIndex {
     }
 }
 
+impl TryFrom<usize> for ShardIndex {
+    type Error = TryFromIntError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Ok(Self(value.try_into()?))
+    }
+}
+
 /// A sliver of an erasure-encoded blob.
 ///
 /// Can be either a [`PrimarySliver`] or [`SecondarySliver`].
@@ -214,6 +225,37 @@ impl Sliver {
     /// Returns true iff the sliver length is 0.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Returns the [`Sliver<T>`][Sliver] contained within the enum.
+    pub fn to_raw<T>(self) -> Result<encoding::Sliver<T>, WrongSliverVariantError>
+    where
+        Self: TryInto<encoding::Sliver<T>>,
+        T: EncodingAxis,
+    {
+        self.try_into().map_err(|_| WrongSliverVariantError)
+    }
+}
+
+impl TryFrom<Sliver> for PrimarySliver {
+    type Error = WrongSliverVariantError;
+
+    fn try_from(value: Sliver) -> Result<Self, Self::Error> {
+        match value {
+            Sliver::Primary(sliver) => Ok(sliver),
+            Sliver::Secondary(_) => Err(WrongSliverVariantError),
+        }
+    }
+}
+
+impl TryFrom<Sliver> for SecondarySliver {
+    type Error = WrongSliverVariantError;
+
+    fn try_from(value: Sliver) -> Result<Self, Self::Error> {
+        match value {
+            Sliver::Primary(_) => Err(WrongSliverVariantError),
+            Sliver::Secondary(sliver) => Ok(sliver),
+        }
     }
 }
 
@@ -277,6 +319,28 @@ impl SliverType {
             SliverType::Primary => SliverType::Secondary,
             SliverType::Secondary => SliverType::Primary,
         }
+    }
+
+    /// Creates the [`SliverType`] for the [`EncodingAxis`].
+    pub fn for_encoding<T: EncodingAxis>() -> Self {
+        if T::IS_PRIMARY {
+            SliverType::Primary
+        } else {
+            SliverType::Secondary
+        }
+    }
+}
+
+impl Display for SliverType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                SliverType::Primary => "primary",
+                SliverType::Secondary => "secondary",
+            }
+        )
     }
 }
 

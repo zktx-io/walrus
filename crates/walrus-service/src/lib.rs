@@ -3,6 +3,8 @@
 
 //! Service functionality for Walrus.
 
+/// Client for the Walrus service.
+pub mod client;
 /// Configuration module.
 pub mod config;
 /// Encoding utilities.
