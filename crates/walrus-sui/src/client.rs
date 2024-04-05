@@ -175,10 +175,8 @@ impl SuiContractClient {
             .ok_or_else(|| SuiClientError::NoCompatiblePaymentCoin)?;
         let res = self
             .move_call_and_transfer(
-                contracts::system::reserve_space.with_type_params(&[
-                    self.read_client.system_tag.clone(),
-                    self.read_client.coin_type.clone(),
-                ]),
+                contracts::system::reserve_space
+                    .with_type_params(&[self.read_client.coin_type.clone()]),
                 vec![
                     self.read_client.call_arg_from_system_obj(true).await?,
                     encoded_size.into(),
@@ -189,10 +187,8 @@ impl SuiContractClient {
             .await?;
         let storage_id = get_created_object_ids_by_type(
             &res,
-            &contracts::storage_resource::Storage.to_move_struct_tag(
-                self.read_client.system_pkg,
-                &[self.read_client.system_tag.clone()],
-            )?,
+            &contracts::storage_resource::Storage
+                .to_move_struct_tag(self.read_client.system_pkg, &[])?,
         )?;
 
         ensure!(
@@ -218,10 +214,7 @@ impl SuiContractClient {
         let erasure_code_type: u8 = erasure_code_type.into();
         let res = self
             .move_call_and_transfer(
-                contracts::blob::register.with_type_params(&[
-                    self.read_client.system_tag.clone(),
-                    self.read_client.coin_type.clone(),
-                ]),
+                contracts::blob::register.with_type_params(&[self.read_client.coin_type.clone()]),
                 vec![
                     self.read_client.call_arg_from_system_obj(true).await?,
                     self.wallet.get_object_ref(storage.id).await?.into(),
@@ -233,10 +226,7 @@ impl SuiContractClient {
             .await?;
         let blob_obj_id = get_created_object_ids_by_type(
             &res,
-            &contracts::blob::Blob.to_move_struct_tag(
-                self.read_client.system_pkg,
-                &[self.read_client.system_tag.clone()],
-            )?,
+            &contracts::blob::Blob.to_move_struct_tag(self.read_client.system_pkg, &[])?,
         )?;
         ensure!(
             blob_obj_id.len() == 1,
@@ -256,10 +246,7 @@ impl SuiContractClient {
     ) -> SuiClientResult<Blob> {
         let res = self
             .move_call_and_transfer(
-                contracts::blob::certify.with_type_params(&[
-                    self.read_client.system_tag.clone(),
-                    self.read_client.coin_type.clone(),
-                ]),
+                contracts::blob::certify.with_type_params(&[self.read_client.coin_type.clone()]),
                 vec![
                     self.read_client.call_arg_from_system_obj(true).await?,
                     self.wallet.get_object_ref(blob.id).await?.into(),
