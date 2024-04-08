@@ -216,6 +216,16 @@ where
             event_polling_interval,
         }
     }
+
+    /// Specify which shards are managed by this storage node.
+    pub fn with_storage_shards(mut self, handled_shards: &[ShardIndex]) -> Self {
+        for shard in handled_shards {
+            self.storage
+                .create_storage_for_shard(*shard)
+                .expect("shard storage should be successfully created");
+        }
+        self
+    }
 }
 
 impl<T> StorageNode<T>
