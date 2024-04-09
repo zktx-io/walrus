@@ -89,7 +89,7 @@ module blob_store::bls_aggregate {
         };
 
         // The expression below is the solution to the inequality:
-        // total_shards = 3 f + 1
+        // total_weight = 3 f + 1
         // stake >= 2f + 1
         assert!(3 * (aggregate_weight as u64) >= 2 * (self.total_weight as u64) + 1,
             ERROR_NOT_ENOUGH_STAKE);

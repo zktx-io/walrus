@@ -2,14 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Walrus Storage Node entry point.
 
-use std::{
-    fs,
-    io,
-    net::SocketAddr,
-    num::{NonZeroU16, NonZeroU32},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs, io, net::SocketAddr, num::NonZeroU16, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -82,13 +75,13 @@ enum Commands {
         committee_size: NonZeroU16,
         /// The total number of shards.
         #[clap(long, default_value = "10")]
-        total_shards: NonZeroU16,
+        n_shards: NonZeroU16,
         /// Number of primary symbols to use (used to generate client config).
-        #[clap(long, default_value_t = 2)]
-        n_symbols_primary: u16,
+        #[clap(long, default_value = "2")]
+        n_symbols_primary: NonZeroU16,
         /// Number of secondary symbols to use (used to generate client config).
-        #[clap(long, default_value_t = 4)]
-        n_symbols_secondary: u16,
+        #[clap(long, default_value = "4")]
+        n_symbols_secondary: NonZeroU16,
     },
     /// Generate a new key pair.
     KeyGen {
@@ -112,7 +105,7 @@ enum CommitteeConfig {
     Manual {
         /// The total number of shards.
         #[clap(long, default_value = "100")]
-        total_shards: NonZeroU32,
+        n_shards: NonZeroU16,
         /// The number of source symbols for the primary encoding.
         #[clap(long, default_value = "30")]
         source_symbols_primary: NonZeroU16,
@@ -149,7 +142,7 @@ fn main() -> anyhow::Result<()> {
                     (encoding_config, handled_shards)
                 }
                 CommitteeConfig::Manual {
-                    total_shards,
+                    n_shards,
                     source_symbols_primary,
                     source_symbols_secondary,
                     handled_shards,
@@ -157,7 +150,7 @@ fn main() -> anyhow::Result<()> {
                     EncodingConfig::new(
                         source_symbols_primary.get(),
                         source_symbols_secondary.get(),
-                        total_shards.get(),
+                        n_shards.get(),
                     ),
                     handled_shards
                         .into_iter()
@@ -170,14 +163,14 @@ fn main() -> anyhow::Result<()> {
         Commands::GenerateDryRunConfigs {
             working_dir,
             committee_size,
-            total_shards,
+            n_shards,
             n_symbols_primary,
             n_symbols_secondary,
         } => {
             generate_dry_run_configs(
                 working_dir,
-                committee_size.get(),
-                total_shards.get(),
+                committee_size,
+                n_shards,
                 n_symbols_primary,
                 n_symbols_secondary,
             )?;
@@ -246,10 +239,10 @@ fn run_storage_node(
 
 fn generate_dry_run_configs(
     working_dir: PathBuf,
-    committee_size: u16,
-    shards: u16,
-    n_symbols_primary: u16,
-    n_symbols_secondary: u16,
+    committee_size: NonZeroU16,
+    shards: NonZeroU16,
+    n_symbols_primary: NonZeroU16,
+    n_symbols_secondary: NonZeroU16,
 ) -> anyhow::Result<()> {
     if let Err(e) = fs::create_dir_all(&working_dir) {
         return Err(e).context(format!(
@@ -275,7 +268,7 @@ fn generate_dry_run_configs(
         .context("Failed to write client configs")?;
 
     // Write the storage nodes config files.
-    for storage_node_index in 0..committee_size {
+    for storage_node_index in 0..committee_size.get() {
         let storage_node_config = storage_node_configs[storage_node_index as usize].clone();
         let serialized_storage_node_config = serde_yaml::to_string(&storage_node_config)
             .context("Failed to serialize storage node configs")?;

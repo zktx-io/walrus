@@ -44,7 +44,7 @@ pub fn primary_sliver() -> PrimarySliver {
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
         ],
-        4,
+        4.try_into().unwrap(),
         SliverPairIndex::new(1),
     )
 }
@@ -95,7 +95,7 @@ pub fn blob_id_from_u64(num: u64) -> BlobId {
 pub fn blob_metadata() -> BlobMetadata {
     let config = encoding_config();
     let unencoded_length = 62_831;
-    let hashes: Vec<_> = (0..config.n_shards)
+    let hashes: Vec<_> = (0..config.n_shards.into())
         .map(|i| SliverPairMetadata {
             primary_hash: Node::Digest([(i % 256) as u8; 32]),
             secondary_hash: Node::Digest([(i % 256) as u8; 32]),

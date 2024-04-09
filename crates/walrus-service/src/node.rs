@@ -165,18 +165,21 @@ pub struct StorageNode<T> {
 impl StorageNode<SuiReadClient> {
     /// Create a new storage node with the provided configuration.
     pub async fn new(
-        config: &StorageNodeConfig,
+        node_config: &StorageNodeConfig,
         registry_service: RegistryService,
         encoding_config: EncodingConfig,
     ) -> anyhow::Result<Self> {
         DBMetrics::init(&registry_service.default_registry());
-        let storage = Storage::open(config.storage_path.as_path(), MetricConf::new("storage"))?;
-        let protocol_key_pair = config
+        let storage = Storage::open(
+            node_config.storage_path.as_path(),
+            MetricConf::new("storage"),
+        )?;
+        let protocol_key_pair = node_config
             .protocol_key_pair
             .get()
             .expect("protocol keypair must already be loaded");
 
-        let sui_config = config
+        let sui_config = node_config
             .sui
             .as_ref()
             .ok_or_else(|| anyhow!("sui config must be present"))?;
@@ -320,7 +323,7 @@ where
     ) -> Result<Option<Sliver>, RetrieveSliverError> {
         let shard = shard_index_for_pair(
             sliver_pair_idx,
-            self.encoding_config.n_shards() as usize,
+            self.encoding_config.n_shards().get(),
             blob_id,
         );
         let sliver = self
@@ -342,7 +345,7 @@ where
         // If not, we can return early without touching the database.
         let shard = shard_index_for_pair(
             sliver_pair_idx,
-            self.encoding_config.n_shards() as usize,
+            self.encoding_config.n_shards().get(),
             blob_id,
         );
         let shard_storage = self

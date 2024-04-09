@@ -3,6 +3,8 @@
 
 //! The mapping between the encoded sliver pairs and shards.
 
+use std::num::NonZeroU16;
+
 use thiserror::Error;
 use walrus_core::{encoding::SliverPair, metadata::SliverPairIndex, BlobId, ShardIndex};
 
@@ -36,18 +38,28 @@ pub enum SliverAssignmentError {
 ///
 /// Returns a [`SliverAssignmentError`] if the `pairs` have already been shuffled in a way that is
 /// inconsistent with the provided `blob_id`.
+///
+/// # Panics
+///
+/// Panics if the length of the provided slice is larger than `u16::MAX`.
 pub fn rotate_pairs(
     pairs: &mut [SliverPair],
     blob_id: &BlobId,
 ) -> Result<(), SliverAssignmentError> {
-    if pairs.is_empty() {
+    let Some(n_pairs) = NonZeroU16::new(
+        pairs
+            .len()
+            .try_into()
+            .expect("there shouldn't be more than `u16::MAX` sliver pairs"),
+    ) else {
+        // Nothing to do for an empty slice.
         return Ok(());
-    }
+    };
     if is_rotation(pairs) {
         if pairs[0].index() == SliverPairIndex::new(0) {
             rotate_by_bytes(pairs, blob_id.as_ref());
         } else if pairs[0].index().as_usize()
-            != pair_index_for_shard(ShardIndex(0), pairs.len(), blob_id)
+            != pair_index_for_shard(ShardIndex(0), n_pairs.get().into(), blob_id)
         {
             return Err(SliverAssignmentError::InconsistentRotation);
         }
@@ -89,18 +101,16 @@ fn is_rotation(pairs: &[SliverPair]) -> bool {
 /// # Arguments
 ///
 /// * `pair_idx` - The index of the sliver pair, as returned by the blob-encoding function.
-/// * `total_shards` - The total number of shards in the system.
+/// * `n_shards` - The total number of shards in the system.
 /// * `blob_id` - The Blob ID that produced the sliver. It is interpreted as a big-endian unsigned
 /// integer, and then used to compute the offset for the sliver pair index.
-///
-/// # Panics
-/// Panic if the total number of shards is greater than `u16::MAX`.
 pub fn shard_index_for_pair(
     pair_idx: SliverPairIndex,
-    total_shards: usize,
+    n_shards: u16,
     blob_id: &BlobId,
 ) -> ShardIndex {
-    let index = (bytes_mod(blob_id.as_ref(), total_shards) + pair_idx.as_usize()) % total_shards;
+    let index =
+        (bytes_mod(blob_id.as_ref(), n_shards.into()) + pair_idx.as_usize()) % n_shards as usize;
     ShardIndex(index as u16)
 }
 
@@ -109,11 +119,11 @@ pub fn shard_index_for_pair(
 /// # Arguments
 ///
 /// * `shard_idx` - The index of the shard.
-/// * `total_shards` - The total number of shards in the system.
+/// * `n_shards` - The total number of shards in the system.
 /// * `blob_id` - The Blob ID that produced the sliver pair. It is interpreted as a big-endian
 /// unsigned integer, and the used to compute the offset for the sliver pair index.
-pub fn pair_index_for_shard(shard_idx: ShardIndex, total_shards: usize, blob_id: &BlobId) -> usize {
-    (total_shards - bytes_mod(blob_id.as_ref(), total_shards) + shard_idx.0 as usize) % total_shards
+pub fn pair_index_for_shard(shard_idx: ShardIndex, n_shards: usize, blob_id: &BlobId) -> usize {
+    (n_shards - bytes_mod(blob_id.as_ref(), n_shards) + shard_idx.0 as usize) % n_shards
 }
 
 /// Rotate the input slice in place, based on the rotation specified by the byte array.
@@ -138,18 +148,21 @@ fn bytes_mod(bytes: &[u8], modulus: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use walrus_core::{encoding::Sliver, test_utils};
+    use walrus_core::{encoding::EncodingConfig, test_utils};
     use walrus_test_utils::param_test;
 
     use super::*;
 
     // Fixture
-    fn sliver_pairs(num: u32) -> Vec<SliverPair> {
-        let num = num as u16;
+    fn sliver_pairs(num: u16) -> Vec<SliverPair> {
+        let encoding_config = EncodingConfig::new(1, 1, num);
         (0..num)
-            .map(|n| SliverPair {
-                primary: Sliver::new_empty(0, 1, SliverPairIndex::new(n)),
-                secondary: Sliver::new_empty(0, 1, SliverPairIndex::new(num - n - 1)),
+            .map(|n| {
+                SliverPair::new_empty(
+                    &encoding_config,
+                    1.try_into().unwrap(),
+                    SliverPairIndex::new(n),
+                )
             })
             .collect()
     }
@@ -231,14 +244,14 @@ mod tests {
     }
 
     fn test_shard_index_for_pair(
-        total_shards: usize,
+        n_shards: u16,
         blob_id_value: u64,
         pair_idx: SliverPairIndex,
         shard_idx: ShardIndex,
     ) {
         let blob_id = test_utils::blob_id_from_u64(blob_id_value);
         assert_eq!(
-            shard_index_for_pair(pair_idx, total_shards, &blob_id),
+            shard_index_for_pair(pair_idx, n_shards, &blob_id),
             shard_idx
         );
     }
@@ -252,14 +265,14 @@ mod tests {
     }
 
     fn test_pair_index_for_shard(
-        total_shards: usize,
+        n_shards: usize,
         blob_id_value: u64,
         shard_idx: ShardIndex,
         pair_idx: usize,
     ) {
         let blob_id = test_utils::blob_id_from_u64(blob_id_value);
         assert_eq!(
-            pair_index_for_shard(shard_idx, total_shards, &blob_id),
+            pair_index_for_shard(shard_idx, n_shards, &blob_id),
             pair_idx
         );
     }

@@ -4,7 +4,7 @@
 //! Core functionality for Walrus.
 use std::{
     fmt::{self, Debug, Display, LowerHex},
-    num::TryFromIntError,
+    num::{NonZeroUsize, TryFromIntError},
     str::FromStr,
 };
 
@@ -245,6 +245,7 @@ impl Sliver {
             Self::Primary(_) => config.sliver_size_for_blob::<Primary>(blob_size),
             Self::Secondary(_) => config.sliver_size_for_blob::<Secondary>(blob_size),
         }
+        .map(NonZeroUsize::get)
     }
 }
 

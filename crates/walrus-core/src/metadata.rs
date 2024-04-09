@@ -49,7 +49,6 @@ pub struct SliverIndex(pub u16);
 
 impl SliverIndex {
     /// Creates a new sliver index from the given `usize`.
-
     pub fn new(index: u16) -> Self {
         Self(index)
     }
@@ -163,11 +162,12 @@ impl UnverifiedBlobMetadataWithId {
         config: &EncodingConfig,
     ) -> Result<VerifiedBlobMetadataWithId, VerificationError> {
         let n_hashes = self.metadata().hashes.len();
+        let n_shards = config.n_shards.get().into();
         crate::ensure!(
-            n_hashes == config.n_shards as usize,
+            n_hashes == n_shards,
             VerificationError::InvalidHashCount {
                 actual: n_hashes,
-                expected: config.n_shards as usize,
+                expected: n_shards,
             }
         );
         crate::ensure!(
@@ -329,8 +329,8 @@ mod tests {
             let config = test_utils::encoding_config();
             let mut metadata = test_utils::unverified_blob_metadata();
             metadata.metadata.unencoded_length = u16::MAX as u64
-                * config.source_symbols_primary as u64
-                * config.source_symbols_secondary as u64
+                * config.source_symbols_primary.get() as u64
+                * config.source_symbols_secondary.get() as u64
                 + 1;
 
             let err = metadata
