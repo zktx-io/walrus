@@ -25,12 +25,11 @@ use walrus_core::{
     SliverPairIndex,
     SliverType,
 };
-use walrus_sui::types::EventType;
 
 use crate::{
     config::StorageNodeConfig,
     storage::Storage,
-    system_events::{SuiSystemEventProvider, SystemEventCursorSet, SystemEventProvider},
+    system_events::{SuiSystemEventProvider, SystemEventProvider},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -259,12 +258,9 @@ impl StorageNode {
     }
 
     async fn process_events(&self) -> anyhow::Result<()> {
-        let cursors = SystemEventCursorSet {
-            registered: self.storage.get_event_cursor(EventType::Registered)?,
-            certified: self.storage.get_event_cursor(EventType::Certified)?,
-        };
+        let cursor = self.storage.get_event_cursor()?;
 
-        let mut blob_events = Box::into_pin(self.event_provider.events(cursors).await?);
+        let mut blob_events = Box::into_pin(self.event_provider.events(cursor).await?);
         while let Some(event) = blob_events.next().await {
             tracing::debug!(event=?event.event_id(), "received system event");
             self.storage.update_blob_info(event)?;
