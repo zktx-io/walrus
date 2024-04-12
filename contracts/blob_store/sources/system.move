@@ -6,6 +6,7 @@ module blob_store::system {
     use sui::coin::{Self, Coin};
     use sui::table::{Self, Table};
     use sui::event;
+    use sui::bcs;
 
     use blob_store::committee::{Self, Committee};
     use blob_store::storage_accounting::{Self, FutureAccounting, FutureAccountingRingBuffer};
@@ -17,9 +18,11 @@ module blob_store::system {
     const ERROR_INVALID_PERIODS_AHEAD : u64 = 2;
     const ERROR_STORAGE_EXCEEDED : u64 = 3;
     const ERROR_INVALID_MSG_TYPE : u64 = 4;
+    const ERROR_INVALID_ID_EPOCH : u64 = 5;
 
     // Message types:
     const EPOCH_DONE_MSG_TYPE: u8 = 0;
+    const INVALID_BLOB_ID_MSG_TYPE : u8 = 2;
 
     // Epoch status values
     #[allow(unused_const)]
@@ -44,6 +47,12 @@ module blob_store::system {
     /// Signals that the epoch change is DONE now.
     public struct EpochChangeDone has copy, drop {
         epoch: u64,
+    }
+
+    /// Signals that a BlobID is invalid.
+    public struct InvalidBlobID has copy, drop {
+        epoch: u64, // The epoch in which the blob ID is first registered as invalid
+        blob_id: u256,
     }
 
     // Object definitions
@@ -309,6 +318,90 @@ module blob_store::system {
         event::emit(EpochChangeDone {
             epoch: message.epoch,
         });
+    }
+
+    // The logic to register an invalid Blob ID
+
+    /// Define a message type for the InvalidBlobID message.
+    /// It may only be constructed when a valid certified message is
+    /// passed in.
+    public struct CertifiedInvalidBlobID has drop {
+        epoch: u64,
+        blob_id: u256,
+    }
+
+    // read the blob id
+    public fun invalid_blob_id(
+        self: &CertifiedInvalidBlobID
+    ) : u256 {
+        self.blob_id
+    }
+
+    /// Construct the certified invalid Blob ID message, note that constructing
+    /// implies a certified message, that is already checked.
+    public fun invalid_blob_id_message(
+        message: committee::CertifiedMessage
+        ) : CertifiedInvalidBlobID {
+
+        // Assert type is correct
+        assert!(committee::intent_type(&message) == INVALID_BLOB_ID_MSG_TYPE,
+            ERROR_INVALID_MSG_TYPE);
+
+        // The InvalidBlobID message has no payload besides the blob_id.
+        // The certified blob message contain a blob_id : u256
+        let epoch = committee::cert_epoch(&message);
+        let message_body = committee::into_message(message);
+
+        let mut bcs_body = bcs::new(message_body);
+        let blob_id = bcs::peel_u256(&mut bcs_body);
+
+        // This output is provided as a service in case anything else needs to rely on
+        // certified invalid blob ID information in the future. But out base design only
+        // uses the event emitted here.
+        CertifiedInvalidBlobID { epoch, blob_id }
+    }
+
+    /// Private System call to process invalid blob id message. This checks that the epoch
+    /// in which the message was certified is correct, before emitting an event. Correct
+    /// nodes will only certify invalid blob ids within their period of validity, and this
+    /// endures we are not flooded with invalid events from past epochs.
+    public(package) fun inner_declare_invalid_blob_id<WAL>(
+        system: &System<WAL>,
+        message: CertifiedInvalidBlobID,
+    ) {
+
+        // Assert the epoch is correct.
+        let epoch = message.epoch;
+        assert!(epoch == epoch(system), ERROR_INVALID_ID_EPOCH);
+
+        // Emit the event about a blob id being invalid here.
+        event::emit(InvalidBlobID {
+            epoch,
+            blob_id: message.blob_id,
+        });
+    }
+
+    /// Public system call to process invalid blob id message. Will check the
+    /// the certificate in the current committee and ensure that the epoch is
+    /// correct as well.
+    public fun invalidate_blob_id<WAL>(
+        system: &System<WAL>,
+        signature: vector<u8>,
+        members: vector<u16>,
+        message: vector<u8>,
+    ) : u256 {
+        let committee = option::borrow(&system.current_committee);
+
+        let certified_message = committee::verify_quorum_in_epoch(
+            committee,
+            signature,
+            members,
+            message);
+
+        let invalid_blob_message = invalid_blob_id_message(certified_message);
+        let blob_id = invalid_blob_message.blob_id;
+        inner_declare_invalid_blob_id(system, invalid_blob_message);
+        blob_id
     }
 
 }
