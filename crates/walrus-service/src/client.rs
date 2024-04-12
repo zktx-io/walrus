@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use futures::Future;
 use reqwest::{Client as ReqwestClient, ClientBuilder};
 use tokio::time::Duration;
+use tracing::Instrument;
 use walrus_core::{
     encoding::{BlobDecoder, EncodingAxis, EncodingConfig, Sliver, SliverPair},
     metadata::VerifiedBlobMetadataWithId,
@@ -63,6 +64,7 @@ impl Client {
     }
 
     /// Encodes and stores a blob into Walrus by sending sliver pairs to at least 2f+1 shards.
+    #[tracing::instrument(skip_all, fields(blob_id_prefix))]
     pub async fn store_blob(
         &self,
         blob: &[u8],
@@ -71,6 +73,8 @@ impl Client {
             .encoding_config
             .get_blob_encoder(blob)?
             .encode_with_metadata();
+        tracing::Span::current().record("blob_id_prefix", truncate_blob_id(metadata.blob_id()));
+        tracing::debug!(blob_id = %metadata.blob_id(), "computed blob pairs and metadata");
         let pairs_per_node = self.pairs_per_node(metadata.blob_id(), pairs);
         let comms = self.node_communications();
         let mut requests = WeightedFutures::new(
@@ -91,17 +95,28 @@ impl Client {
                 self.concurrent_requests,
             )
             .await;
-        let results = requests.take_inner_ok();
-        drop(requests);
-        Ok((metadata, results))
+        let results = requests.into_results();
+        let valid_confirmations = results
+            .into_iter()
+            .filter_map(|NodeResult(_, _, node, result)| {
+                result
+                    .map_err(|err| {
+                        tracing::error!(?node, ?err, "storing metadata and pairs failed")
+                    })
+                    .ok()
+            })
+            .collect();
+        Ok((metadata, valid_confirmations))
     }
 
     /// Reconstructs the blob by reading slivers from Walrus shards.
+    #[tracing::instrument(skip_all, fields(blob_id_prefix = truncate_blob_id(blob_id)))]
     pub async fn read_blob<T>(&self, blob_id: &BlobId) -> Result<Vec<u8>>
     where
         T: EncodingAxis,
         Sliver<T>: TryFrom<SliverEnum>,
     {
+        tracing::debug!(%blob_id, "starting to read blob");
         let metadata = self.retrieve_metadata(blob_id).await?;
         self.request_slivers_and_decode::<T>(&metadata).await
     }
@@ -119,10 +134,10 @@ impl Client {
         let comms = self.node_communications();
         // Create requests to get all slivers from all nodes.
         let futures = comms.iter().flat_map(|n| {
-            n.node
-                .shard_ids
-                .iter()
-                .map(|s| n.retrieve_verified_sliver::<T>(metadata, *s))
+            n.node.shard_ids.iter().map(|s| {
+                n.retrieve_verified_sliver::<T>(metadata, *s)
+                    .instrument(n.span.clone())
+            })
         });
         let mut decoder = self
             .encoding_config
@@ -136,7 +151,18 @@ impl Client {
             )
             .await;
 
-        let slivers = requests.take_inner_ok();
+        let slivers = requests
+            .take_results()
+            .into_iter()
+            .filter_map(|NodeResult(_, _, node, result)| {
+                result
+                    .map_err(|err| {
+                        tracing::error!(?node, ?err, "retrieving sliver failed");
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+
         if let Some((blob, _meta)) = decoder.decode_and_verify(metadata.blob_id(), slivers)? {
             // We have enough to decode the blob.
             Ok(blob)
@@ -150,6 +176,7 @@ impl Client {
 
     /// Decodes the blob of given blob ID by requesting slivers and trying to decode at each new
     /// sliver it receives.
+    #[tracing::instrument(skip_all)]
     async fn decode_sliver_by_sliver<'a, I, Fut, T>(
         &self,
         requests: &mut WeightedFutures<I, Fut, NodeResult<Sliver<T>, SliverRetrieveError>>,
@@ -161,7 +188,8 @@ impl Client {
         I: Iterator<Item = Fut>,
         Fut: Future<Output = NodeResult<Sliver<T>, SliverRetrieveError>>,
     {
-        while let Some(NodeResult(_, _, _, result)) = requests.next(self.concurrent_requests).await
+        while let Some(NodeResult(_, _, node, result)) =
+            requests.next(self.concurrent_requests).await
         {
             match result {
                 Ok(sliver) => {
@@ -170,7 +198,9 @@ impl Client {
                         return Ok(blob);
                     }
                 }
-                Err(_e) => (), // TODO(giac): add tracing
+                Err(err) => {
+                    tracing::error!(?node, ?err, "retrieving sliver failed");
+                }
             }
         }
         // We have exhausted all the slivers but were not able to reconstruct the blob.
@@ -183,7 +213,10 @@ impl Client {
     /// against the blob ID.
     pub async fn retrieve_metadata(&self, blob_id: &BlobId) -> Result<VerifiedBlobMetadataWithId> {
         let comms = self.node_communications();
-        let futures = comms.iter().map(|n| n.retrieve_verified_metadata(blob_id));
+        let futures = comms.iter().map(|n| {
+            n.retrieve_verified_metadata(blob_id)
+                .instrument(n.span.clone())
+        });
         // Wait until the first request succeeds
         let mut requests = WeightedFutures::new(futures);
         requests.execute_weight(1, self.concurrent_requests).await;
@@ -240,4 +273,11 @@ impl Client {
         });
         pairs_per_node
     }
+}
+
+/// Returns the 8 characters of the blob ID.
+fn truncate_blob_id(blob_id: &BlobId) -> String {
+    let mut blob_id_string = blob_id.to_string();
+    blob_id_string.truncate(8);
+    blob_id_string
 }

@@ -250,6 +250,13 @@ impl TryFrom<SuiMoveStruct> for StorageNode {
     }
 }
 
+// TODO(giac): remove if unused in #243
+impl Display for StorageNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "node-pk: {}", self.public_key)
+    }
+}
+
 impl AssociatedContractStruct for StorageNode {
     const CONTRACT_STRUCT: StructTag<'static> = contracts::storage_node::StorageNodeInfo;
 }
