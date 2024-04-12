@@ -17,8 +17,6 @@ use walrus_core::{
 };
 use walrus_sui::types::{Committee, StorageNode};
 
-use crate::mapping::shard_index_for_pair;
-
 mod communication;
 mod config;
 mod error;
@@ -261,8 +259,7 @@ impl Client {
             .flat_map(|(idx, m)| m.shard_ids.iter().map(move |s| (*s, idx)))
             .collect::<HashMap<_, _>>();
         pairs.into_iter().for_each(|p| {
-            pairs_per_node[shard_to_node[&shard_index_for_pair(
-                p.index(),
+            pairs_per_node[shard_to_node[&p.index().to_shard_index(
                 self.committee
                     .total_weight
                     .try_into()
