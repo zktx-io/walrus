@@ -5,7 +5,7 @@ use anyhow::bail;
 use fastcrypto::traits::ToFromBytes;
 use test_cluster::TestClusterBuilder;
 use tokio_stream::StreamExt;
-use walrus_core::{BlobId, EncodingType, ShardIndex};
+use walrus_core::{merkle::Node, BlobId, EncodingType, ShardIndex};
 use walrus_sui::{
     client::{ContractClient, ReadClient, SuiContractClient},
     test_utils::{get_default_blob_certificate, system_setup::publish_with_default_system},
@@ -14,7 +14,7 @@ use walrus_sui::{
 
 #[tokio::test]
 #[ignore = "ignore integration tests by default"]
-async fn test_register_blob() -> anyhow::Result<()> {
+async fn test_register_certify_blob() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let test_cluster = TestClusterBuilder::new().build().await;
     let mut wallet = test_cluster.wallet;
@@ -35,14 +35,22 @@ async fn test_register_blob() -> anyhow::Result<()> {
     assert_eq!(storage_resource.end_epoch, 3);
     assert_eq!(storage_resource.storage_size, size);
     #[rustfmt::skip]
-    let blob_id = BlobId([
+    let root_hash = [
         1, 2, 3, 4, 5, 6, 7, 8,
         1, 2, 3, 4, 5, 6, 7, 8,
         1, 2, 3, 4, 5, 6, 7, 8,
         1, 2, 3, 4, 5, 6, 7, 8,
-    ]);
+    ];
+
+    let blob_id = BlobId::from_metadata(Node::from(root_hash), EncodingType::RedStuff, size);
     let blob_obj = walrus_client
-        .register_blob(&storage_resource, blob_id, size, EncodingType::RedStuff)
+        .register_blob(
+            &storage_resource,
+            blob_id,
+            root_hash,
+            size,
+            EncodingType::RedStuff,
+        )
         .await?;
     assert_eq!(blob_obj.blob_id, blob_id);
     assert_eq!(blob_obj.encoded_size, size);
@@ -63,9 +71,16 @@ async fn test_register_blob() -> anyhow::Result<()> {
     assert_eq!(blob_registered.end_epoch, storage_resource.end_epoch);
     assert_eq!(blob_registered.size, blob_obj.encoded_size);
 
-    let blob_obj = walrus_client
-        .certify_blob(&blob_obj, &get_default_blob_certificate(blob_id, 0))
-        .await?;
+    let certificate = get_default_blob_certificate(blob_id, 0);
+
+    // Values printed here should match move test `test_blob_certify_single_function`
+    // Note: we keep these commented in case we ever need to recompute them to update tests.
+    //
+    // println!("certificate signature: {:?}", certificate.signature.as_bytes());
+    // let bytes : Vec<u8> = certificate.confirmation.clone().into();
+    // println!("certificate message: {:?}", bytes);
+
+    let blob_obj = walrus_client.certify_blob(&blob_obj, &certificate).await?;
     assert_eq!(blob_obj.certified, Some(0));
 
     // Make sure that we got the expected event
@@ -88,14 +103,22 @@ async fn test_register_blob() -> anyhow::Result<()> {
     // we receive the event
     let storage_resource = walrus_client.reserve_space(size, 3).await?;
     #[rustfmt::skip]
-    let blob_id = BlobId([
+    let root_hash = [
         1, 2, 3, 4, 5, 6, 7, 0,
         1, 2, 3, 4, 5, 6, 7, 0,
         1, 2, 3, 4, 5, 6, 7, 0,
         1, 2, 3, 4, 5, 6, 7, 0,
-    ]);
+    ];
+    let blob_id = BlobId::from_metadata(Node::from(root_hash), EncodingType::RedStuff, size);
+
     let blob_obj = walrus_client
-        .register_blob(&storage_resource, blob_id, size, EncodingType::RedStuff)
+        .register_blob(
+            &storage_resource,
+            blob_id,
+            root_hash,
+            size,
+            EncodingType::RedStuff,
+        )
         .await?;
 
     // Make sure that we got the expected event
