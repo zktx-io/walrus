@@ -1,12 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Serialize};
 use sui_types::base_types::ObjectID;
-use walrus_core::encoding::EncodingConfig;
-use walrus_sui::types::Committee;
 
 use crate::config::LoadConfig;
 
@@ -14,30 +12,57 @@ use crate::config::LoadConfig;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// The number of parallel requests the client makes.
+    #[serde(default = "defaults::default_concurrent_requests")]
     pub concurrent_requests: usize,
     /// Timeout for the `reqwest` client used by the client,
+    #[serde(default = "defaults::default_connection_timeout")]
     pub connection_timeout: Duration,
     /// The walrus package id.
     pub system_pkg: ObjectID,
     /// The system walrus system object id.
     pub system_object: ObjectID,
+    /// Path to the wallet configuration.
+    ///
+    /// If set, this MUST be an absolute path.
+    #[serde(deserialize_with = "deserialize_wallet_config")]
+    pub wallet_config: Option<PathBuf>,
 }
 
 impl LoadConfig for Config {}
 
-/// Temporary config with information that can be eventually fetched from the chain.
-// TODO: remove as soon as the information is fetched from the chain.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LocalCommitteeConfig {
-    /// The committee information.
-    pub committee: Committee,
+fn deserialize_wallet_config<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let path = Option::<PathBuf>::deserialize(deserializer)?;
+    if let Some(path) = &path {
+        if !path.is_absolute() {
+            return Err(D::Error::custom(format!(
+                "an absolute path is required for the wallet config (found {})",
+                path.display()
+            )));
+        }
+    }
+    Ok(path)
 }
 
-impl LoadConfig for LocalCommitteeConfig {}
+/// Returns the default paths for the Walrus configuration file.
+pub fn default_configuration_paths() -> Vec<PathBuf> {
+    let mut default_paths = vec!["./config.yaml".into()];
+    if let Some(home_dir) = home::home_dir() {
+        default_paths.push(home_dir.join(".walrus").join("config.yaml"))
+    }
+    default_paths
+}
 
-impl LocalCommitteeConfig {
-    /// Returns the [`EncodingConfig`] for this configuration.
-    pub fn encoding_config(&self) -> EncodingConfig {
-        EncodingConfig::new(self.committee.n_shards())
+mod defaults {
+    use std::time::Duration;
+
+    pub fn default_concurrent_requests() -> usize {
+        10
+    }
+
+    pub fn default_connection_timeout() -> Duration {
+        Duration::from_secs(10)
     }
 }
