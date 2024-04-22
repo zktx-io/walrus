@@ -259,6 +259,9 @@ impl EncodingConfig {
     ///
     /// The output length includes the metadata and the blob ID sizes.
     /// Returns `None` if the blob size cannot be computed.
+    ///
+    /// This computation is the same as done by the function of the same name in
+    /// `contracts/blob_store/redstuff.move` and should be kept in sync.
     pub fn encoded_blob_length(&self, unencoded_length: usize) -> Option<u64> {
         let slivers_size = (self.source_symbols_primary.get() as u64
             + self.source_symbols_secondary.get() as u64)
@@ -344,6 +347,29 @@ mod tests {
             EncodingConfig::new_from_n_source_symbols(3, 5, 10)
                 .sliver_size_for_blob::<Primary>(blob_size),
             expected_primary_sliver_size.and_then(NonZeroUsize::new)
+        );
+    }
+
+    param_test! {
+        test_encoded_size: [
+            zero: (0, 10, None),
+            one_small_committee: (1, 10, Some(10*((4+7) + 10*2*32 + 32))),
+            one_large_committee: (1, 1000, Some(1000*((329+662) + 1000*2*32 + 32))),
+            larger_blob_small_committee: ((4*7)*100, 10, Some(10*((4+7)*100 + 10*2*32 + 32))),
+            larger_blob_large_committee: (
+                (329*662)*100,
+                1000,
+                Some(1000*((329+662)*100 + 1000*2*32 + 32))
+            ),
+
+        ]
+    }
+    /// These tests replicate the tests for `encoded_blob_length` in
+    /// `contracts/blob_store/redstuff.move` and should be kept in sync.
+    fn test_encoded_size(blob_size: usize, n_shards: u16, expected_encoded_size: Option<u64>) {
+        assert_eq!(
+            EncodingConfig::new(NonZeroU16::new(n_shards).unwrap()).encoded_blob_length(blob_size),
+            expected_encoded_size,
         );
     }
 

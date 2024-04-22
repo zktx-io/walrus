@@ -1,11 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroU16;
+
 use anyhow::bail;
 use fastcrypto::traits::ToFromBytes;
 use test_cluster::TestClusterBuilder;
 use tokio_stream::StreamExt;
-use walrus_core::{merkle::Node, BlobId, EncodingType, ShardIndex};
+use walrus_core::{encoding::EncodingConfig, merkle::Node, BlobId, EncodingType, ShardIndex};
 use walrus_sui::{
     client::{ContractClient, ReadClient, SuiContractClient},
     test_utils::{get_default_blob_certificate, system_setup::publish_with_default_system},
@@ -22,6 +24,9 @@ async fn test_register_certify_blob() -> anyhow::Result<()> {
     let walrus_client =
         SuiContractClient::new(wallet, package_id, system_object, 10000000000).await?;
 
+    // used to calculate the encoded size of the blob
+    let encoding_config = EncodingConfig::new(NonZeroU16::new(100).unwrap());
+
     // Get event streams for the events
     let polling_duration = std::time::Duration::from_millis(50);
     let mut events = walrus_client
@@ -29,11 +34,12 @@ async fn test_register_certify_blob() -> anyhow::Result<()> {
         .blob_events(polling_duration, None)
         .await?;
 
-    let size = 10000;
-    let storage_resource = walrus_client.reserve_space(size, 3).await?;
+    let size = 10_000;
+    let resource_size = encoding_config.encoded_blob_length(size as usize).unwrap();
+    let storage_resource = walrus_client.reserve_space(resource_size, 3).await?;
     assert_eq!(storage_resource.start_epoch, 0);
     assert_eq!(storage_resource.end_epoch, 3);
-    assert_eq!(storage_resource.storage_size, size);
+    assert_eq!(storage_resource.storage_size, resource_size);
     #[rustfmt::skip]
     let root_hash = [
         1, 2, 3, 4, 5, 6, 7, 8,
@@ -53,7 +59,7 @@ async fn test_register_certify_blob() -> anyhow::Result<()> {
         )
         .await?;
     assert_eq!(blob_obj.blob_id, blob_id);
-    assert_eq!(blob_obj.encoded_size, size);
+    assert_eq!(blob_obj.size, size);
     assert_eq!(blob_obj.certified, None);
     assert_eq!(blob_obj.storage, storage_resource);
     assert_eq!(blob_obj.stored_epoch, 0);
@@ -69,7 +75,7 @@ async fn test_register_certify_blob() -> anyhow::Result<()> {
         blob_obj.erasure_code_type
     );
     assert_eq!(blob_registered.end_epoch, storage_resource.end_epoch);
-    assert_eq!(blob_registered.size, blob_obj.encoded_size);
+    assert_eq!(blob_registered.size, blob_obj.size);
 
     let certificate = get_default_blob_certificate(blob_id, 0);
 
@@ -101,7 +107,7 @@ async fn test_register_certify_blob() -> anyhow::Result<()> {
 
     // Now register and certify a blob with a different blob id again to check that
     // we receive the event
-    let storage_resource = walrus_client.reserve_space(size, 3).await?;
+    let storage_resource = walrus_client.reserve_space(resource_size, 3).await?;
     #[rustfmt::skip]
     let root_hash = [
         1, 2, 3, 4, 5, 6, 7, 0,
