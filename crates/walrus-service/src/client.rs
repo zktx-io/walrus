@@ -18,6 +18,7 @@ use walrus_core::{
     SignedStorageConfirmation,
     Sliver as SliverEnum,
 };
+use walrus_sdk::error::NodeError;
 use walrus_sui::{
     client::{ContractClient, ReadClient},
     types::{Blob, Committee, StorageNode},
@@ -30,7 +31,7 @@ mod error;
 mod utils;
 
 use communication::{NodeCommunication, NodeResult};
-use error::{SliverRetrieveError, StoreError};
+use error::StoreError;
 use utils::WeightedFutures;
 
 /// A client to communicate with Walrus shards and storage nodes.
@@ -179,8 +180,8 @@ impl<T> Client<T> {
     ///
     /// This function _does not_ check that the received confirmations match the current epoch and
     /// blob ID, as it assumes that the storage confirmations were received through
-    /// `NodeCommunication::store_metadata_and_pairs`, which internally uses `verify_confirmation`
-    /// to check blob ID and epoch.
+    /// `NodeCommunication::store_metadata_and_pairs`, which internally verifies it to check the
+    /// blob ID and epoch.
     fn confirmations_to_certificate(
         &self,
         blob_id: &BlobId,
@@ -286,14 +287,14 @@ impl<T> Client<T> {
     #[tracing::instrument(skip_all)]
     async fn decode_sliver_by_sliver<'a, I, Fut, U>(
         &self,
-        requests: &mut WeightedFutures<I, Fut, NodeResult<Sliver<U>, SliverRetrieveError>>,
+        requests: &mut WeightedFutures<I, Fut, NodeResult<Sliver<U>, NodeError>>,
         decoder: &mut BlobDecoder<'a, U>,
         blob_id: &BlobId,
     ) -> Result<Vec<u8>>
     where
         U: EncodingAxis,
         I: Iterator<Item = Fut>,
-        Fut: Future<Output = NodeResult<Sliver<U>, SliverRetrieveError>>,
+        Fut: Future<Output = NodeResult<Sliver<U>, NodeError>>,
     {
         while let Some(NodeResult(_, _, node, result)) =
             requests.next(self.concurrent_requests).await
