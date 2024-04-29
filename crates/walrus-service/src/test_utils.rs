@@ -18,7 +18,13 @@ use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 use typed_store::rocks::MetricConf;
 use walrus_core::{test_utils, Epoch, ProtocolKeyPair, PublicKey, ShardIndex};
-use walrus_sui::types::{BlobEvent, Committee, NetworkAddress, StorageNode as SuiStorageNode};
+use walrus_sui::types::{
+    BlobEvent,
+    Committee,
+    InvalidCommittee,
+    NetworkAddress,
+    StorageNode as SuiStorageNode,
+};
 use walrus_test_utils::WithTempDir;
 
 use crate::{
@@ -428,6 +434,31 @@ impl TestCluster {
     /// Returns a new builder to create the [`TestCluster`].
     pub fn builder() -> TestClusterBuilder {
         TestClusterBuilder::default()
+    }
+
+    /// Returns the [`Committee`] configuration for the current cluster.
+    pub fn committee(&self) -> Result<Committee, InvalidCommittee> {
+        let members = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| SuiStorageNode {
+                name: format!("node-{i}"),
+                network_address: node.rest_api_address.into(),
+                public_key: node.public_key.clone(),
+                shard_ids: node.storage_node.shards(),
+            })
+            .collect();
+        Committee::new(members, 0)
+    }
+
+    /// Stops the storage node with index `idx` by cancelling its task.
+    pub fn cancel_node(&mut self, idx: usize) {
+        assert!(
+            idx < self.nodes.len(),
+            "the index of the node to be dropped must be within the node vector"
+        );
+        self.nodes[idx].cancel.cancel();
     }
 }
 

@@ -1,15 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{num::NonZeroU16, time::Duration};
+use std::{num::NonZeroU16, sync::OnceLock, time::Duration};
 
-use anyhow::Context;
+use anyhow::anyhow;
 use sui_types::{base_types::ObjectID, digests::TransactionDigest, event::EventID};
+use tokio::sync::Mutex;
 use walrus_core::{
     encoding::{EncodingConfig, Primary},
     BlobId,
     EncodingType,
-    ShardIndex,
 };
 use walrus_service::{
     client::{Client, Config},
@@ -17,16 +17,51 @@ use walrus_service::{
 };
 use walrus_sui::{
     test_utils::{MockContractClient, MockSuiReadClient},
-    types::{BlobCertified, BlobRegistered, Committee, StorageNode as SuiStorageNode},
+    types::{BlobCertified, BlobRegistered},
 };
-use walrus_test_utils::Result as TestResult;
+use walrus_test_utils::async_param_test;
 
-#[tokio::test]
-#[ignore = "ignore E2E tests by default"]
-async fn test_store_and_read_blob() -> TestResult {
+async_param_test! {
+    test_store_and_read_blob_with_crash_failures : [
+        #[ignore = "ignore E2E tests by default"] #[tokio::test] no_failures: (&[], Ok(())),
+        #[ignore = "ignore E2E tests by default"] #[tokio::test] shard_failure: (&[0], Ok(())),
+        #[ignore = "ignore E2E tests by default"] #[tokio::test] f_shard_failure: (&[4], Ok(())),
+        #[ignore = "ignore E2E tests by default"] #[tokio::test] f_plus_one_shard_failure:
+            (&[0, 4], Err(anyhow!("not enough confirmations for the blob id were retrieved"))),
+        #[ignore = "ignore E2E tests by default"] #[tokio::test] all_shard_failure:
+            (
+                &[0, 1, 2, 3, 4],
+                Err(anyhow!("not enough confirmations for the blob id were retrieved"))
+            ),
+    ]
+}
+async fn test_store_and_read_blob_with_crash_failures(
+    failed_nodes: &[usize],
+    expected: anyhow::Result<()>,
+) {
+    let result = run_store_and_read_with_crash_failures(failed_nodes).await;
+    match (result, expected) {
+        (Ok(()), Ok(())) => (),
+        (Err(actual_err), Err(expected_err)) => {
+            assert_eq!(
+                format!("{}", actual_err.root_cause()),
+                format!("{}", expected_err.root_cause())
+            )
+        }
+        (act, exp) => panic!(
+            "test result mismatch; expected=({:?}); actual=({:?});",
+            exp, act
+        ),
+    }
+}
+
+async fn run_store_and_read_with_crash_failures(failed_nodes: &[usize]) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let encoding_config = EncodingConfig::new(NonZeroU16::new(10).unwrap());
+    let blob = walrus_test_utils::random_data(31415);
+
+    // The default `TestCluster` has 13 shards.
+    let encoding_config = EncodingConfig::new(NonZeroU16::new(13).unwrap());
 
     let config = Config {
         concurrent_requests: 10,
@@ -36,49 +71,35 @@ async fn test_store_and_read_blob() -> TestResult {
         wallet_config: None,
     };
 
-    let blob = walrus_test_utils::random_data(31415);
     let blob_id = encoding_config
         .get_blob_encoder(&blob)?
         .compute_metadata()
         .blob_id()
         .to_owned();
 
-    let assignment: Vec<&[u16]> = vec![&[0, 1], &[2, 3], &[4, 5, 6], &[7, 8, 9]];
-    let cluster = TestCluster::builder()
-        .with_shard_assignment(&assignment)
-        .with_system_event_providers(vec![
-            blob_registered_event(blob_id).into(),
-            blob_certified_event(blob_id).into(),
-        ])
-        .build()
-        .await?;
-
-    let members = cluster
-        .nodes
-        .iter()
-        .zip(assignment)
-        .enumerate()
-        .map(|(i, (node, shard_ids))| SuiStorageNode {
-            name: format!("node-{i}"),
-            network_address: node.rest_api_address.into(),
-            public_key: node.public_key.clone(),
-            shard_ids: shard_ids.iter().map(ShardIndex::from).collect(),
-        })
-        .collect();
-    let committee = Committee::new(members, 0)?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cluster_builder = TestCluster::builder().with_system_event_providers(vec![
+        blob_registered_event(blob_id).into(),
+        blob_certified_event(blob_id).into(),
+    ]);
+    let mut cluster = {
+        // Lock to avoid race conditions.
+        let _lock = global_test_lock().lock().await;
+        cluster_builder.build().await?
+    };
 
     let sui_contract_client = MockContractClient::new(
         0,
-        MockSuiReadClient::new_with_blob_ids([blob_id], Some(committee)),
+        MockSuiReadClient::new_with_blob_ids([blob_id], Some(cluster.committee()?)),
     );
     let client = Client::new(config, sui_contract_client).await?;
 
+    // Stop the nodes in the failure set.
+    failed_nodes
+        .iter()
+        .for_each(|&idx| cluster.cancel_node(idx));
+
     // Store a blob and get confirmations from each node.
-    let blob_confirmation = client
-        .reserve_and_store_blob(&blob, 1)
-        .await
-        .context("unable to reserve and store blob")?;
+    let blob_confirmation = client.reserve_and_store_blob(&blob, 1).await?;
 
     // Read the blob.
     let read_blob = client
@@ -88,6 +109,12 @@ async fn test_store_and_read_blob() -> TestResult {
     assert_eq!(read_blob, blob);
 
     Ok(())
+}
+
+// Prevent tests running simultaneously to avoid interferences or race conditions.
+fn global_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(Mutex::default)
 }
 
 fn blob_registered_event(blob_id: BlobId) -> BlobRegistered {
