@@ -11,11 +11,18 @@ use crate::config::LoadConfig;
 /// Config for the client.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
-    /// The number of parallel requests the client makes.
-    #[serde(default = "defaults::default_concurrent_requests")]
-    pub concurrent_requests: usize,
+    /// The maximum number of storage nodes the client contacts in parallel to write slivers and
+    /// metadata. If `None`, the value is set by the client to `n - f`, depending on the number of
+    /// shards `n`.
+    pub concurrent_writes: Option<usize>,
+    /// The maximum number of slivers the client requests in parallel. If `None`, the value is set
+    /// by the client to `n - 2f`, depending on the number of shards `n`.
+    pub concurrent_sliver_reads: Option<usize>,
+    /// The maximum number of nodes the client contacts to get the blob metadata in parallel.
+    #[serde(default = "default::concurrent_metadata_reads")]
+    pub concurrent_metadata_reads: usize,
     /// Timeout for the `reqwest` client used by the client,
-    #[serde(default = "defaults::default_connection_timeout")]
+    #[serde(default = "default::connection_timeout")]
     pub connection_timeout: Duration,
     /// The walrus package id.
     pub system_pkg: ObjectID,
@@ -55,14 +62,24 @@ pub fn default_configuration_paths() -> Vec<PathBuf> {
     default_paths
 }
 
-mod defaults {
-    use std::time::Duration;
+pub(crate) mod default {
+    use std::{num::NonZeroU16, time::Duration};
 
-    pub fn default_concurrent_requests() -> usize {
-        10
+    use walrus_core::bft;
+
+    pub fn concurrent_writes(n_shards: NonZeroU16) -> usize {
+        (n_shards.get() - bft::max_n_faulty(n_shards)) as usize
     }
 
-    pub fn default_connection_timeout() -> Duration {
+    pub fn concurrent_sliver_reads(n_shards: NonZeroU16) -> usize {
+        (n_shards.get() - 2 * bft::max_n_faulty(n_shards)) as usize
+    }
+
+    pub fn concurrent_metadata_reads() -> usize {
+        3
+    }
+
+    pub fn connection_timeout() -> Duration {
         Duration::from_secs(10)
     }
 }
