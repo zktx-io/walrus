@@ -40,8 +40,10 @@ pub struct EncodingConfig {
 }
 
 impl EncodingConfig {
-    /// Creates a new encoding config with the appropriate number of primary and secondary source
-    /// symbols for the given number of shards.
+    /// Creates a new encoding config, given the number of shards.
+    ///
+    /// The number of shards determines the the appropriate number of primary and secondary source
+    /// symbols.
     ///
     /// The decoding probability is given by the [`decoding_safety_limit`]. See the documentation of
     /// [`decoding_safety_limit`] and [`source_symbols_for_n_shards`] for more details.
@@ -57,17 +59,11 @@ impl EncodingConfig {
 
     /// Creates a new encoding configuration for the provided system parameters.
     ///
-    /// # Arguments
-    ///
-    /// * `source_symbols_primary` - The number of source symbols for the primary encoding. This
-    ///   should be equal to or below `n_shards - 2f`, where `f` is the Byzantine parameter.
-    /// * `source_symbols_secondary` - The number of source symbols for the secondary encoding. This
-    ///   should be equal to or below `n_shards - f`.
-    /// * `n_shards` - The total number of shards.
-    ///
-    /// # Returns
-    ///
-    /// The encoding configuration.
+    /// In a setup with `n_shards` total shards -- among which `f` are Byzantine, and
+    /// `f < n_shards / 3` -- `source_symbols_primary` is the number of source symbols for the
+    /// primary encoding (must be equal to or below `n_shards - 2f`), and `source_symbols_secondary`
+    /// is the number of source symbols for the secondary encoding (must be equal to or below
+    /// `n_shards - f`).
     ///
     /// # Panics
     ///
@@ -233,13 +229,11 @@ impl EncodingConfig {
         (self.n_shards_as_usize() * DIGEST_LEN * 2 + BlobId::LENGTH) as u64
     }
 
-    /// Returns an [`Encoder`] to perform a single primary or secondary encoding of the provided
-    /// data.
+    /// Returns an [`Encoder`] to perform a single primary or secondary encoding of the data.
     ///
-    /// # Arguments
-    ///
-    /// * `encoding_axis` - Sets the encoding parameters for the primary or secondary encoding.
-    /// * `data` - The data to be encoded. This *does not* have to be aligned/padded.
+    /// The `data` to be encoded _does not_ have to be aligned/padded. The `encoding_axis` specifies
+    /// which encoding parameters the encoder uses, i.e., the parameters for either the primary or
+    /// the secondary encoding.
     ///
     /// # Errors
     ///
@@ -256,9 +250,7 @@ impl EncodingConfig {
 
     /// Returns a [`BlobEncoder`] to encode a blob into [`SliverPair`s][super::SliverPair].
     ///
-    /// # Arguments
-    ///
-    /// * `blob` - The blob to be encoded. Does not have to be padded.
+    /// The `blob` to be encoded does not have to be padded.
     ///
     /// # Errors
     ///
@@ -270,9 +262,7 @@ impl EncodingConfig {
     /// Returns a [`BlobDecoder`] to reconstruct a blob from either
     /// [`Primary`][super::PrimarySliver] or [`Secondary`][super::SecondarySliver] slivers.
     ///
-    /// # Arguments
-    ///
-    /// * `blob_size` - The size of the blob to be decoded.
+    /// `blob_size` is the _unencoded_ size (i.e., before encoding) of the blob to be decoded.
     ///
     /// # Errors
     ///
@@ -285,9 +275,11 @@ impl EncodingConfig {
     }
 }
 
-/// Returns the minimum difference between the number of primary source symbols and 1/3rd of the
-/// number of shards, and between the number of secondary source symbols and 2/3rds of the number of
-/// shards.
+/// Returns the "safety limit" for the encoding.
+///
+/// The safety limit is the minimum difference between the number of primary source symbols and
+/// 1/3rd of the number of shards, and between the number of secondary source symbols and 2/3rds of
+/// the number of shards.
 ///
 /// This safety limit ensures that, when collecting symbols for reconstruction or recovery, f+1
 /// replies (for primary symbols) or 2f+1 replies (for secondary symbols) from a committee of 3f+1
