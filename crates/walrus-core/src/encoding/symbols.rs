@@ -24,6 +24,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbols {
     /// The encoded symbols.
+    // INV: The length of this vector is a multiple of `symbol_size`.
     data: Vec<u8>,
     /// The number of bytes for each symbol.
     symbol_size: NonZeroU16,
@@ -38,7 +39,7 @@ impl Symbols {
     /// `data.len() % symbol_size != 0`.
     pub fn new(data: Vec<u8>, symbol_size: NonZeroU16) -> Self {
         assert!(
-            data.len() % symbol_size.get() as usize == 0,
+            data.len() % usize::from(symbol_size.get()) == 0,
             "the provided data must contain complete symbols"
         );
         Symbols { data, symbol_size }
@@ -48,13 +49,14 @@ impl Symbols {
     /// rest. If `len` is greater or equal to the [`Symbols`]’ current number of symbols, this has
     /// no effect.
     pub fn truncate(&mut self, len: usize) {
-        self.data.truncate(len * self.symbol_size.get() as usize);
+        self.data
+            .truncate(len * usize::from(self.symbol_size.get()));
     }
 
     /// Creates a new [`Symbols`] struct with zeroed-out data of length `n_symbols * symbol_size`.
     pub fn zeros(n_symbols: usize, symbol_size: NonZeroU16) -> Self {
         Symbols {
-            data: vec![0; n_symbols * symbol_size.get() as usize],
+            data: vec![0; n_symbols * usize::from(symbol_size.get())],
             symbol_size,
         }
     }
@@ -94,7 +96,7 @@ impl Symbols {
     /// True iff it does not contain any symbols.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.data.is_empty()
     }
 
     /// Obtain a reference to the symbol at `index`.
@@ -159,13 +161,10 @@ impl Symbols {
     pub fn to_decoding_symbols<T: EncodingAxis>(
         &self,
     ) -> Option<impl Iterator<Item = DecodingSymbol<T>> + '_> {
-        if self.len() > u32::MAX as usize {
-            None
-        } else {
-            Some(self.to_symbols().enumerate().map(|(i, s)| {
-                DecodingSymbol::new(i.try_into().expect("checked limit above"), s.into())
-            }))
-        }
+        let _ = u32::try_from(self.len()).ok()?;
+        Some(self.to_symbols().enumerate().map(|(i, s)| {
+            DecodingSymbol::new(i.try_into().expect("checked limit above"), s.into())
+        }))
     }
 
     /// Add one or more symbols to the collection.
@@ -307,7 +306,7 @@ impl<T: EncodingAxis, U> DecodingSymbol<T, U> {
 
     /// Returns true iff the symbol size is 0.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.data.is_empty()
     }
 }
 
@@ -430,7 +429,10 @@ mod tests {
     fn correct_symbols_new_empty(n_symbols: usize, symbol_size: u16) {
         let symbol_size = symbol_size.try_into().unwrap();
         let symbols = Symbols::zeros(n_symbols, symbol_size);
-        assert_eq!(symbols.data.len(), n_symbols * symbol_size.get() as usize);
+        assert_eq!(
+            symbols.data.len(),
+            n_symbols * usize::from(symbol_size.get())
+        );
         assert_eq!(symbols.symbol_size, symbol_size);
     }
 

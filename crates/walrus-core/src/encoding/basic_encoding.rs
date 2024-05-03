@@ -47,17 +47,11 @@ impl Encoder {
         encoding_plan: &SourceBlockEncodingPlan,
     ) -> Result<Self, EncodeError> {
         assert!(n_shards >= n_source_symbols);
-        if data.is_empty() {
-            return Err(EncodeError::EmptyData);
-        }
-        if data.len() % n_source_symbols.get() as usize != 0 {
+        if data.len() % usize::from(n_source_symbols.get()) != 0 {
             return Err(EncodeError::MisalignedData(n_source_symbols));
         }
-
-        let Some(symbol_size) = utils::compute_symbol_size(data.len(), n_source_symbols.into())
-        else {
-            return Err(EncodeError::DataTooLarge);
-        };
+        let symbol_size =
+            utils::compute_symbol_size_from_usize(data.len(), n_source_symbols.into())?;
 
         Ok(Self {
             raptorq_encoder: SourceBlockEncoder::with_encoding_plan(
@@ -112,7 +106,7 @@ impl Encoder {
             .source_packets()
             .into_iter()
             .chain(self.raptorq_encoder.repair_packets(0, repair_end.into()))
-            .skip(range.start as usize)
+            .skip(range.start.into())
             .take(range.len())
             .map(utils::packet_to_data)
     }
@@ -158,7 +152,7 @@ impl Decoder {
             raptorq_decoder: SourceBlockDecoder::new(
                 0,
                 &utils::get_transmission_info(symbol_size),
-                (n_source_symbols.get() as u64) * (symbol_size.get() as u64),
+                u64::from(n_source_symbols.get()) * u64::from(symbol_size.get()),
             ),
             symbol_size,
         }
@@ -177,7 +171,7 @@ impl Decoder {
         U: EncodingAxis,
         V: std::fmt::Debug,
     {
-        let expected_symbol_size = self.symbol_size.get() as usize;
+        let expected_symbol_size: usize = self.symbol_size.get().into();
         let packets = symbols.into_iter().filter_map(|symbol| {
             let actual_symbol_size = symbol.len();
             if actual_symbol_size == expected_symbol_size {
@@ -204,7 +198,7 @@ mod tests {
     use walrus_test_utils::{param_test, random_data, Result};
 
     use super::*;
-    use crate::encoding::Primary;
+    use crate::encoding::{InvalidDataSizeError, Primary};
 
     #[test]
     fn encoding_empty_data_fails() {
@@ -214,7 +208,9 @@ mod tests {
                 NonZeroU16::new(42).unwrap(),
                 NonZeroU16::new(314).unwrap()
             ),
-            Err(EncodeError::EmptyData)
+            Err(EncodeError::InvalidDataSize(
+                InvalidDataSizeError::EmptyData
+            ))
         ));
     }
 

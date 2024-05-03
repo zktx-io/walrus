@@ -133,7 +133,7 @@ impl<T: ContractClient> Client<T> {
         tracing::Span::current().record("blob_id_prefix", string_prefix(metadata.blob_id()));
         let encoded_length = self
             .encoding_config
-            .encoded_blob_length(blob.len())
+            .encoded_blob_length_from_usize(blob.len())
             .expect("valid for metadata created from the same config");
         tracing::debug!(blob_id = %metadata.blob_id(), ?encoded_length,
                         "computed blob pairs and metadata");
@@ -151,7 +151,9 @@ impl<T: ContractClient> Client<T> {
                 &storage_resource,
                 *metadata.blob_id(),
                 root_hash.bytes(),
-                blob.len() as u64,
+                blob.len()
+                    .try_into()
+                    .expect("conversion implicitly checked above"),
                 metadata.metadata().encoding_type,
             )
             .await?;
@@ -285,7 +287,7 @@ impl<T> Client<T> {
         });
         let mut decoder = self
             .encoding_config
-            .get_blob_decoder::<U>(metadata.metadata().unencoded_length.try_into()?)?;
+            .get_blob_decoder::<U>(metadata.metadata().unencoded_length)?;
         // Get the first ~1/3 or ~2/3 of slivers directly, and decode with these.
         let mut requests = WeightedFutures::new(futures);
         let enough_source_symbols =

@@ -3,13 +3,13 @@
 
 //! Metadata associated with a Blob and stored by storage nodes.
 
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU64};
 
 use fastcrypto::hash::{Blake2b256, HashFunction};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    encoding::{source_symbols_for_n_shards, EncodingAxis, EncodingConfig},
+    encoding::{source_symbols_for_n_shards, EncodingAxis, EncodingConfig, InvalidDataSizeError},
     merkle::{MerkleTree, Node as MerkleNode, DIGEST_LEN},
     BlobId,
     EncodingType,
@@ -35,9 +35,17 @@ pub enum VerificationError {
     /// available in the configuration provided.
     #[error("the unencoded blob length is too large for the given config")]
     UnencodedLengthTooLarge,
+    /// The blob is empty.
+    #[error("the blob is empty")]
+    EmptyBlob,
 }
 
 /// [`BlobMetadataWithId`] that has been verified with [`UnverifiedBlobMetadataWithId::verify`].
+///
+/// This ensures the following properties:
+/// - The unencoded length is nonzero and not larger than the maximum blob size.
+/// - The number of sliver hashes matches the number of slivers (twice the number of shards).
+/// - The blob ID is correctly computed from the sliver hashes.
 pub type VerifiedBlobMetadataWithId = BlobMetadataWithId<true>;
 
 /// [`BlobMetadataWithId`] that has yet to be verified.
@@ -67,7 +75,7 @@ impl<const V: bool> BlobMetadataWithId<V> {
     pub fn new_verified_from_metadata(
         sliver_pair_meta: Vec<SliverPairMetadata>,
         encoding: EncodingType,
-        unencoded_length: u64,
+        unencoded_length: NonZeroU64,
     ) -> VerifiedBlobMetadataWithId {
         let blob_metadata = BlobMetadata {
             encoding_type: encoding,
@@ -150,7 +158,7 @@ impl UnverifiedBlobMetadataWithId {
             }
         );
         crate::ensure!(
-            self.metadata.unencoded_length <= config.max_blob_size() as u64,
+            self.metadata.unencoded_length.get() <= config.max_blob_size(),
             VerificationError::UnencodedLengthTooLarge
         );
         let computed_blob_id = BlobId::from_sliver_pair_metadata(&self.metadata);
@@ -177,7 +185,7 @@ pub struct BlobMetadata {
     /// The type of encoding used to erasure encode the blob.
     pub encoding_type: EncodingType,
     /// The length of the unencoded blob.
-    pub unencoded_length: u64,
+    pub unencoded_length: NonZeroU64,
     /// The hashes over the slivers of the blob.
     pub hashes: Vec<SliverPairMetadata>,
 }
@@ -205,6 +213,14 @@ impl BlobMetadata {
                 .map(|h| h.pair_leaf_input::<Blake2b256>()),
         )
         .root()
+    }
+
+    /// Returns the symbol size associated with the blob.
+    pub fn symbol_size(
+        &self,
+        encoding_config: &EncodingConfig,
+    ) -> Result<NonZeroU16, InvalidDataSizeError> {
+        encoding_config.symbol_size_for_blob(self.unencoded_length.get())
     }
 }
 
@@ -317,10 +333,13 @@ mod tests {
         fn fails_for_unencoded_length_too_large() {
             let config = test_utils::encoding_config();
             let mut metadata = test_utils::unverified_blob_metadata();
-            metadata.metadata.unencoded_length = u16::MAX as u64
-                * config.source_symbols_primary.get() as u64
-                * config.source_symbols_secondary.get() as u64
-                + 1;
+            metadata.metadata.unencoded_length = NonZeroU64::new(
+                u64::from(u16::MAX)
+                    * u64::from(config.source_symbols_primary.get())
+                    * u64::from(config.source_symbols_secondary.get())
+                    + 1,
+            )
+            .unwrap();
 
             let err = metadata
                 .verify(&config)
