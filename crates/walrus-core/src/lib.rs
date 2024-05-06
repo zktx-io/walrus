@@ -15,11 +15,11 @@ use encoding::{
     EncodingAxis,
     EncodingConfig,
     Primary,
-    PrimaryDecodingSymbol,
+    PrimaryRecoverySymbol,
     PrimarySliver,
-    RecoveryError,
+    RecoverySymbolError,
     Secondary,
-    SecondaryDecodingSymbol,
+    SecondaryRecoverySymbol,
     SecondarySliver,
     WrongSliverVariantError,
 };
@@ -34,6 +34,7 @@ use thiserror::Error;
 
 pub mod bft;
 pub mod encoding;
+pub mod inconsistency;
 pub mod merkle;
 pub mod metadata;
 pub mod utils;
@@ -333,7 +334,7 @@ impl Sliver {
     }
 
     /// Returns the hash of the sliver, i.e., the Merkle root of the tree computed over the symbols.
-    pub fn hash(&self, config: &EncodingConfig) -> Result<Node, RecoveryError> {
+    pub fn hash(&self, config: &EncodingConfig) -> Result<Node, RecoverySymbolError> {
         match self {
             Sliver::Primary(inner) => inner.get_merkle_root::<DefaultHashFunction>(config),
             Sliver::Secondary(inner) => inner.get_merkle_root::<DefaultHashFunction>(config),
@@ -461,33 +462,33 @@ impl Display for SliverType {
 
 /// A decoding symbol for recovering a sliver
 ///
-/// Can be either a [`PrimaryDecodingSymbol`] or [`SecondaryDecodingSymbol`].
+/// Can be either a [`PrimaryRecoverySymbol`] or [`SecondaryRecoverySymbol`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DecodingSymbol<U: MerkleAuth> {
+pub enum RecoverySymbol<U: MerkleAuth> {
     /// A primary decoding symbol to recover a primary sliver
-    Primary(PrimaryDecodingSymbol<U>),
+    Primary(PrimaryRecoverySymbol<U>),
     /// A secondary decoding symbol to recover a secondary sliver.
-    Secondary(SecondaryDecodingSymbol<U>),
+    Secondary(SecondaryRecoverySymbol<U>),
 }
 
-impl<U: MerkleAuth> DecodingSymbol<U> {
-    /// Returns true iff this decoding symbol is a [`DecodingSymbol::Primary`].
+impl<U: MerkleAuth> RecoverySymbol<U> {
+    /// Returns true iff this decoding symbol is a [`RecoverySymbol::Primary`].
     #[inline]
     pub fn is_primary(&self) -> bool {
-        matches!(self, DecodingSymbol::Primary(_))
+        matches!(self, RecoverySymbol::Primary(_))
     }
 
-    /// Returns true iff this decoding symbol is a [`DecodingSymbol::Secondary`].
+    /// Returns true iff this decoding symbol is a [`RecoverySymbol::Secondary`].
     #[inline]
     pub fn is_secondary(&self) -> bool {
-        matches!(self, DecodingSymbol::Secondary(_))
+        matches!(self, RecoverySymbol::Secondary(_))
     }
 
     /// Returns the associated [`DecodingSymbolType`] of this decoding symbol.
     pub fn r#type(&self) -> DecodingSymbolType {
         match self {
-            DecodingSymbol::Primary(_) => DecodingSymbolType::Primary,
-            DecodingSymbol::Secondary(_) => DecodingSymbolType::Secondary,
+            RecoverySymbol::Primary(_) => DecodingSymbolType::Primary,
+            RecoverySymbol::Secondary(_) => DecodingSymbolType::Secondary,
         }
     }
 }

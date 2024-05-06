@@ -19,11 +19,15 @@ pub use config::{decoding_safety_limit, source_symbols_for_n_shards, EncodingCon
 
 mod errors;
 pub use errors::{
+    DataTooLargeError,
     DecodingVerificationError,
     EncodeError,
     InvalidDataSizeError,
-    RecoveryError,
+    RecoverySymbolError,
+    SliverRecoveryError,
+    SliverRecoveryOrVerificationError,
     SliverVerificationError,
+    SymbolVerificationError,
     WrongSliverVariantError,
     WrongSymbolSizeError,
 };
@@ -37,9 +41,10 @@ pub use slivers::{PrimarySliver, SecondarySliver, Sliver, SliverPair};
 mod symbols;
 pub use symbols::{
     DecodingSymbol,
-    DecodingSymbolPair,
-    PrimaryDecodingSymbol,
-    SecondaryDecodingSymbol,
+    PrimaryRecoverySymbol,
+    RecoverySymbol,
+    RecoverySymbolPair,
+    SecondaryRecoverySymbol,
     Symbols,
 };
 

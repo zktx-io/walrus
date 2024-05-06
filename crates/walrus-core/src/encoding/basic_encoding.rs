@@ -165,11 +165,11 @@ impl Decoder {
     ///
     /// If decoding failed due to an insufficient number of provided symbols, it can be continued
     /// by additional calls to [`decode`][Self::decode] providing more symbols.
-    pub fn decode<T, U, V>(&mut self, symbols: T) -> Option<Vec<u8>>
+    pub fn decode<T, U>(&mut self, symbols: T) -> Option<Vec<u8>>
     where
-        T: IntoIterator<Item = DecodingSymbol<U, V>>,
+        T: IntoIterator,
+        T::IntoIter: Iterator<Item = DecodingSymbol<U>>,
         U: EncodingAxis,
-        V: std::fmt::Debug,
     {
         let expected_symbol_size: usize = self.symbol_size.get().into();
         let packets = symbols.into_iter().filter_map(|symbol| {

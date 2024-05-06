@@ -5,6 +5,11 @@ use std::num::NonZeroU16;
 
 use thiserror::Error;
 
+/// Error indicating that the data is too large to be encoded/decoded.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+#[error("the data is too large to be encoded/decoded")]
+pub struct DataTooLargeError;
+
 /// Error returned when encoding/decoding is impossible due to the given data size.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum InvalidDataSizeError {
@@ -14,6 +19,12 @@ pub enum InvalidDataSizeError {
     /// The data to be encoded/decoded is empty.
     #[error("the data is empty")]
     EmptyData,
+}
+
+impl From<DataTooLargeError> for InvalidDataSizeError {
+    fn from(_value: DataTooLargeError) -> Self {
+        Self::DataTooLarge
+    }
 }
 
 /// Error type returned when encoding fails.
@@ -28,13 +39,10 @@ pub enum EncodeError {
     MisalignedData(NonZeroU16),
 }
 
-/// Error type returned when sliver recovery fails.
+/// Error type returned when computing recovery symbols fails.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
-pub enum RecoveryError {
-    /// The symbols provided are empty or have different sizes.
-    #[error("the symbols provided are empty or have different sizes")]
-    InvalidSymbolSizes,
-    /// The index of the recovery symbol can be at most `n_shards`
+pub enum RecoverySymbolError {
+    /// The index of the recovery symbol can be at most `n_shards`.
     #[error("the index of the recovery symbol can be at most `n_shards`")]
     IndexTooLarge,
     /// The underlying [`Encoder`][super::Encoder] returned an error.
@@ -42,9 +50,38 @@ pub enum RecoveryError {
     EncodeError(#[from] EncodeError),
 }
 
-impl From<InvalidDataSizeError> for RecoveryError {
+impl From<InvalidDataSizeError> for RecoverySymbolError {
     fn from(value: InvalidDataSizeError) -> Self {
         EncodeError::from(value).into()
+    }
+}
+
+/// Error type returned when attempting to recover a sliver from recovery symbols fails.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum SliverRecoveryError {
+    /// The blob size in the metadata is is too large.
+    #[error("the blob size in the metadata is too large")]
+    BlobSizeTooLarge(#[from] DataTooLargeError),
+    /// The sliver decoding failed.
+    #[error("the decoding failed")]
+    DecodingFailure,
+}
+
+/// Error type returned when attempting to recover a sliver from recovery symbols fails or the
+/// resulting sliver cannot be verified.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum SliverRecoveryOrVerificationError {
+    /// Recovery of the sliver failed.
+    #[error(transparent)]
+    RecoveryError(#[from] SliverRecoveryError),
+    /// The verification of the decoded sliver failed.
+    #[error(transparent)]
+    VerificationError(#[from] SliverVerificationError),
+}
+
+impl From<DataTooLargeError> for SliverRecoveryOrVerificationError {
+    fn from(value: DataTooLargeError) -> Self {
+        SliverRecoveryError::from(value).into()
     }
 }
 
@@ -85,5 +122,22 @@ pub enum SliverVerificationError {
     MerkleRootMismatch,
     /// Error resulting from the Merkle tree computation. The Merkle root could not be computed.
     #[error(transparent)]
-    RecoveryFailed(#[from] RecoveryError),
+    RecoveryFailed(#[from] RecoverySymbolError),
+}
+
+/// Error returned when verification of a recovery symbol fails.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum SymbolVerificationError {
+    /// The sliver index is too large for the number of shards in the metadata.
+    #[error("the sliver index is too large for the number of shards in the metadata")]
+    IndexTooLarge,
+    /// The symbol size does not match the symbol size that can be computed from the metadata.
+    #[error("the symbol size does not match the metadata")]
+    SymbolSizeMismatch,
+    /// The verification of the Merkle proof failed.
+    #[error("verification of the Merkle proof failed")]
+    InvalidProof,
+    /// The provided metadata is itself invalid.
+    #[error("the metadata is invalid")]
+    InvalidMetadata,
 }

@@ -9,6 +9,8 @@ use super::{
     utils,
     BlobDecoder,
     BlobEncoder,
+    DataTooLargeError,
+    Decoder,
     EncodeError,
     Encoder,
     EncodingAxis,
@@ -212,6 +214,20 @@ impl EncodingConfig {
     ///
     /// # Errors
     ///
+    /// Returns a [`DataTooLargeError`] if the computed symbol size is larger than
+    /// [`MAX_SYMBOL_SIZE`].
+    #[inline]
+    pub fn symbol_size_for_blob_from_nonzero(
+        &self,
+        blob_size: NonZeroU64,
+    ) -> Result<NonZeroU16, DataTooLargeError> {
+        utils::compute_symbol_size_from_nonzero(blob_size, self.source_symbols_per_blob())
+    }
+
+    /// The symbol size when encoding a blob of size `blob_size`.
+    ///
+    /// # Errors
+    ///
     /// Returns an [`InvalidDataSizeError::EmptyData`] if `data_length == 0` and an
     /// [`InvalidDataSizeError::DataTooLarge`] if the data_length cannot be converted to a `u64` or
     /// the computed symbol size is larger than [`MAX_SYMBOL_SIZE`].
@@ -283,6 +299,12 @@ impl EncodingConfig {
             self.n_shards(),
             self.encoding_plan::<E>(),
         )
+    }
+
+    /// Returns a [`Decoder`] to perform a single primary or secondary decoding for the provided
+    /// `symbol_size`.
+    pub fn get_decoder<E: EncodingAxis>(&self, symbol_size: NonZeroU16) -> Decoder {
+        Decoder::new(self.n_source_symbols::<E>(), symbol_size)
     }
 
     /// Returns a [`BlobEncoder`] to encode a blob into [`SliverPair`s][super::SliverPair].
