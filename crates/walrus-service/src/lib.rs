@@ -3,6 +3,7 @@
 
 //! Service functionality for Walrus.
 
+pub mod aggregator;
 pub mod client;
 pub mod config;
 pub mod server;
@@ -14,6 +15,7 @@ pub use node::{StorageNode, StorageNodeBuilder};
 mod storage;
 pub use storage::Storage;
 
+pub mod cli_utils;
 pub mod committee;
 pub mod system_events;
 
