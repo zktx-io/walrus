@@ -399,7 +399,6 @@ mod test {
         merkle::{MerkleAuth, MerkleProof},
         messages::{InvalidBlobIdAttestation, StorageConfirmation},
         metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
-        test_utils::generate_config_metadata_and_valid_recovery_symbols,
         BlobId,
         RecoverySymbol,
         Sliver,
@@ -719,7 +718,7 @@ mod test {
         let client = storage_node_client(config.as_ref());
 
         let (_encoding_config, _metadata, target_sliver_index, recovery_symbols) =
-            generate_config_metadata_and_valid_recovery_symbols()
+            walrus_core::test_utils::generate_config_metadata_and_valid_recovery_symbols()
                 .expect("generating metadata and recovery symbols not to fail");
         let inconsistency_proof = InconsistencyProof::Primary(InconsistencyProofInner::new(
             target_sliver_index,
@@ -744,7 +743,7 @@ mod test {
         let client = storage_node_client(config.as_ref());
 
         let (_encoding_config, _metadata, target_sliver_index, recovery_symbols) =
-            generate_config_metadata_and_valid_recovery_symbols()
+            walrus_core::test_utils::generate_config_metadata_and_valid_recovery_symbols()
                 .expect("generating metadata and recovery symbols not to fail");
         let inconsistency_proof = InconsistencyProof::Primary(InconsistencyProofInner::new(
             target_sliver_index,

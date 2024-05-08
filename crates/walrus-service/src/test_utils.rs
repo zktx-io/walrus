@@ -14,7 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use fastcrypto::{bls12381::min_pk::BLS12381PublicKey, traits::KeyPair};
+use fastcrypto::{bls12381::min_pk::BLS12381PublicKey, traits::KeyPair as _};
 use futures::StreamExt;
 use mysten_metrics::RegistryService;
 use prometheus::Registry;
@@ -25,11 +25,10 @@ use tokio_util::sync::CancellationToken;
 use typed_store::rocks::MetricConf;
 use walrus_core::{
     encoding::EncodingConfig,
+    keys::ProtocolKeyPair,
     metadata::VerifiedBlobMetadataWithId,
-    test_utils,
     BlobId,
     Epoch,
-    ProtocolKeyPair,
     PublicKey,
     ShardIndex,
 };
@@ -62,7 +61,7 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
     let temp_dir = TempDir::new().expect("able to create a temporary directory");
     WithTempDir {
         inner: StorageNodeConfig {
-            protocol_key_pair: PathOrInPlace::InPlace(test_utils::keypair()),
+            protocol_key_pair: PathOrInPlace::InPlace(walrus_core::test_utils::key_pair()),
             rest_api_address,
             metrics_address,
             storage_path: temp_dir.path().to_path_buf(),

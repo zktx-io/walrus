@@ -14,6 +14,7 @@ use walrus_core::{
     encoding::{EncodingConfig, RecoverySymbolError},
     ensure,
     inconsistency::InconsistencyVerificationError,
+    keys::ProtocolKeyPair,
     merkle::{MerkleAuth, MerkleProof},
     messages::{
         Confirmation,
@@ -27,7 +28,6 @@ use walrus_core::{
     BlobId,
     Epoch,
     InconsistencyProof,
-    ProtocolKeyPair,
     RecoverySymbol,
     ShardIndex,
     Sliver,
