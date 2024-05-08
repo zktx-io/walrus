@@ -5,7 +5,7 @@
 //! For creating an instance of a single storage node in a test, see [`StorageNodeHandleBuilder`] .
 //!
 //! For creating a cluster of test storage nodes, see [`TestClusterBuilder`].
-use std::{borrow::Borrow, net::SocketAddr, num::NonZeroU16, sync::Arc};
+use std::{borrow::Borrow, marker::PhantomData, net::SocketAddr, num::NonZeroU16, sync::Arc};
 
 use async_trait::async_trait;
 use fastcrypto::{bls12381::min_pk::BLS12381PublicKey, traits::KeyPair};
@@ -14,10 +14,19 @@ use mysten_metrics::RegistryService;
 use prometheus::Registry;
 use sui_types::event::EventID;
 use tempfile::TempDir;
-use tokio_stream::Stream;
+use tokio_stream::{wrappers::BroadcastStream, Stream};
 use tokio_util::sync::CancellationToken;
 use typed_store::rocks::MetricConf;
-use walrus_core::{test_utils, Epoch, ProtocolKeyPair, PublicKey, ShardIndex};
+use walrus_core::{
+    encoding::EncodingConfig,
+    metadata::VerifiedBlobMetadataWithId,
+    test_utils,
+    BlobId,
+    Epoch,
+    ProtocolKeyPair,
+    PublicKey,
+    ShardIndex,
+};
 use walrus_sui::types::{
     BlobEvent,
     Committee,
@@ -28,7 +37,7 @@ use walrus_sui::types::{
 use walrus_test_utils::WithTempDir;
 
 use crate::{
-    committee::{CommitteeService, CommitteeServiceFactory},
+    committee::{CommitteeService, CommitteeServiceFactory, NodeCommitteeService},
     config::{PathOrInPlace, StorageNodeConfig},
     server::UserServer,
     storage::Storage,
@@ -274,10 +283,12 @@ impl StorageNodeHandleBuilder {
             ];
             debug_assert!(committee_members[0].is_some() || committee_members[1].is_some());
 
-            Box::new(StubCommitteeServiceFactory::from_members(
-                // Remove the possible None in the members list
-                committee_members.into_iter().flatten().collect(),
-            ))
+            Box::new(
+                StubCommitteeServiceFactory::<StubCommitteeService>::from_members(
+                    // Remove the possible None in the members list
+                    committee_members.into_iter().flatten().collect(),
+                ),
+            )
         });
 
         // Create the node's config using the previously generated keypair and address.
@@ -367,22 +378,36 @@ fn committee_partner(node_config: &StorageNodeTestConfig) -> Option<StorageNodeT
     }
 }
 
-/// A [`CommitteeServiceFactory`] implementation that constructs [`StubCommitteeService`] instances.
-///
-/// This wraps a [`Committee`] and answers queries based on the contained data.
+/// A [`CommitteeServiceFactory`] implementation that constructs committee service
+/// instances using the supplied committee.
 #[derive(Debug, Clone)]
-pub struct StubCommitteeServiceFactory(Committee);
+pub struct StubCommitteeServiceFactory<T> {
+    committee: Committee,
+    _service_type: PhantomData<T>,
+}
 
-impl StubCommitteeServiceFactory {
+impl<T> StubCommitteeServiceFactory<T> {
     fn from_members(members: Vec<SuiStorageNode>) -> Self {
-        Self(Committee::new(members, 0).expect("valid members to be provided for tests"))
+        Self {
+            committee: Committee::new(members, 0).expect("valid members to be provided for tests"),
+            _service_type: PhantomData,
+        }
     }
 }
 
 #[async_trait]
-impl CommitteeServiceFactory for StubCommitteeServiceFactory {
+impl CommitteeServiceFactory for StubCommitteeServiceFactory<StubCommitteeService> {
     async fn new_for_epoch(&self) -> Result<Box<dyn CommitteeService>, anyhow::Error> {
-        Ok(Box::new(StubCommitteeService(self.0.clone())))
+        Ok(Box::new(StubCommitteeService(self.committee.clone())))
+    }
+}
+
+#[async_trait]
+impl CommitteeServiceFactory for StubCommitteeServiceFactory<NodeCommitteeService> {
+    async fn new_for_epoch(&self) -> Result<Box<dyn CommitteeService>, anyhow::Error> {
+        Ok(Box::new(
+            NodeCommitteeService::new(self.committee.clone()).await?,
+        ))
     }
 }
 
@@ -402,12 +427,14 @@ impl CommitteeService for StubCommitteeService {
         self.0.n_shards()
     }
 
-    fn exclude_member(&mut self, identity: &PublicKey) -> bool {
-        // Nothing to exclude, but return true if the member is present in the committee.
-        self.0
-            .members()
-            .iter()
-            .any(|info| info.public_key == *identity)
+    fn exclude_member(&mut self, _identity: &PublicKey) {}
+
+    async fn get_and_verify_metadata(
+        &self,
+        _blob_id: &BlobId,
+        _encoding_config: &EncodingConfig,
+    ) -> VerifiedBlobMetadataWithId {
+        std::future::pending().await
     }
 
     fn committee(&self) -> &Committee {
@@ -430,6 +457,18 @@ impl SystemEventProvider for Vec<BlobEvent> {
         Ok(Box::new(
             tokio_stream::iter(self.clone()).chain(tokio_stream::pending()),
         ))
+    }
+}
+
+#[async_trait::async_trait]
+impl SystemEventProvider for tokio::sync::broadcast::Sender<BlobEvent> {
+    async fn events(
+        &self,
+        _cursor: Option<EventID>,
+    ) -> Result<Box<dyn Stream<Item = BlobEvent> + Send + Sync + 'life0>, anyhow::Error> {
+        Ok(Box::new(BroadcastStream::new(self.subscribe()).map(
+            |value| value.expect("should not return errors in test"),
+        )))
     }
 }
 
@@ -590,7 +629,9 @@ impl TestClusterBuilder {
                 builder = builder.with_committee_service_factory(factory);
             } else {
                 builder = builder.with_committee_service_factory(Box::new(
-                    StubCommitteeServiceFactory::from_members(committee_members.clone()),
+                    StubCommitteeServiceFactory::<NodeCommitteeService>::from_members(
+                        committee_members.clone(),
+                    ),
                 ));
             }
 
@@ -685,4 +726,29 @@ impl Default for TestClusterBuilder {
                 .collect(),
         }
     }
+}
+
+/// Returns a test-committee with members with the specified number of shards each.
+#[cfg(test)]
+pub(crate) fn test_committee(weights: &[u16]) -> Committee {
+    let n_shards: u16 = weights.iter().sum();
+    let mut shards = 0..n_shards;
+
+    let members = weights
+        .iter()
+        .map(|&node_shard_count| SuiStorageNode {
+            shard_ids: (&mut shards)
+                .take(node_shard_count.into())
+                .map(ShardIndex)
+                .collect(),
+            public_key: ProtocolKeyPair::generate().as_ref().public().clone(),
+            name: String::new(),
+            network_address: NetworkAddress {
+                host: String::new(),
+                port: 0,
+            },
+        })
+        .collect();
+
+    Committee::new(members, 0).unwrap()
 }
