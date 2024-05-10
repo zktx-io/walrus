@@ -22,8 +22,12 @@ use walrus_core::{
 use walrus_sdk::{client::Client as StorageNodeClient, error::NodeError};
 use walrus_sui::types::StorageNode;
 
-use super::{error::StoreError, utils::WeightedResult};
-use crate::{client::error::SliverStoreError, utils};
+use super::{
+    error::{SliverStoreError, StoreError},
+    utils::{string_prefix, WeightedResult},
+    ClientError,
+    ClientErrorKind,
+};
 
 /// Represents the index of the node in the vector of members of the committee.
 pub type NodeIndex = usize;
@@ -58,16 +62,21 @@ pub(crate) struct NodeCommunication<'a> {
 }
 
 impl<'a> NodeCommunication<'a> {
+    /// Creates as new instance of [`NodeCommunication`].
     pub fn new(
         node_index: NodeIndex,
         epoch: Epoch,
         client: &'a ReqwestClient,
         node: &'a StorageNode,
         encoding_config: &'a EncodingConfig,
-    ) -> Self {
+    ) -> Result<Self, ClientError> {
         let url = Url::parse(&format!("http://{}", node.network_address)).unwrap();
 
-        Self {
+        ensure!(
+            !node.shard_ids.is_empty(),
+            ClientErrorKind::InvalidConfig.into()
+        );
+        Ok(Self {
             node_index,
             epoch,
             node,
@@ -77,15 +86,27 @@ impl<'a> NodeCommunication<'a> {
                 "node",
                 index = node_index,
                 epoch,
-                pk_prefix = utils::string_prefix(&node.public_key)
+                pk_prefix = string_prefix(&node.public_key)
             ),
             client: StorageNodeClient::from_url(url, client.clone()),
-        }
+        })
     }
 
     /// Returns the number of shards.
     pub fn n_shards(&self) -> NonZeroU16 {
         self.encoding_config.n_shards()
+    }
+
+    /// Returns the number of shards owned by the node.
+    pub fn n_owned_shards(&self) -> NonZeroU16 {
+        NonZeroU16::new(
+            self.node
+                .shard_ids
+                .len()
+                .try_into()
+                .expect("the number of shards is capped"),
+        )
+        .expect("each node has >0 shards")
     }
 
     fn to_node_result<T, E>(&self, weight: usize, result: Result<T, E>) -> NodeResult<T, E> {
@@ -105,7 +126,7 @@ impl<'a> NodeCommunication<'a> {
             .client
             .get_and_verify_metadata(blob_id, self.encoding_config)
             .await;
-        self.to_node_result(1, result)
+        self.to_node_result(self.n_owned_shards().get().into(), result)
     }
 
     /// Requests a sliver from the storage node, and verifies that it matches the metadata and
@@ -171,7 +192,7 @@ impl<'a> NodeCommunication<'a> {
         }
         .await;
 
-        self.to_node_result(self.node.shard_ids.len(), result)
+        self.to_node_result(self.n_owned_shards().get().into(), result)
     }
 
     /// Stores the sliver pairs on the node.

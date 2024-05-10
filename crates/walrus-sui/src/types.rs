@@ -277,12 +277,16 @@ pub struct Committee {
 }
 
 impl Committee {
-    /// Create a new committee for `epoch` consisting of `members`. `members` must contain at
-    /// least one storage node holding at least one shard.
+    /// Create a new committee for `epoch` consisting of `members`.
+    ///
+    /// `members` must contain at least one storage node holding at least one shard.
     pub fn new(members: Vec<StorageNode>, epoch: Epoch) -> Result<Self, InvalidCommittee> {
-        let n_shards = members
-            .iter()
-            .fold(0, |acc, node| node.shard_ids.len() + acc);
+        let mut n_shards = 0;
+        for node in members.iter() {
+            let node_shards = node.shard_ids.len();
+            ensure!(node_shards > 0, InvalidCommittee::EmptyNode,);
+            n_shards += node_shards
+        }
         let n_shards = u16::try_from(n_shards).map_err(|_| InvalidCommittee::TooManyShards)?;
         let n_shards = NonZeroU16::new(n_shards).ok_or(InvalidCommittee::EmptyCommittee)?;
         Ok(Self {
@@ -292,13 +296,31 @@ impl Committee {
         })
     }
 
-    /// Checks if the number is large enough to reach a quorum (`n_shards - f`) where `f` is the
-    /// maximum number of faulty shards, given `n_shards`.
+    /// Checks if the number is larger or equal to the minimum number of honest shards.
     ///
-    /// See [walrus_core::bft] for further details.
+    /// This is (`n_shards - f`), where `f` is the maximum number of faulty shards, given
+    /// `n_shards`. See [walrus_core::bft] for further details.
+    #[inline]
+    pub fn is_at_least_min_honest(&self, num: usize) -> bool {
+        num >= bft::min_n_correct(self.n_shards).get().into()
+    }
+
+    /// Checks if the number is large enough to reach a quorum (`2f + 1`).
+    ///
+    /// `f` is the maximum number of faulty shards, given `n_shards`.  See [walrus_core::bft] for
+    /// further details.
     #[inline]
     pub fn is_quorum(&self, num: usize) -> bool {
-        num >= bft::min_n_correct(self.n_shards).get().into()
+        num > 2 * usize::from(bft::max_n_faulty(self.n_shards))
+    }
+
+    /// Checks if the number is larger or equal to the validity threshold
+    ///
+    /// The validity threshold is `f + 1`, where `f` is the maximum number of faulty shards. See
+    /// [walrus_core::bft] for further details.
+    #[inline]
+    pub fn is_above_validity(&self, num: usize) -> bool {
+        num > usize::from(bft::max_n_faulty(self.n_shards))
     }
 
     /// Return the shards handed by the specified storage node,
@@ -385,6 +407,9 @@ pub enum InvalidCommittee {
     #[error("trying to create an empty committee")]
     /// Error resulting if the committee contains no shards.
     EmptyCommittee,
+    /// Error resulting if one of the nodes has no shards.
+    #[error("trying to create a committee with an empty node")]
+    EmptyNode,
 }
 
 /// The status of the epoch
