@@ -179,11 +179,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             // * libssl-dev - Required to compile the orchestrator
             // TODO(alberto): Remove libssl-dev dependency #221
             "sudo apt-get -y install build-essential sysstat iftop libssl-dev",
-            // * linux-tools-common linux-tools-generic linux-tools-* - installs perf
-            // Perf is optional as sometimes AWS releases new kernels without publishing a new
-            // linux-tools package (we do not want to fail the deployment when this happens).
-            "sudo apt-get -y install linux-tools-common linux-tools-generic linux-tools-`uname -r`
-                || echo 'Failed to install perf(optional)'",
+            "sudo apt-get -y install linux-tools-common linux-tools-generic pkg-config",
             // Install rust (non-interactive).
             "curl --proto \"=https\" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
             "echo \"source $HOME/.cargo/env\" | tee -a ~/.bashrc",
@@ -257,7 +253,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
 
     /// Configure the instances with the appropriate configuration files.
     pub async fn configure(&self, parameters: &BenchmarkParameters) -> TestbedResult<()> {
-        display::action("Configuring instances");
+        display::config("Deploying Walrus contract", "");
 
         // Select instances to configure.
         let (clients, nodes, _) = self.select_instances(parameters)?;
@@ -265,11 +261,26 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         // Generate the genesis configuration file and the keystore allowing access to gas objects.
         let command = self
             .protocol_commands
-            .genesis_command(nodes.iter(), parameters);
+            .genesis_command(nodes.iter(), parameters)
+            .await;
+
+        display::action("\nConfiguring instances");
+
+        let id = "configure";
         let repo_name = self.settings.repository_name();
-        let context = CommandContext::new().with_execute_from_path(repo_name.into());
-        let all = clients.into_iter().chain(nodes);
-        self.ssh_manager.execute(all, command, context).await?;
+        let context = CommandContext::new()
+            .run_background(id.into())
+            .with_execute_from_path(repo_name.into());
+        let mut instances = nodes;
+        if parameters.settings.dedicated_clients != 0 {
+            instances.extend(clients);
+        };
+        self.ssh_manager
+            .execute(instances.clone(), command, context)
+            .await?;
+        self.ssh_manager
+            .wait_for_command(instances, id, CommandStatus::Terminated)
+            .await?;
 
         display::done();
         Ok(())
@@ -281,7 +292,6 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
 
         // Kill all tmux servers and delete the nodes dbs. Optionally clear logs.
         let mut command = vec!["(tmux kill-server || true)".into()];
-        command.extend(self.protocol_commands.cleanup_commands());
         for path in self.protocol_commands.db_directories() {
             command.push(format!("(rm -rf {} || true)", path.display()));
         }
