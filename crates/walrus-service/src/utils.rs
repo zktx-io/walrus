@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Utility functions used internally in the crate.
+
 use std::{num::Saturating, slice::Iter, time::Duration};
 
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
@@ -166,6 +168,12 @@ where
 
         Some(*next_index)
     }
+}
+
+pub(crate) fn string_prefix<T: ToString>(s: &T) -> String {
+    let mut string = s.to_string();
+    string.truncate(8);
+    format!("{}...", string)
 }
 
 #[cfg(test)]

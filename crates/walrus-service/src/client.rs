@@ -9,7 +9,7 @@ use fastcrypto::{bls12381::min_pk::BLS12381AggregateSignature, traits::Aggregate
 use futures::Future;
 use reqwest::{Client as ReqwestClient, ClientBuilder};
 use tokio::time::{sleep, Duration};
-use tracing::Instrument;
+use tracing::{Instrument, Level};
 use walrus_core::{
     bft,
     encoding::{BlobDecoder, EncodingAxis, EncodingConfig, Sliver, SliverPair},
@@ -128,7 +128,7 @@ impl<T: ContractClient> Client<T> {
     /// Encodes the blob, reserves & registers the space on chain, and stores the slivers to the
     /// storage nodes. Finally, the function aggregates the storage confirmations and posts the
     /// [`ConfirmationCertificate`] on chain.
-    #[tracing::instrument(skip_all, fields(blob_id_prefix))]
+    #[tracing::instrument(skip_all, fields(blob_id))]
     pub async fn reserve_and_store_blob(
         &self,
         blob: &[u8],
@@ -139,13 +139,12 @@ impl<T: ContractClient> Client<T> {
             .get_blob_encoder(blob)
             .map_err(ClientError::other)?
             .encode_with_metadata();
-        tracing::Span::current().record("blob_id_prefix", string_prefix(metadata.blob_id()));
+        tracing::Span::current().record("blob_id", metadata.blob_id().to_string());
         let encoded_length = self
             .encoding_config
             .encoded_blob_length_from_usize(blob.len())
             .expect("valid for metadata created from the same config");
-        tracing::debug!(blob_id = %metadata.blob_id(), ?encoded_length,
-                        "computed blob pairs and metadata");
+        tracing::debug!(encoded_length, "computed blob pairs and metadata");
 
         // Get the root hash of the blob.
         let root_hash = metadata.metadata().compute_root_hash();
@@ -205,7 +204,7 @@ impl<T> Client<T> {
             .execute_weight(&quorum_check, self.concurrent_writes)
             .await;
         tracing::debug!(
-            elapsed_time=?start.elapsed(), "stored metadata and slivers onto a quorum of nodes"
+            elapsed_time = ?start.elapsed(), "stored metadata and slivers onto a quorum of nodes"
         );
         // Double the execution time, with a minimum of 100 ms. This gives the client time to
         // collect more storage confirmations.
@@ -216,7 +215,7 @@ impl<T> Client<T> {
             )
             .await;
         tracing::debug!(
-            elapsed_time=?start.elapsed(),
+            elapsed_time = ?start.elapsed(),
             %completed_reason,
             "stored metadata and slivers onto additional nodes"
         );
@@ -228,7 +227,7 @@ impl<T> Client<T> {
     ///
     /// This function _does not_ check that the received confirmations match the current epoch and
     /// blob ID, as it assumes that the storage confirmations were received through
-    /// `NodeCommunication::store_metadata_and_pairs`, which internally verifies it to check the
+    /// [`NodeCommunication::store_metadata_and_pairs`], which internally verifies it to check the
     /// blob ID and epoch.
     fn confirmations_to_certificate(
         &self,
@@ -248,7 +247,7 @@ impl<T> Client<T> {
                             .expect("the node index is computed from the vector of members"),
                     );
                 }
-                Err(err) => tracing::error!(?node, ?err, "storing metadata and pairs failed"),
+                Err(error) => tracing::warn!(node, %error, "storing metadata and pairs failed"),
             }
         }
 
@@ -272,13 +271,13 @@ impl<T> Client<T> {
     }
 
     /// Reconstructs the blob by reading slivers from Walrus shards.
-    #[tracing::instrument(skip_all, fields(blob_id_prefix=string_prefix(blob_id)))]
+    #[tracing::instrument(level = Level::ERROR, skip(self))]
     pub async fn read_blob<U>(&self, blob_id: &BlobId) -> Result<Vec<u8>, ClientError>
     where
         U: EncodingAxis,
         Sliver<U>: TryFrom<SliverEnum>,
     {
-        tracing::debug!(%blob_id, "starting to read blob");
+        tracing::debug!("starting to read blob");
         let metadata = self.retrieve_metadata(blob_id).await?;
         self.request_slivers_and_decode::<U>(&metadata).await
     }
@@ -320,8 +319,8 @@ impl<T> Client<T> {
             .into_iter()
             .filter_map(|NodeResult(_, _, node, result)| {
                 result
-                    .map_err(|err| {
-                        tracing::error!(?node, ?err, "retrieving sliver failed");
+                    .map_err(|error| {
+                        tracing::warn!(%node, %error, "retrieving sliver failed");
                     })
                     .ok()
             })
@@ -343,7 +342,7 @@ impl<T> Client<T> {
 
     /// Decodes the blob of given blob ID by requesting slivers and trying to decode at each new
     /// sliver it receives.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(level = Level::ERROR, skip_all)]
     async fn decode_sliver_by_sliver<'a, I, Fut, U>(
         &self,
         requests: &mut WeightedFutures<I, Fut, NodeResult<Sliver<U>, NodeError>>,
@@ -367,8 +366,8 @@ impl<T> Client<T> {
                         return Ok(blob);
                     }
                 }
-                Err(err) => {
-                    tracing::error!(?node, ?err, "retrieving sliver failed");
+                Err(error) => {
+                    tracing::warn!(%node, %error, "retrieving sliver failed");
                 }
             }
         }
@@ -447,10 +446,4 @@ impl<T> Client<T> {
         });
         pairs_per_node
     }
-}
-
-pub(crate) fn string_prefix<T: ToString>(s: &T) -> String {
-    let mut string = s.to_string();
-    string.truncate(8);
-    format!("{}...", string)
 }
