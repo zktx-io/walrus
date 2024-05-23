@@ -6,7 +6,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::{MakeSpan, TraceLayer};
 use tracing::Level;
 use walrus_core::{
+    encoding::{max_sliver_size_for_n_shards, metadata_length_for_n_shards},
     messages::StorageConfirmation,
     metadata::{BlobMetadata, UnverifiedBlobMetadataWithId},
     BlobId,
@@ -44,6 +45,12 @@ pub const RECOVERY_ENDPOINT: &str =
     "/v1/blobs/:blobId/slivers/:sliverPairindex/:sliverType/:targetPairIndex";
 /// The path to push inconsistency proofs.
 pub const INCONSISTENCY_PROOF_ENDPOINT: &str = "/v1/blobs/:blobId/inconsistent/:sliverType";
+/// Additional space to be added to the maximum body size accepted by the server.
+///
+/// The maximum body size is set to be the maximum size of primary slivers, which contain at most
+/// `n_secondary_source_symbols * u16::MAX` bytes. However, we need a few extra bytes to accommodate
+/// the additional information encoded with the slivers.
+const HEADROOM: usize = 128;
 
 /// A blob ID encoded as a Base64 string designed to be used in URLs.
 #[serde_as]
@@ -133,11 +140,23 @@ impl<S: ServiceState + Send + Sync + 'static> UserServer<S> {
         let app = Router::new()
             .route(
                 METADATA_ENDPOINT,
-                get(Self::retrieve_metadata).put(Self::store_metadata),
+                put(Self::store_metadata)
+                    .route_layer(DefaultBodyLimit::max(
+                        usize::try_from(metadata_length_for_n_shards(self.state.n_shards()))
+                            .expect("running on 64bit arch (see hardware requirements)")
+                            + HEADROOM,
+                    ))
+                    .get(Self::retrieve_metadata),
             )
             .route(
                 SLIVER_ENDPOINT,
-                get(Self::retrieve_sliver).put(Self::store_sliver),
+                put(Self::store_sliver)
+                    .route_layer(DefaultBodyLimit::max(
+                        usize::try_from(max_sliver_size_for_n_shards(self.state.n_shards()))
+                            .expect("running on 64bit arch (see hardware requirements)")
+                            + HEADROOM,
+                    ))
+                    .get(Self::retrieve_sliver),
             )
             .route(
                 STORAGE_CONFIRMATION_ENDPOINT,
@@ -556,6 +575,10 @@ mod test {
                 )),
                 _ => Err(anyhow!("internal error").into()),
             }
+        }
+
+        fn n_shards(&self) -> std::num::NonZeroU16 {
+            walrus_core::test_utils::encoding_config().n_shards()
         }
     }
 

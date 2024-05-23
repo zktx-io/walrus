@@ -1,6 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use std::{future::Future, sync::Arc};
+use std::{future::Future, num::NonZeroU16, sync::Arc};
 
 use anyhow::{anyhow, bail, Context};
 use fastcrypto::traits::KeyPair;
@@ -181,6 +181,9 @@ pub trait ServiceState {
         sliver_type: SliverType,
         target_pair_index: SliverPairIndex,
     ) -> Result<RecoverySymbol<MerkleProof>, RetrieveSymbolError>;
+
+    /// Returns the number of shards the node is currently operating with.
+    fn n_shards(&self) -> NonZeroU16;
 }
 
 /// Builder to construct a [`StorageNode`].
@@ -735,6 +738,10 @@ impl ServiceState for StorageNode {
                 RecoverySymbol::Primary(symbol)
             }
         })
+    }
+
+    fn n_shards(&self) -> NonZeroU16 {
+        self.encoding_config.n_shards()
     }
 }
 

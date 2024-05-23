@@ -20,6 +20,9 @@ use super::{
 };
 use crate::{bft, merkle::DIGEST_LEN, BlobId};
 
+pub const UNENCODED_LENGTH_SIZE: usize = 8;
+pub const ENCODING_TYPE_SIZE: usize = 1;
+
 /// Configuration of the Walrus encoding.
 ///
 /// This consists of the number of source symbols for the two encodings, the total number of shards,
@@ -273,13 +276,18 @@ impl EncodingConfig {
         self.encoded_blob_length(unencoded_length.try_into().ok()?)
     }
 
-    /// Computes the length of the metadata for a blob.
+    /// Computes the length of the metadata produced by this encoding config.
     ///
     /// This is independent of the blob size.
     pub fn metadata_length(&self) -> u64 {
-        (self.n_shards_as_usize() * DIGEST_LEN * 2 + BlobId::LENGTH)
-            .try_into()
-            .expect("this always fits into a `u64`")
+        metadata_length_for_n_shards(self.n_shards())
+    }
+
+    /// Returns the maximum size of a sliver for the current configuration.
+    ///
+    /// This is the size of a primary sliver with `u16::MAX` symbol size.
+    pub fn max_sliver_size(&self) -> u64 {
+        max_sliver_size_for_n_secondary(self.n_secondary_source_symbols())
     }
 
     /// Returns an [`Encoder`] to perform a single primary or secondary encoding of the data.
@@ -384,6 +392,37 @@ pub fn source_symbols_for_n_shards(n_shards: NonZeroU16) -> (NonZeroU16, NonZero
     )
 }
 
+/// Computes the length of the metadata produced for a system with `n_shards` shards.
+///
+/// This is independent of the blob size.
+pub fn metadata_length_for_n_shards(n_shards: NonZeroU16) -> u64 {
+    (
+        // The hashes.
+        usize::from(n_shards.get()) * DIGEST_LEN * 2
+        // The blob ID.
+        + BlobId::LENGTH
+        // The u64 `unencoded_length`
+        + UNENCODED_LENGTH_SIZE
+        // The u8 `EncodingType`
+        + ENCODING_TYPE_SIZE
+    )
+        .try_into()
+        .expect("this always fits into a `u64`")
+}
+
+/// Returns the maximum size of a sliver for a system with `n_secondary_source_symbols`.
+fn max_sliver_size_for_n_secondary(n_secondary_source_symbols: NonZeroU16) -> u64 {
+    u64::from(n_secondary_source_symbols.get()) * u64::from(u16::MAX)
+}
+
+/// Returns the maximum size of a sliver for a system with `n_shards` shards.
+///
+/// This is the size of a primary sliver with `u16::MAX` symbol size.
+pub fn max_sliver_size_for_n_shards(n_shards: NonZeroU16) -> u64 {
+    let (_, secondary) = source_symbols_for_n_shards(n_shards);
+    max_sliver_size_for_n_secondary(secondary)
+}
+
 #[cfg(test)]
 mod tests {
     use walrus_test_utils::param_test;
@@ -416,13 +455,15 @@ mod tests {
     param_test! {
         test_encoded_size: [
             zero: (0, 10, None),
-            one_small_committee: (1, 10, Some(10*((4+7) + 10*2*32 + 32))),
-            #[ignore] one_large_committee: (1, 1000, Some(1000*((329+662) + 1000*2*32 + 32))),
-            larger_blob_small_committee: ((4*7)*100, 10, Some(10*((4+7)*100 + 10*2*32 + 32))),
+            one_small_committee: (1, 10, Some(10*((4+7) + 10*2*32 + 32 + 8 + 1))),
+            #[ignore] one_large_committee:
+                (1, 1000, Some(1000*((329+662) + 1000*2*32 + 32 + 8 + 1))),
+            larger_blob_small_committee:
+                ((4*7)*100, 10, Some(10*((4+7)*100 + 10*2*32 + 32 + 8 + 1))),
             #[ignore] larger_blob_large_committee: (
                 (329*662)*100,
                 1000,
-                Some(1000*((329+662)*100 + 1000*2*32 + 32))
+                Some(1000*((329+662)*100 + 1000*2*32 + 32 + 8 + 1))
             ),
 
         ]
