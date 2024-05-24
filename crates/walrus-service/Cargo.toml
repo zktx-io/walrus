@@ -52,16 +52,12 @@ walrus-test-utils = { workspace = true, optional = true }
 workspace = true
 
 [[bin]]
-name = "walrus-client"
+name = "walrus"
 path = "bin/client.rs"
 
 [[bin]]
 name = "walrus-node"
 path = "bin/node.rs"
-
-[[bin]]
-name = "walrus-aggregator"
-path = "bin/aggregator.rs"
 
 [dev-dependencies]
 mockall = "0.12.1"
