@@ -10,7 +10,14 @@ use clap::{Parser, Subcommand};
 use walrus_core::{encoding::Primary, BlobId};
 use walrus_service::{
     aggregator::AggregatorServer,
-    cli_utils::{error, get_read_client, load_configuration, load_wallet_context, success},
+    cli_utils::{
+        error,
+        get_read_client,
+        load_configuration,
+        load_wallet_context,
+        success,
+        HumanReadableBytes,
+    },
     client::{Client, Config},
 };
 use walrus_sui::client::SuiContractClient;
@@ -123,9 +130,12 @@ async fn client() -> Result<()> {
                 .reserve_and_store_blob(&std::fs::read(file)?, epochs)
                 .await?;
             println!(
-                "{} Blob stored successfully.\nBlob ID: {}",
+                "{} Blob stored successfully.\n\
+                Unencoded size: {}\nBlob ID: {}\nSui object ID: {}",
                 success(),
-                blob.blob_id
+                HumanReadableBytes(blob.size),
+                blob.blob_id,
+                blob.id,
             );
         }
         Commands::Read {
