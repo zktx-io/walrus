@@ -85,7 +85,6 @@ cargo build --bin walrus-node
 
 # Set working directory
 working_dir="./working_dir"
-testbed_config_path="$working_dir/testbed_config.yaml"
 
 # Derive the ip addresses for the storage nodes
 ips=" "
@@ -109,7 +108,7 @@ if ! $existing; then
     # Generate configs
     echo Generating configuration...
     cargo run --bin walrus-node -- generate-dry-run-configs \
-    --working-dir $working_dir --testbed-config-path $testbed_config_path
+    --working-dir $working_dir
 fi
 
 i=0
