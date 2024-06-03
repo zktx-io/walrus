@@ -10932,7 +10932,7 @@ dependencies = [
  "serde",
  "serde_spanned",
  "toml_datetime",
- "winnow 0.6.9",
+ "winnow 0.6.8",
 ]
 
 [[package]]
@@ -11634,6 +11634,7 @@ dependencies = [
  "serde_with 3.8.1",
  "thiserror",
  "tracing",
+ "utoipa",
  "walrus-test-utils",
 ]
 
@@ -11679,6 +11680,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+ "utoipa",
  "walrus-core",
  "walrus-test-utils",
 ]
@@ -12115,9 +12117,9 @@ dependencies = [
 
 [[package]]
 name = "winnow"
-version = "0.6.9"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86c949fede1d13936a99f14fafd3e76fd642b556dd2ce96287fbe2e0151bfac6"
+checksum = "c3c52e9c97a68071b23e836c9380edae937f17b9c4667bd021973efc689f618d"
 dependencies = [
  "memchr",
 ]
