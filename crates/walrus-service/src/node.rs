@@ -38,7 +38,7 @@ use walrus_core::{
 use walrus_sdk::api::BlobStatus;
 use walrus_sui::{
     client::SuiReadClient,
-    types::{BlobCertified, BlobEvent, InvalidBlobID},
+    types::{BlobCertified, BlobEvent, InvalidBlobId},
 };
 
 use crate::{
@@ -403,7 +403,7 @@ impl StorageNode {
     fn on_blob_invalid(
         &self,
         event_sequence_number: usize,
-        event: InvalidBlobID,
+        event: InvalidBlobId,
     ) -> anyhow::Result<()> {
         self.storage.delete_blob(&event.blob_id)?;
         self.storage
@@ -703,11 +703,12 @@ impl ServiceState for StorageNode {
     }
 
     fn blob_status(&self, blob_id: &BlobId) -> Result<BlobStatus, BlobStatusError> {
-        self.storage
+        Ok(self
+            .storage
             .get_blob_info(blob_id)
             .context("could not retrieve blob info")?
-            .ok_or(BlobStatusError::Unknown)
             .map(BlobStatus::from)
+            .unwrap_or_default())
     }
 
     async fn verify_inconsistency_proof(
@@ -922,7 +923,7 @@ mod tests {
             .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(node.as_ref().storage.is_stored_at_all_shards(&BLOB_ID)?);
-        events.send(BlobEvent::InvalidBlobID(InvalidBlobID::for_testing(
+        events.send(BlobEvent::InvalidBlobID(InvalidBlobId::for_testing(
             BLOB_ID,
         )))?;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -943,11 +944,18 @@ mod tests {
         // Wait to make sure the event is received.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let blob_status = node.as_ref().blob_status(&BLOB_ID)?;
+        let BlobStatus::Existent {
+            status,
+            end_epoch,
+            status_event,
+        } = node.as_ref().blob_status(&BLOB_ID)?
+        else {
+            panic!("got nonexistent blob status")
+        };
 
-        assert_eq!(blob_status.status, SdkBlobCertificationStatus::Registered);
-        assert_eq!(blob_status.status_event, blob_event.event_id);
-        assert_eq!(blob_status.end_epoch, blob_event.end_epoch);
+        assert_eq!(status, SdkBlobCertificationStatus::Registered);
+        assert_eq!(status_event, blob_event.event_id);
+        assert_eq!(end_epoch, blob_event.end_epoch);
 
         Ok(())
     }
@@ -963,7 +971,7 @@ mod tests {
 
         assert!(matches!(
             node.as_ref().blob_status(&BLOB_ID),
-            Err(BlobStatusError::Unknown)
+            Ok(BlobStatus::Nonexistent)
         ));
 
         Ok(())
