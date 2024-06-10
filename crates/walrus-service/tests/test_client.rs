@@ -275,9 +275,6 @@ async fn default_setup() -> anyhow::Result<(
         cluster_builder.build().await?
     };
 
-    // Ensure that the servers in the cluster have sufficient time to get ready.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Create the client with a separate wallet
     let sui_contract_client = new_wallet_on_global_test_cluster()
         .await?

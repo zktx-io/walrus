@@ -29,7 +29,7 @@ use walrus_core::{
 };
 
 use crate::{
-    api::BlobStatus,
+    api::{BlobStatus, ServiceHealthInfo},
     error::{Kind, NodeError},
     node_response::NodeResponse as _,
 };
@@ -81,6 +81,10 @@ impl UrlEndpoints {
         let sliver_type = SliverType::for_encoding::<A>();
         let path = format!("inconsistent/{sliver_type}");
         self.blob_resource(blob_id).join(&path).unwrap()
+    }
+
+    fn server_health_info(&self) -> Url {
+        self.0.join("/v1/health").unwrap()
     }
 }
 
@@ -416,6 +420,19 @@ impl Client {
             .map_err(NodeError::other)?;
         Ok(attestation)
     }
+
+    /// Gets the health information of the storage node.
+    pub async fn get_server_health_info(&self) -> Result<ServiceHealthInfo, NodeError> {
+        let server_health_info: ServiceHealthInfo = self
+            .inner
+            .get(self.endpoints.server_health_info())
+            .send()
+            .await
+            .map_err(Kind::Reqwest)?
+            .service_response()
+            .await?;
+        Ok(server_health_info)
+    }
 }
 
 #[cfg(test)]
@@ -428,7 +445,7 @@ mod tests {
     const BLOB_ID: BlobId = test_utils::blob_id_from_u64(99);
 
     param_test! {
-        url_endpoint: [
+        test_blob_url_endpoint: [
             blob: (|e| e.blob_resource(&BLOB_ID), ""),
             metadata: (|e| e.metadata(&BLOB_ID), "metadata"),
             confirmation: (|e| e.confirmation(&BLOB_ID), "confirmation"),
@@ -442,7 +459,7 @@ mod tests {
             ),
         ]
     }
-    fn url_endpoint<F>(url_fn: F, expected_path: &str)
+    fn test_blob_url_endpoint<F>(url_fn: F, expected_path: &str)
     where
         F: FnOnce(UrlEndpoints) -> Url,
     {
@@ -451,5 +468,13 @@ mod tests {
         let expected = format!("http://node.com/v1/blobs/{BLOB_ID}/{expected_path}");
 
         assert_eq!(url.to_string(), expected);
+    }
+
+    #[test]
+    fn test_url_health_info_endpoint() {
+        let endpoints = UrlEndpoints(Url::parse("http://node.com").unwrap());
+        let url = endpoints.server_health_info();
+
+        assert_eq!(url.to_string(), "http://node.com/v1/health");
     }
 }

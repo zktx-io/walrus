@@ -21,6 +21,7 @@ use prometheus::Registry;
 use reqwest::Url;
 use sui_types::event::EventID;
 use tempfile::TempDir;
+use tokio::time::Duration;
 use tokio_stream::{wrappers::BroadcastStream, Stream};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -376,6 +377,10 @@ impl StorageNodeHandleBuilder {
             Client::from_url(url, inner)
         };
 
+        if self.run_rest_api {
+            wait_for_node_ready(&client).await?;
+        }
+
         Ok(StorageNodeHandle {
             storage_node: node,
             storage_directory: temp_dir,
@@ -401,6 +406,19 @@ impl Default for StorageNodeHandleBuilder {
             test_config: None,
         }
     }
+}
+
+/// Waits until the node is ready by querying the node's health info endpoint using the node
+/// client.
+async fn wait_for_node_ready(client: &Client) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Err(err) = client.get_server_health_info().await {
+            tracing::trace!(%err, "node is not ready yet, retrying...");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok(())
+    })
+    .await?
 }
 
 /// Returns with a a test config for a storage node that would make a valid committee when paired

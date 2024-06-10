@@ -7,7 +7,8 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 use sui_types::event::EventID;
-use walrus_core::Epoch;
+use tokio::time::Duration;
+use walrus_core::{Epoch, PublicKey};
 
 /// Error message returned by the service.
 #[derive(Debug, Serialize, Deserialize)]
@@ -127,4 +128,18 @@ impl Ord for BlobStatus {
             }
         }
     }
+}
+
+/// Represents information about the health of the storage node service.
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct ServiceHealthInfo {
+    /// The uptime of the service.
+    #[schema(value_type = Object)]
+    pub uptime: Duration,
+    /// The epoch of the storage node.
+    #[schema(value_type = u64)]
+    pub epoch: Epoch,
+    /// The public key of the storage node.
+    #[schema(value_type = [u8], format = "Base58")]
+    pub public_key: PublicKey,
 }
