@@ -227,7 +227,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             &format!("git fetch origin {commit}"),
             &format!("(git checkout -b {commit} || git checkout -f origin/{commit})"),
             "source $HOME/.cargo/env",
-            "cargo build --release",
+            "RUSTFLAGS=-Ctarget-cpu=native cargo build --release",
         ]
         .join(" && ");
 
@@ -316,13 +316,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         if let Some(instance) = instance {
             display::action("Configuring monitoring instance");
 
-            let monitor = Monitor::new(
-                instance,
-                clients,
-                nodes,
-                self.ssh_manager.clone(),
-                self.settings.dedicated_clients != 0,
-            );
+            let monitor = Monitor::new(instance, clients, nodes, self.ssh_manager.clone());
             monitor
                 .start_prometheus(&self.protocol_commands, parameters)
                 .await?;

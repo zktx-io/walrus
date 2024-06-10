@@ -18,7 +18,7 @@ use fastcrypto::{
     traits::{Signer, ToFromBytes},
 };
 pub use mock_clients::{MockContractClient, MockSuiReadClient};
-use sui_sdk::wallet_context::WalletContext;
+use sui_sdk::{sui_client_config::SuiEnv, wallet_context::WalletContext};
 use sui_types::{
     base_types::SuiAddress,
     digests::TransactionDigest,
@@ -40,10 +40,11 @@ use walrus_test_utils::WithTempDir;
 
 use crate::{
     types::{BlobCertified, BlobRegistered, InvalidBlobId},
-    utils::{create_wallet, sign_and_send_ptb},
+    utils::{create_wallet, request_sui_from_faucet, sign_and_send_ptb, SuiNetwork},
 };
 
-const DEFAULT_GAS_BUDGET: u64 = 500_000_000;
+/// Default gas budget for transactions in tests and benchmarks.
+pub const DEFAULT_GAS_BUDGET: u64 = 500_000_000;
 const DEFAULT_FUNDING_PER_COIN: u64 = 10_000_000_000;
 
 /// Returns a random `EventID` for testing.
@@ -128,6 +129,28 @@ impl GlobalTestClusterHandler {
             handle
         }
     }
+}
+
+/// Creates a wallet for testing funded with 2 coins by the faucet of the provided network.
+pub async fn wallet_for_testing_from_faucet(
+    network: SuiNetwork,
+) -> anyhow::Result<WithTempDir<WalletContext>> {
+    let mut wallet = temp_dir_wallet(network.env())?;
+    let address = wallet.as_mut().active_address()?;
+    let sui_client = wallet.as_ref().get_client().await?;
+    request_sui_from_faucet(address, network, &sui_client).await?;
+    request_sui_from_faucet(address, network, &sui_client).await?;
+    Ok(wallet)
+}
+
+fn temp_dir_wallet(env: SuiEnv) -> anyhow::Result<WithTempDir<WalletContext>> {
+    let temp_dir = tempfile::tempdir().expect("temporary directory creation must succeed");
+    let wallet = create_wallet(&temp_dir.path().join("wallet_config.yaml"), env, None)?;
+
+    Ok(WithTempDir {
+        inner: wallet,
+        temp_dir,
+    })
 }
 
 /// Returns a handle to the global instance of a Sui test cluster and the wallet config path.

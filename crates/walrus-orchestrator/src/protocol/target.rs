@@ -22,7 +22,7 @@ use walrus_service::{
 };
 use walrus_sui::utils::SuiNetwork;
 
-use super::{ProtocolCommands, ProtocolMetrics, ProtocolParameters, CARGO_FLAGS, RUST_FLAGS};
+use super::{ProtocolCommands, ProtocolMetrics, ProtocolParameters, BINARY_PATH};
 use crate::{benchmark::BenchmarkParameters, client::Instance};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -108,24 +108,24 @@ impl ProtocolParameters for ProtocolNodeParameters {}
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ProtocolClientParameters {
-    gas_budget: u64,
-    // Percentage of writes in the workload.
-    // Todo: This parameters will be used once we have a load generator (#128)
-    load_type: u64,
+    target_load: u64,
+    blob_size: usize,
+    metrics_port: u16,
 }
 
 impl Default for ProtocolClientParameters {
     fn default() -> Self {
         Self {
-            gas_budget: 500_000_000,
-            load_type: 100,
+            target_load: 2,
+            blob_size: 10_000,
+            metrics_port: 9584,
         }
     }
 }
 
 impl Display for ProtocolClientParameters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}% Writes", self.load_type)
+        write!(f, "load: {} writes/s", self.target_load)
     }
 }
 
@@ -171,7 +171,7 @@ impl ProtocolCommands for TargetProtocol {
             working_dir: parameters.settings.working_dir.as_path(),
             sui_network: parameters.node_parameters.sui_network,
             contract_path: parameters.node_parameters.contract_path.clone(),
-            gas_budget: parameters.client_parameters.gas_budget,
+            gas_budget: walrus_sui::test_utils::DEFAULT_GAS_BUDGET,
             shards_information: shards,
             host_addresses: ips.iter().map(|ip| ip.to_string()).collect(),
             rest_api_port: parameters.node_parameters.rest_api_port,
@@ -182,7 +182,7 @@ impl ProtocolCommands for TargetProtocol {
         .await
         .expect("Failed to create Walrus contract");
 
-        // Generate a command to print the Sui config to all instances.
+        // Generate a command to upload benchmark and testbed config to all instances.
         let serialized_testbed_config =
             serde_yaml::to_string(&testbed_config).expect("Failed to serialize sui configs");
         let testbed_config_path = parameters.settings.working_dir.join("testbed_config.yaml");
@@ -193,7 +193,7 @@ impl ProtocolCommands for TargetProtocol {
 
         // Generate a command to print all client and storage node configs on all instances.
         let generate_config_command = [
-            &format!("{RUST_FLAGS} cargo run {CARGO_FLAGS} --bin walrus-node --"),
+            &format!("./{BINARY_PATH}/walrus-node"),
             "generate-dry-run-configs",
             &format!(
                 "--working-dir {}",
@@ -236,7 +236,7 @@ impl ProtocolCommands for TargetProtocol {
                 let node_config_path = working_dir.join(node_config_name);
 
                 let run_command = [
-                    &format!("{RUST_FLAGS} cargo run {CARGO_FLAGS} --bin walrus-node --"),
+                    &format!("./{BINARY_PATH}/walrus-node"),
                     "run",
                     &format!("--config-path {}", node_config_path.display()),
                     "--cleanup-storage",
@@ -245,7 +245,7 @@ impl ProtocolCommands for TargetProtocol {
 
                 let command = [
                     "source $HOME/.cargo/env",
-                    "export RUST_LOG=\"client=DEBUG,walrus=INFO\"",
+                    "export RUST_LOG=INFO,walrus_service=DEBUG",
                     &run_command,
                 ]
                 .join(" && ");
@@ -256,14 +256,43 @@ impl ProtocolCommands for TargetProtocol {
 
     fn client_command<I>(
         &self,
-        _instances: I,
-        _parameters: &BenchmarkParameters,
+        instances: I,
+        parameters: &BenchmarkParameters,
     ) -> Vec<(Instance, String)>
     where
         I: IntoIterator<Item = Instance>,
     {
-        // Todo: Implement once we have a load generator (#128)
-        vec![]
+        let clients: Vec<_> = instances.into_iter().collect();
+        let load_per_client = (parameters.load / clients.len()).max(1);
+        let number_of_tasks = load_per_client * 5;
+
+        clients
+            .into_iter()
+            .map(|instance| {
+                let working_dir = &parameters.settings.working_dir;
+                let client_config_path = working_dir.clone().join("client_config.yaml");
+
+                let run_command = [
+                    format!("./{BINARY_PATH}/walrus-stress"),
+                    format!("--target-load {load_per_client}"),
+                    format!("--config-path {}", client_config_path.display()),
+                    format!("--n-clients {number_of_tasks}"),
+                    format!(
+                        "--metrics-port {}",
+                        parameters.client_parameters.metrics_port
+                    ),
+                    format!(
+                        "--sui-network {}",
+                        parameters.node_parameters.sui_network.r#type()
+                    ),
+                    format!("--blob-size {}", parameters.client_parameters.blob_size),
+                ]
+                .join(" ");
+
+                let command = ["source $HOME/.cargo/env", &run_command].join(" && ");
+                (instance, command)
+            })
+            .collect()
     }
 }
 
@@ -284,13 +313,12 @@ impl ProtocolMetrics for TargetProtocol {
     {
         instances
             .into_iter()
-            .enumerate()
-            .map(|(i, instance)| {
+            .map(|instance| {
                 let metrics_port = parameters.node_parameters.metrics_port;
                 let metrics_address = metrics_socket_address(
                     std::net::IpAddr::V4(instance.main_ip),
                     metrics_port,
-                    Some(i as u16),
+                    None,
                 );
                 let metrics_path = format!("{metrics_address}/metrics",);
                 (instance, metrics_path)
@@ -300,13 +328,20 @@ impl ProtocolMetrics for TargetProtocol {
 
     fn clients_metrics_path<I>(
         &self,
-        _instances: I,
-        _parameters: &BenchmarkParameters,
+        instances: I,
+        parameters: &BenchmarkParameters,
     ) -> Vec<(Instance, String)>
     where
         I: IntoIterator<Item = Instance>,
     {
-        // Todo: Implement once we have a load generator (#128)
-        vec![]
+        instances
+            .into_iter()
+            .map(|instance| {
+                let instance_ip = instance.main_ip;
+                let metrics_port = parameters.client_parameters.metrics_port;
+                let metrics_path = format!("{instance_ip}:{metrics_port}/metrics");
+                (instance, metrics_path)
+            })
+            .collect()
     }
 }
