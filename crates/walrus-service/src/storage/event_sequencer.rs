@@ -3,21 +3,21 @@
 
 use std::{
     cmp::{Ordering, Reverse},
-    collections::BinaryHeap,
+    collections::{hash_map::Entry, BinaryHeap, HashMap},
     sync::{Arc, Mutex},
 };
 
 use sui_types::event::EventID;
 
-/// On receiving a sequence of (sequence_number, EventID) pairs, tracks the highest sequentially
-/// observed sequence_number.
+/// A queue of contiguous events.
+///
+/// Given an arbitrary permutation of the index and [`EventID`] pairs `(0, EventID_0),
+/// (1, EventID_1), (2, EventID_2), ...`, this queue sorts the event IDs by the their index and
+/// provides access to the `EventID`s sequentially starting from 0.
 #[derive(Debug, Default)]
 pub(super) struct EventSequencer {
-    // INV: head tracks the highest event ID before the gap in sequence indicated by
-    // next_required_sequence_num.
-    head: Option<EventID>,
-    next_required_sequence_num: usize,
-    queue: BinaryHeap<Reverse<Sequenced<EventID>>>,
+    head_index: usize,
+    queue: HashMap<usize, EventID>,
 }
 
 impl EventSequencer {
@@ -25,83 +25,33 @@ impl EventSequencer {
         Self::default()
     }
 
-    /// Adds the provided (sequence_number, EventID) pair to those observed.
+    /// Adds the provided (index, EventID) pair to those observed.
     ///
-    /// Added sequence numbers must be unique over those observed up to this point.
-    pub fn add(&mut self, sequence_number: usize, event_id: EventID) {
-        match sequence_number.cmp(&self.next_required_sequence_num) {
-            Ordering::Equal => {
-                self.next_required_sequence_num += 1;
-                self.head = Some(event_id);
-
-                // Attempt to advance the head, in the case that this filled a gap.
-                while let Some(Reverse(Sequenced(next_sequence_num, _))) = self.queue.peek() {
-                    if *next_sequence_num == self.next_required_sequence_num {
-                        let Reverse(Sequenced(_, next_event)) = self.queue.pop().unwrap();
-
-                        self.next_required_sequence_num += 1;
-                        self.head = Some(next_event);
-                    } else {
-                        break;
-                    }
-                }
-            }
-            Ordering::Greater => {
-                debug_assert!(
-                    !self
-                        .queue
-                        .iter()
-                        .any(|Reverse(Sequenced(i, _))| *i == sequence_number),
-                    "larger sequence number repeated"
-                );
-                self.queue
-                    .push(Reverse(Sequenced(sequence_number, event_id)));
-            }
-            Ordering::Less => {
-                // This class provides the invariant that we never advance unless we have seen all
-                // prior sequence numbers, therefore anything encountered here is a duplicate.
-                debug_assert!(
-                    false,
-                    "sequence number repeated: ({sequence_number}, {event_id:?})"
-                );
-                tracing::warn!(sequence_number, ?event_id, "sequence number repeated");
-            }
+    /// # Panics
+    ///
+    /// Panics if the provided index has already been observed.
+    pub fn add(&mut self, index: usize, event_id: EventID) {
+        if index < self.head_index || self.queue.insert(index, event_id).is_some() {
+            // This class provides the invariant that we never advance unless we have seen all
+            // prior sequence numbers, therefore anything less than the head_index or with a prior
+            // inserted value is a repeat.
+            panic!("index repeated: ({index}, {event_id:?})");
         }
     }
 
-    /// Returns the furthest EventID that has been observed in a contiguous sequence.
-    pub fn peek(&self) -> Option<&EventID> {
-        self.head.as_ref()
+    /// Returns an iterator the next contiguous observed event IDs.
+    pub fn ready_events(&self) -> impl Iterator<Item = &EventID> {
+        (self.head_index..).scan((), |_, i| self.queue.get(&i))
     }
 
-    /// Returns the furthest EventID that has been observed in a contiguous sequence, and removes
-    /// it from the sequence.
-    pub fn pop(&mut self) -> Option<EventID> {
-        self.head.take()
+    /// Advances the queue to the next gap in the sequence, discarding all events before the gap.
+    pub fn advance(&mut self) {
+        while self.queue.remove(&self.head_index).is_some() {
+            self.head_index += 1;
+        }
     }
-}
 
-/// A wrapper implementation of Ord that only considers the sequence number for comparison and
-/// equality operations.
-#[derive(Debug, Clone, Copy)]
-struct Sequenced<T>(pub usize, pub T);
-
-impl<T> PartialOrd for Sequenced<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    pub fn remaining(&self) -> u64 {
+        self.queue.len().try_into().expect("usize is at most u64")
     }
 }
-
-impl<T> Ord for Sequenced<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl<T> PartialEq for Sequenced<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl<T> Eq for Sequenced<T> {}

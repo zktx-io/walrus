@@ -4,16 +4,16 @@ use std::{future::Future, num::NonZeroU16, sync::Arc};
 
 use anyhow::{anyhow, bail, Context};
 use fastcrypto::traits::KeyPair;
-use futures::{future::Either, stream::FuturesUnordered, StreamExt};
-use mysten_metrics::RegistryService;
+use futures::StreamExt;
+use prometheus::Registry;
 use serde::Serialize;
 use sui_types::event::EventID;
 use tokio::{select, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{instrument, Instrument};
+use tracing::Instrument;
 use typed_store::{rocks::MetricConf, DBMetrics, TypedStoreError};
 use walrus_core::{
-    encoding::{EncodingAxis, EncodingConfig, Primary, RecoverySymbolError, Secondary},
+    encoding::{EncodingConfig, RecoverySymbolError},
     ensure,
     keys::ProtocolKeyPair,
     merkle::MerkleProof,
@@ -45,12 +45,11 @@ use crate::{
     committee::{CommitteeService, CommitteeServiceFactory, SuiCommitteeServiceFactory},
     config::{StorageNodeConfig, SuiConfig},
     contract_service::{SuiSystemContractService, SystemContractService},
-    storage::{DatabaseConfig, ShardStorage, Storage},
+    storage::{DatabaseConfig, EventProgress, ShardStorage, Storage},
     system_events::{SuiSystemEventProvider, SystemEventProvider},
 };
 
 mod errors;
-use self::errors::IndexOutOfRange;
 pub use self::errors::{
     BlobStatusError,
     ComputeStorageConfirmationError,
@@ -62,6 +61,10 @@ pub use self::errors::{
     StoreMetadataError,
     StoreSliverError,
 };
+use self::{blob_sync::BlobSynchronizer, errors::IndexOutOfRange, metrics::NodeMetricSet};
+
+mod blob_sync;
+pub(crate) mod metrics;
 
 pub trait ServiceState {
     /// Retrieves the metadata associated with a blob.
@@ -199,10 +202,9 @@ impl StorageNodeBuilder {
     pub async fn build(
         self,
         config: &StorageNodeConfig,
-        registry_service: RegistryService,
+        metrics_registry: Registry,
     ) -> Result<StorageNode, anyhow::Error> {
-        DBMetrics::init(&registry_service.default_registry());
-        let start_time = Instant::now();
+        DBMetrics::init(&metrics_registry);
 
         let protocol_key_pair = config
             .protocol_key_pair
@@ -257,7 +259,7 @@ impl StorageNodeBuilder {
             event_provider,
             committee_service_factory,
             contract_service,
-            start_time,
+            &metrics_registry,
         )
         .await
     }
@@ -281,6 +283,11 @@ async fn create_read_client(
 /// A Walrus storage node, responsible for 1 or more shards on Walrus.
 #[derive(Debug)]
 pub struct StorageNode {
+    inner: Arc<StorageNodeInner>,
+}
+
+#[derive(Debug)]
+pub struct StorageNodeInner {
     protocol_key_pair: ProtocolKeyPair,
     storage: Storage,
     encoding_config: Arc<EncodingConfig>,
@@ -289,6 +296,7 @@ pub struct StorageNode {
     committee_service: Arc<dyn CommitteeService>,
     _committee_service_factory: Box<dyn CommitteeServiceFactory>,
     start_time: Instant,
+    metrics: NodeMetricSet,
 }
 
 impl StorageNode {
@@ -299,8 +307,9 @@ impl StorageNode {
         event_provider: Box<dyn SystemEventProvider>,
         committee_service_factory: Box<dyn CommitteeServiceFactory>,
         contract_service: Box<dyn SystemContractService>,
-        start_time: Instant,
+        registry: &Registry,
     ) -> Result<Self, anyhow::Error> {
+        let start_time = Instant::now();
         let committee_service = committee_service_factory
             .new_for_epoch(Some(key_pair.as_ref().public()))
             .await
@@ -320,7 +329,7 @@ impl StorageNode {
                 .with_context(|| format!("unable to initialize storage for shard {}", shard))?;
         }
 
-        Ok(StorageNode {
+        let inner = Arc::new(StorageNodeInner {
             protocol_key_pair: key_pair,
             storage,
             event_provider,
@@ -328,8 +337,13 @@ impl StorageNode {
             contract_service: contract_service.into(),
             committee_service: committee_service.into(),
             _committee_service_factory: committee_service_factory,
+            metrics: NodeMetricSet::new(registry),
             start_time,
-        })
+        });
+
+        inner.init_gauges()?;
+
+        Ok(StorageNode { inner })
     }
 
     /// Creates a new [`StorageNodeBuilder`] for constructing a `StorageNode`.
@@ -349,60 +363,83 @@ impl StorageNode {
         Ok(())
     }
 
-    async fn process_events(&self) -> anyhow::Result<()> {
-        let cursor = self.storage.get_event_cursor()?;
+    /// Returns the shards currently owned by the storage node.
+    pub fn shards(&self) -> Vec<ShardIndex> {
+        self.inner.storage.shards()
+    }
 
-        let mut blob_events = Box::into_pin(self.event_provider.events(cursor).await?).enumerate();
+    async fn process_events(&self) -> anyhow::Result<()> {
+        let cursor = self.inner.storage.get_event_cursor()?;
+
+        let mut blob_events =
+            Box::into_pin(self.inner.event_provider.events(cursor).await?).enumerate();
 
         while let Some((sequence_number, event)) = blob_events.next().await {
             tracing::debug!(event = ?event.event_id(), "received system event");
 
-            self.storage.update_blob_info(&event)?;
+            let _timer_guard = &self
+                .inner
+                .metrics
+                .event_process_duration_seconds
+                .with_label_values(&[event_label(&event)])
+                .start_timer();
+
+            self.inner.storage.update_blob_info(&event)?;
 
             match event {
                 BlobEvent::Certified(event) => {
-                    self.on_blob_certified(sequence_number, event).await?
+                    self.process_blob_certified_event(sequence_number, event)?;
                 }
-                BlobEvent::InvalidBlobID(event) => self.on_blob_invalid(sequence_number, event)?,
-                BlobEvent::Registered(_) => self
-                    .storage
-                    .maybe_advance_event_cursor(sequence_number, &event.event_id())?,
+                BlobEvent::InvalidBlobID(event) => {
+                    self.process_blob_invalid_event(sequence_number, event)?;
+                }
+                BlobEvent::Registered(_) => {
+                    self.inner
+                        .mark_event_completed(sequence_number, &event.event_id())?;
+                }
             }
         }
 
         bail!("event stream for blob events stopped")
     }
 
-    fn current_epoch(&self) -> Epoch {
-        self.committee_service.get_epoch()
-    }
-
-    /// Returns the shards currently owned by the storage node.
-    pub fn shards(&self) -> Vec<ShardIndex> {
-        self.storage.shards()
-    }
-
-    async fn on_blob_certified(
+    fn process_blob_certified_event(
         &self,
         event_sequence_number: usize,
         event: BlobCertified,
     ) -> anyhow::Result<()> {
-        if self.storage.is_stored_at_all_shards(&event.blob_id)? {
-            self.storage
-                .maybe_advance_event_cursor(event_sequence_number, &event.event_id)?;
+        let start = tokio::time::Instant::now();
+        let histogram_set = self.inner.metrics.recover_blob_duration_seconds.clone();
+
+        if self.inner.storage.is_stored_at_all_shards(&event.blob_id)? {
+            self.inner
+                .mark_event_completed(event_sequence_number, &event.event_id)?;
+
+            histogram_set
+                .with_label_values(&[metrics::STATUS_SKIPPED])
+                .observe(start.elapsed().as_secs_f64());
+
             return Ok(());
         }
 
-        // Slivers, and possible metadata, are not stored.
+        // Slivers, and possibly metadata, are not stored.
         // TODO(jsmith): Do not spawn if there is already a worker for this blob id (#366)
         // TODO(jsmith): Handle cancellation. (#366)
         // TODO(kwuest): Handle epoch change. (#405)
-        let synchronizer = BlobSynchronizer::new(event, event_sequence_number, self);
+        let synchronizer = BlobSynchronizer::new(event, event_sequence_number, self.inner.clone());
         tokio::spawn(
-            async {
-                if let Err(err) = synchronizer.sync().await {
-                    tracing::error!(?err, "blob synchronizer failed")
-                }
+            async move {
+                // TODO(jsmith): Add a case for recording cancellation (#366).
+                let label = if let Err(err) = synchronizer.run().await {
+                    tracing::error!(?err, "blob synchronizer failed");
+                    metrics::STATUS_FAILURE
+                } else {
+                    metrics::STATUS_SUCCESS
+                };
+
+                histogram_set
+                    .with_label_values(&[label])
+                    .observe(start.elapsed().as_secs_f64());
             }
             .in_current_span(),
         );
@@ -411,15 +448,21 @@ impl StorageNode {
     }
 
     // TODO(kwuest): Cancel in-progress syncs for the blob (part of #366 or follow-up)
-    fn on_blob_invalid(
+    fn process_blob_invalid_event(
         &self,
         event_sequence_number: usize,
         event: InvalidBlobId,
     ) -> anyhow::Result<()> {
-        self.storage.delete_blob(&event.blob_id)?;
-        self.storage
-            .maybe_advance_event_cursor(event_sequence_number, &event.event_id)?;
+        self.inner.storage.delete_blob(&event.blob_id)?;
+        self.inner
+            .mark_event_completed(event_sequence_number, &event.event_id)?;
         Ok(())
+    }
+}
+
+impl StorageNodeInner {
+    fn current_epoch(&self) -> Epoch {
+        self.committee_service.get_epoch()
     }
 
     fn check_index(&self, index: SliverPairIndex) -> Result<(), IndexOutOfRange> {
@@ -444,160 +487,29 @@ impl StorageNode {
             .shard_storage(shard_index)
             .ok_or(ShardNotAssigned(shard_index, self.current_epoch()))
     }
-}
 
-struct BlobSynchronizer {
-    blob_id: BlobId,
-    storage: Storage,
-    committee_service: Arc<dyn CommitteeService>,
-    encoding_config: Arc<EncodingConfig>,
-    contract_service: Arc<dyn SystemContractService>,
-    cursor: (usize, EventID),
-}
+    fn init_gauges(&self) -> Result<(), TypedStoreError> {
+        let persisted = self.storage.get_sequentially_processed_event_count()?;
 
-impl BlobSynchronizer {
-    fn new(event: BlobCertified, event_sequence_number: usize, node: &StorageNode) -> Self {
-        Self {
-            blob_id: event.blob_id,
-            // TODO(jsmith): Make storage node cheaper to clone once we have epoch migration (#367)
-            storage: node.storage.clone(),
-            committee_service: node.committee_service.clone(),
-            encoding_config: node.encoding_config.clone(),
-            contract_service: node.contract_service.clone(),
-            cursor: (event_sequence_number, event.event_id),
-        }
-    }
-
-    #[tracing::instrument(skip_all, fields(blob_id = %self.blob_id))]
-    async fn sync(self) -> anyhow::Result<()> {
-        let metadata = self.sync_metadata().await?;
-
-        let mut sliver_sync_futures: FuturesUnordered<_> = self
-            .storage
-            .shards()
-            .iter()
-            .flat_map(|&shard| {
-                [
-                    Either::Left(self.sync_sliver::<Primary>(shard, &metadata)),
-                    Either::Right(self.sync_sliver::<Secondary>(shard, &metadata)),
-                ]
-            })
-            .collect();
-
-        while let Some(result) = sliver_sync_futures.next().await {
-            match result {
-                Ok(Some(inconsistency_proof)) => {
-                    tracing::warn!("received an inconsistency proof");
-                    // No need to continue the other futures, sync the inconsistency proof
-                    // and return
-                    self.sync_inconsistency_proof(&inconsistency_proof).await;
-                    break;
-                }
-                Err(err) => panic!("database operations should not fail: {:?}", err),
-                _ => (),
-            }
-        }
-
-        self.storage
-            .maybe_advance_event_cursor(self.cursor.0, &self.cursor.1)?;
+        metrics::with_label!(self.metrics.event_cursor_progress, "persisted").set(persisted);
 
         Ok(())
     }
 
-    async fn sync_metadata(&self) -> Result<VerifiedBlobMetadataWithId, TypedStoreError> {
-        if self.storage.has_metadata(&self.blob_id)? {
-            tracing::debug!("not syncing metadata: already stored");
-            return Ok(self
-                .storage
-                .get_metadata(&self.blob_id)?
-                .expect("metadata already stored"));
-        }
-
-        tracing::debug!("syncing metadata");
-
-        let metadata = self
-            .committee_service
-            .get_and_verify_metadata(&self.blob_id, &self.encoding_config)
-            .await;
-
-        self.storage.put_verified_metadata(&metadata)?;
-
-        tracing::debug!("metadata successfully synced");
-        Ok(metadata)
-    }
-
-    #[instrument(skip_all, fields(axis = ?A::default()))]
-    async fn sync_sliver<A: EncodingAxis>(
+    fn mark_event_completed(
         &self,
-        shard: ShardIndex,
-        metadata: &VerifiedBlobMetadataWithId,
-    ) -> Result<Option<InconsistencyProof>, TypedStoreError> {
-        let shard_storage = self
+        sequence_number: usize,
+        cursor: &EventID,
+    ) -> Result<(), TypedStoreError> {
+        let EventProgress { persisted, pending } = self
             .storage
-            .shard_storage(shard)
-            .expect("shard is managed by this node");
+            .maybe_advance_event_cursor(sequence_number, cursor)?;
 
-        // TODO(jsmith): Persist sync across reboots (#395)
-        // Handling certified messages does not work for handling reboots etc,
-        // because the event is already recorded. We need a way to scan and see of all the blobs we
-        // know about, which are stored and which are not fully stored.
-        if shard_storage.is_sliver_stored::<A>(&self.blob_id)? {
-            tracing::debug!("not syncing sliver: already stored");
-            return Ok(None);
-        }
+        let event_cursor_progress = &self.metrics.event_cursor_progress;
+        metrics::with_label!(event_cursor_progress, "persisted").add(persisted);
+        metrics::with_label!(event_cursor_progress, "pending").add(pending);
 
-        let sliver_id = shard.to_pair_index(self.encoding_config.n_shards(), &self.blob_id);
-        let sliver_or_proof = recover_sliver::<A>(
-            &*self.committee_service,
-            metadata,
-            sliver_id,
-            &self.encoding_config,
-        )
-        .await;
-
-        match sliver_or_proof {
-            Ok(sliver) => {
-                shard_storage.put_sliver(&self.blob_id, &sliver)?;
-                tracing::debug!("sliver successfully synced");
-                Ok(None)
-            }
-            Err(proof) => Ok(Some(proof)),
-        }
-    }
-
-    async fn sync_inconsistency_proof(&self, inconsistency_proof: &InconsistencyProof) {
-        let invalid_blob_certificate = self
-            .committee_service
-            .get_invalid_blob_certificate(
-                &self.blob_id,
-                inconsistency_proof,
-                self.encoding_config.n_shards(),
-            )
-            .await;
-        self.contract_service
-            .invalidate_blob_id(&invalid_blob_certificate)
-            .await
-    }
-}
-
-async fn recover_sliver<A: EncodingAxis>(
-    committee_service: &dyn CommitteeService,
-    metadata: &VerifiedBlobMetadataWithId,
-    sliver_id: SliverPairIndex,
-    encoding_config: &EncodingConfig,
-) -> Result<Sliver, InconsistencyProof> {
-    if A::IS_PRIMARY {
-        committee_service
-            .recover_primary_sliver(metadata, sliver_id, encoding_config)
-            .await
-            .map(Sliver::Primary)
-            .map_err(InconsistencyProof::Primary)
-    } else {
-        committee_service
-            .recover_secondary_sliver(metadata, sliver_id, encoding_config)
-            .await
-            .map(Sliver::Secondary)
-            .map_err(InconsistencyProof::Secondary)
+        Ok(())
     }
 }
 
@@ -606,10 +518,91 @@ impl ServiceState for StorageNode {
         &self,
         blob_id: &BlobId,
     ) -> Result<VerifiedBlobMetadataWithId, RetrieveMetadataError> {
+        self.inner.retrieve_metadata(blob_id)
+    }
+
+    fn store_metadata(
+        &self,
+        metadata: UnverifiedBlobMetadataWithId,
+    ) -> Result<bool, StoreMetadataError> {
+        self.inner.store_metadata(metadata)
+    }
+
+    fn retrieve_sliver(
+        &self,
+        blob_id: &BlobId,
+        sliver_pair_index: SliverPairIndex,
+        sliver_type: SliverType,
+    ) -> Result<Sliver, RetrieveSliverError> {
+        self.inner
+            .retrieve_sliver(blob_id, sliver_pair_index, sliver_type)
+    }
+
+    fn store_sliver(
+        &self,
+        blob_id: &BlobId,
+        sliver_pair_index: SliverPairIndex,
+        sliver: &Sliver,
+    ) -> Result<bool, StoreSliverError> {
+        self.inner.store_sliver(blob_id, sliver_pair_index, sliver)
+    }
+
+    fn compute_storage_confirmation(
+        &self,
+        blob_id: &BlobId,
+    ) -> impl Future<Output = Result<StorageConfirmation, ComputeStorageConfirmationError>> + Send
+    {
+        self.inner.compute_storage_confirmation(blob_id)
+    }
+
+    fn verify_inconsistency_proof(
+        &self,
+        blob_id: &BlobId,
+        inconsistency_proof: InconsistencyProof,
+    ) -> impl Future<Output = Result<InvalidBlobIdAttestation, InconsistencyProofError>> + Send
+    {
+        self.inner
+            .verify_inconsistency_proof(blob_id, inconsistency_proof)
+    }
+
+    fn retrieve_recovery_symbol(
+        &self,
+        blob_id: &BlobId,
+        sliver_pair_index: SliverPairIndex,
+        sliver_type: SliverType,
+        target_pair_index: SliverPairIndex,
+    ) -> Result<RecoverySymbol<MerkleProof>, RetrieveSymbolError> {
+        self.inner.retrieve_recovery_symbol(
+            blob_id,
+            sliver_pair_index,
+            sliver_type,
+            target_pair_index,
+        )
+    }
+
+    fn blob_status(&self, blob_id: &BlobId) -> Result<BlobStatus, BlobStatusError> {
+        self.inner.blob_status(blob_id)
+    }
+
+    fn n_shards(&self) -> NonZeroU16 {
+        self.inner.n_shards()
+    }
+
+    fn health_info(&self) -> ServiceHealthInfo {
+        self.inner.health_info()
+    }
+}
+
+impl ServiceState for StorageNodeInner {
+    fn retrieve_metadata(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<VerifiedBlobMetadataWithId, RetrieveMetadataError> {
         self.storage
             .get_metadata(blob_id)
             .context("database error when retrieving metadata")?
             .ok_or(RetrieveMetadataError::Unavailable)
+            .inspect(|_| self.metrics.metadata_retrieved_total.inc())
     }
 
     fn store_metadata(
@@ -643,6 +636,8 @@ impl ServiceState for StorageNode {
             .put_verified_metadata(&verified_metadata_with_id)
             .context("unable to store metadata")?;
 
+        self.metrics.metadata_stored_total.inc();
+
         Ok(true)
     }
 
@@ -660,6 +655,9 @@ impl ServiceState for StorageNode {
             .get_sliver(blob_id, sliver_type)
             .context("unable to retrieve sliver")?
             .ok_or(RetrieveSliverError::Unavailable)
+            .inspect(|sliver| {
+                metrics::with_label!(self.metrics.slivers_retrieved_total, sliver.r#type()).inc();
+            })
     }
 
     fn store_sliver(
@@ -693,6 +691,8 @@ impl ServiceState for StorageNode {
             .put_sliver(blob_id, sliver)
             .context("unable to store sliver")?;
 
+        metrics::with_label!(self.metrics.slivers_stored_total, sliver.r#type()).inc();
+
         Ok(true)
     }
 
@@ -709,6 +709,8 @@ impl ServiceState for StorageNode {
 
         let confirmation = Confirmation::new(self.current_epoch(), *blob_id);
         let signed = sign_message(confirmation, self.protocol_key_pair.clone()).await?;
+
+        self.metrics.storage_confirmations_issued_total.inc();
 
         Ok(StorageConfirmation::Signed(signed))
     }
@@ -799,13 +801,21 @@ where
     Ok(signed)
 }
 
+fn event_label(event: &BlobEvent) -> &'static str {
+    match event {
+        BlobEvent::Registered(_) => "registered",
+        BlobEvent::Certified(_) => "certified",
+        BlobEvent::InvalidBlobID(_) => "invalid-blob",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::OnceLock, time::Duration};
 
     use fastcrypto::traits::KeyPair;
     use tokio::sync::{broadcast::Sender, Mutex};
-    use walrus_core::encoding::{self, Primary, SliverPair};
+    use walrus_core::encoding::{self, EncodingAxis, Primary, Secondary, SliverPair};
     use walrus_sdk::{api::BlobCertificationStatus as SdkBlobCertificationStatus, client::Client};
     use walrus_sui::{
         test_utils::EventForTesting,
@@ -886,6 +896,7 @@ mod tests {
 
             storage_node
                 .as_ref()
+                .inner
                 .protocol_key_pair
                 .as_ref()
                 .public()
@@ -897,7 +908,7 @@ mod tests {
 
             assert_eq!(
                 confirmation.as_ref().epoch(),
-                storage_node.as_ref().current_epoch()
+                storage_node.as_ref().inner.current_epoch()
             );
             assert_eq!(*confirmation.as_ref().contents(), BLOB_ID);
 
@@ -916,7 +927,7 @@ mod tests {
             .with_node_started(true)
             .build()
             .await?;
-        let n_shards = node.as_ref().committee_service.get_shard_count();
+        let n_shards = node.as_ref().inner.committee_service.get_shard_count();
         let sliver_pair_index = shard_for_node.to_pair_index(n_shards, &BLOB_ID);
 
         let result =
@@ -940,13 +951,16 @@ mod tests {
             .with_node_started(true)
             .build()
             .await?;
+        let storage = &node.as_ref().inner.storage;
+
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(node.as_ref().storage.is_stored_at_all_shards(&BLOB_ID)?);
+        assert!(storage.is_stored_at_all_shards(&BLOB_ID)?);
         events.send(BlobEvent::InvalidBlobID(InvalidBlobId::for_testing(
             BLOB_ID,
         )))?;
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!node.as_ref().storage.is_stored_at_all_shards(&BLOB_ID)?);
+        assert!(!storage.is_stored_at_all_shards(&BLOB_ID)?);
         Ok(())
     }
 
@@ -1084,6 +1098,7 @@ mod tests {
 
             // The proof should be valid and we should receive a valid signature
             node.as_ref()
+                .inner
                 .protocol_key_pair
                 .as_ref()
                 .public()
@@ -1095,7 +1110,7 @@ mod tests {
 
             assert_eq!(
                 invalid_blob_msg.as_ref().epoch(),
-                node.as_ref().current_epoch()
+                node.as_ref().inner.current_epoch()
             );
             assert_eq!(*invalid_blob_msg.as_ref().contents(), blob_id);
 
@@ -1464,7 +1479,11 @@ mod tests {
 
         // The cursor should not have moved beyond that of blob2 registration, since blob2 is yet
         // to be synced.
-        let latest_cursor = cluster.nodes[0].storage_node.storage.get_event_cursor()?;
+        let latest_cursor = cluster.nodes[0]
+            .storage_node
+            .inner
+            .storage
+            .get_event_cursor()?;
         assert_eq!(latest_cursor, Some(blob2_registered_event.event_id));
 
         Ok(())

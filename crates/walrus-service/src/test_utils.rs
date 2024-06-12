@@ -16,7 +16,6 @@ use std::{
 use async_trait::async_trait;
 use fastcrypto::{bls12381::min_pk::BLS12381PublicKey, traits::KeyPair as _};
 use futures::StreamExt;
-use mysten_metrics::RegistryService;
 use prometheus::Registry;
 use reqwest::Url;
 use sui_types::event::EventID;
@@ -287,8 +286,6 @@ impl StorageNodeHandleBuilder {
 
     /// Creates the configured [`StorageNodeHandle`].
     pub async fn build(self) -> anyhow::Result<StorageNodeHandle> {
-        let registry_service = RegistryService::new(Registry::default());
-
         // Identify the storage being used, as it allows us to extract the shards
         // that should be assigned to this storage node.
         let WithTempDir {
@@ -336,17 +333,22 @@ impl StorageNodeHandleBuilder {
             db_config: None,
         };
 
+        let metrics_registry = Registry::default();
         let node = StorageNode::builder()
             .with_storage(storage)
             .with_system_event_provider(self.event_provider)
             .with_committee_service_factory(committee_service_factory)
             .with_system_contract_service(contract_service)
-            .build(&config, registry_service)
+            .build(&config, metrics_registry.clone())
             .await?;
         let node = Arc::new(node);
 
         let cancel_token = CancellationToken::new();
-        let rest_api = Arc::new(UserServer::new(node.clone(), cancel_token.clone()));
+        let rest_api = Arc::new(UserServer::new(
+            node.clone(),
+            cancel_token.clone(),
+            &metrics_registry,
+        ));
 
         if self.run_rest_api {
             let rest_api_address = config.rest_api_address;
