@@ -76,6 +76,7 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
             metrics_address,
             storage_path: temp_dir.path().to_path_buf(),
             sui: None,
+            blob_recovery: Default::default(),
         },
         temp_dir,
     }
@@ -85,12 +86,12 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
 pub fn empty_storage_with_shards(shards: &[ShardIndex]) -> WithTempDir<Storage> {
     let temp_dir = tempfile::tempdir().expect("temporary directory creation must succeed");
     let db_config = DatabaseConfig::default();
-    let mut storage = Storage::open(temp_dir.path(), &db_config, MetricConf::default())
+    let mut storage = Storage::open(temp_dir.path(), db_config, MetricConf::default())
         .expect("storage creation must succeed");
 
     for shard in shards {
         storage
-            .create_storage_for_shard(*shard, &db_config)
+            .create_storage_for_shard(*shard)
             .expect("shard should be successfully created");
     }
 
@@ -331,6 +332,7 @@ impl StorageNodeHandleBuilder {
             metrics_address: unused_socket_address(),
             sui: None,
             db_config: None,
+            blob_recovery: Default::default(),
         };
 
         let metrics_registry = Registry::default();
@@ -487,6 +489,7 @@ impl CommitteeServiceFactory for StubCommitteeServiceFactory<NodeCommitteeServic
         Ok(Box::new(NodeCommitteeService::new(
             self.committee.clone(),
             local_identity,
+            Default::default(),
         )?))
     }
 }

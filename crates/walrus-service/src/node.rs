@@ -44,7 +44,7 @@ use crate::{
     committee::{CommitteeService, CommitteeServiceFactory, SuiCommitteeServiceFactory},
     config::{StorageNodeConfig, SuiConfig},
     contract_service::{SuiSystemContractService, SystemContractService},
-    storage::{DatabaseConfig, EventProgress, ShardStorage, Storage},
+    storage::{EventProgress, ShardStorage, Storage},
     system_events::{SuiSystemEventProvider, SystemEventProvider},
 };
 
@@ -216,7 +216,7 @@ impl StorageNodeBuilder {
         } else {
             Storage::open(
                 config.storage_path.as_path(),
-                &db_config,
+                db_config,
                 MetricConf::new("storage"),
             )?
         };
@@ -248,17 +248,20 @@ impl StorageNodeBuilder {
 
         let committee_service_factory = self.committee_service_factory.unwrap_or_else(|| {
             let (read_client, _) = sui_config_and_client.unwrap();
-            Box::new(SuiCommitteeServiceFactory::new(read_client))
+            Box::new(SuiCommitteeServiceFactory::new(
+                read_client,
+                config.blob_recovery.committee_service_config.clone(),
+            ))
         });
 
         StorageNode::new(
             protocol_key_pair,
             storage,
-            db_config,
             event_provider,
             committee_service_factory,
             contract_service,
             &metrics_registry,
+            config.blob_recovery.max_concurrent_blob_syncs,
         )
         .await
     }
@@ -303,11 +306,11 @@ impl StorageNode {
     async fn new(
         key_pair: ProtocolKeyPair,
         mut storage: Storage,
-        db_config: DatabaseConfig,
         event_provider: Box<dyn SystemEventProvider>,
         committee_service_factory: Box<dyn CommitteeServiceFactory>,
         contract_service: Box<dyn SystemContractService>,
         registry: &Registry,
+        max_concurrent_blob_syncs: usize,
     ) -> Result<Self, anyhow::Error> {
         let start_time = Instant::now();
         let committee_service = committee_service_factory
@@ -325,7 +328,7 @@ impl StorageNode {
 
         for shard in managed_shards {
             storage
-                .create_storage_for_shard(*shard, &db_config)
+                .create_storage_for_shard(*shard)
                 .with_context(|| format!("unable to initialize storage for shard {}", shard))?;
         }
 
@@ -343,7 +346,7 @@ impl StorageNode {
 
         inner.init_gauges()?;
 
-        let blob_sync_handler = BlobSyncHandler::new(inner.clone());
+        let blob_sync_handler = BlobSyncHandler::new(inner.clone(), max_concurrent_blob_syncs);
 
         Ok(StorageNode {
             inner,
