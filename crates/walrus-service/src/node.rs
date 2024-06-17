@@ -10,7 +10,6 @@ use serde::Serialize;
 use sui_types::event::EventID;
 use tokio::{select, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 use typed_store::{rocks::MetricConf, DBMetrics, TypedStoreError};
 use walrus_core::{
     encoding::{EncodingConfig, RecoverySymbolError},
@@ -61,10 +60,10 @@ pub use self::errors::{
     StoreMetadataError,
     StoreSliverError,
 };
-use self::{blob_sync::BlobSynchronizer, errors::IndexOutOfRange, metrics::NodeMetricSet};
 
 mod blob_sync;
 pub(crate) mod metrics;
+use self::{blob_sync::BlobSyncHandler, errors::IndexOutOfRange, metrics::NodeMetricSet};
 
 pub trait ServiceState {
     /// Retrieves the metadata associated with a blob.
@@ -284,6 +283,7 @@ async fn create_read_client(
 #[derive(Debug)]
 pub struct StorageNode {
     inner: Arc<StorageNodeInner>,
+    blob_sync_handler: BlobSyncHandler,
 }
 
 #[derive(Debug)]
@@ -343,7 +343,12 @@ impl StorageNode {
 
         inner.init_gauges()?;
 
-        Ok(StorageNode { inner })
+        let blob_sync_handler = BlobSyncHandler::new(inner.clone());
+
+        Ok(StorageNode {
+            inner,
+            blob_sync_handler,
+        })
     }
 
     /// Creates a new [`StorageNodeBuilder`] for constructing a `StorageNode`.
@@ -358,7 +363,9 @@ impl StorageNode {
                 Ok(()) => unreachable!("process_events should never return successfully"),
                 Err(err) => return Err(err),
             },
-            _ = cancel_token.cancelled() => (),
+            _ = cancel_token.cancelled() => {
+                self.blob_sync_handler.cancel_all().await?;
+            },
         }
         Ok(())
     }
@@ -388,10 +395,12 @@ impl StorageNode {
 
             match event {
                 BlobEvent::Certified(event) => {
-                    self.process_blob_certified_event(sequence_number, event)?;
+                    self.process_blob_certified_event(sequence_number, event)
+                        .await?;
                 }
                 BlobEvent::InvalidBlobID(event) => {
-                    self.process_blob_invalid_event(sequence_number, event)?;
+                    self.process_blob_invalid_event(sequence_number, event)
+                        .await?;
                 }
                 BlobEvent::Registered(_) => {
                     self.inner
@@ -403,7 +412,7 @@ impl StorageNode {
         bail!("event stream for blob events stopped")
     }
 
-    fn process_blob_certified_event(
+    async fn process_blob_certified_event(
         &self,
         event_sequence_number: usize,
         event: BlobCertified,
@@ -411,48 +420,40 @@ impl StorageNode {
         let start = tokio::time::Instant::now();
         let histogram_set = self.inner.metrics.recover_blob_duration_seconds.clone();
 
-        if self.inner.storage.is_stored_at_all_shards(&event.blob_id)? {
+        if self.inner.storage.is_stored_at_all_shards(&event.blob_id)?
+            || self.inner.storage.is_invalid(&event.blob_id)?
+        {
             self.inner
                 .mark_event_completed(event_sequence_number, &event.event_id)?;
-
             histogram_set
                 .with_label_values(&[metrics::STATUS_SKIPPED])
                 .observe(start.elapsed().as_secs_f64());
-
             return Ok(());
         }
 
         // Slivers, and possibly metadata, are not stored.
-        // TODO(jsmith): Do not spawn if there is already a worker for this blob id (#366)
-        // TODO(jsmith): Handle cancellation. (#366)
         // TODO(kwuest): Handle epoch change. (#405)
-        let synchronizer = BlobSynchronizer::new(event, event_sequence_number, self.inner.clone());
-        tokio::spawn(
-            async move {
-                // TODO(jsmith): Add a case for recording cancellation (#366).
-                let label = if let Err(err) = synchronizer.run().await {
-                    tracing::error!(?err, "blob synchronizer failed");
-                    metrics::STATUS_FAILURE
-                } else {
-                    metrics::STATUS_SUCCESS
-                };
 
-                histogram_set
-                    .with_label_values(&[label])
-                    .observe(start.elapsed().as_secs_f64());
-            }
-            .in_current_span(),
-        );
+        // Initiate blob sync
+        self.blob_sync_handler
+            .start_sync(event, event_sequence_number, start)
+            .await?;
 
         Ok(())
     }
 
-    // TODO(kwuest): Cancel in-progress syncs for the blob (part of #366 or follow-up)
-    fn process_blob_invalid_event(
+    async fn process_blob_invalid_event(
         &self,
         event_sequence_number: usize,
         event: InvalidBlobId,
     ) -> anyhow::Result<()> {
+        if let Some((event_seq_num, event_id)) =
+            self.blob_sync_handler.cancel_sync(&event.blob_id).await?
+        {
+            // Advance the event cursor with the event of the cancelled sync. Since the blob is
+            // invalid the associated blob certified event is completed without a sync.
+            self.inner.mark_event_completed(event_seq_num, &event_id)?;
+        }
         self.inner.storage.delete_blob(&event.blob_id)?;
         self.inner
             .mark_event_completed(event_sequence_number, &event.event_id)?;
