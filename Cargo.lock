@@ -11925,6 +11925,7 @@ dependencies = [
  "prometheus",
  "rand 0.8.5",
  "serde",
+ "sui-sdk 1.27.0",
  "tokio",
  "tracing",
  "tracing-subscriber",

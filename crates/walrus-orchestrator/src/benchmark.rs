@@ -22,7 +22,7 @@ pub struct BenchmarkParametersGeneric<N, C> {
     pub client_parameters: C,
     /// The committee size.
     pub nodes: usize,
-    /// The total load (tx/s) to submit to the system.
+    /// The total read and write loads (ops/minute) to submit to the system.
     pub load: usize,
 }
 
@@ -40,7 +40,7 @@ impl<N, C> Display for BenchmarkParametersGeneric<N, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} nodes ({}) - {} tx/s",
+            "{} nodes ({}) - {} ops/min",
             self.nodes, self.settings.faults, self.load
         )
     }
