@@ -55,6 +55,25 @@ impl ClientError {
             kind: ClientErrorKind::Other(err.into()),
         }
     }
+
+    /// Whether the error is an out-of-gas error.
+    pub fn is_out_of_coin_error(&self) -> bool {
+        matches!(
+            &self.kind,
+            ClientErrorKind::NoCompatiblePaymentCoin | ClientErrorKind::NoCompatibleGasCoin(..)
+        )
+    }
+}
+
+impl From<SuiClientError> for ClientError {
+    fn from(value: SuiClientError) -> Self {
+        let kind = match value {
+            SuiClientError::NoCompatiblePaymentCoin => ClientErrorKind::NoCompatiblePaymentCoin,
+            SuiClientError::NoCompatibleGasCoin(e) => ClientErrorKind::NoCompatibleGasCoin(e),
+            error => ClientErrorKind::Other(error.into()),
+        };
+        Self { kind }
+    }
 }
 
 /// Inner error type, raised when the client operation fails.
@@ -88,6 +107,12 @@ pub enum ClientErrorKind {
     /// The blob ID is blocked.
     #[error("the blob ID {0} is blocked")]
     BlobIdBlocked(BlobId),
+    #[error("no compatible payment coin found")]
+    /// No matching payment coin found for the transaction.
+    NoCompatiblePaymentCoin,
+    #[error("no compatible gas coin found: {0}")]
+    /// No matching gas coin found for the transaction.
+    NoCompatibleGasCoin(anyhow::Error),
     /// A failure internal to the node.
     #[error("client internal error: {0}")]
     Other(Box<dyn std::error::Error + Send + Sync + 'static>),
