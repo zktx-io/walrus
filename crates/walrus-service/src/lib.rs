@@ -15,6 +15,8 @@ pub mod testbed;
 pub mod utils;
 
 mod node;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_cluster;
 pub use node::{StorageNode, StorageNodeBuilder};
 
 mod storage;
