@@ -25,7 +25,7 @@ use sui_sdk::{
 use sui_types::{
     base_types::SuiAddress,
     event::EventID,
-    transaction::{Argument, ProgrammableTransaction},
+    transaction::{Argument, Command, ProgrammableTransaction},
     Identifier,
 };
 use walrus_core::{
@@ -41,7 +41,6 @@ use crate::{
     contracts::{self, FunctionTag},
     types::{Blob, StorageResource},
     utils::{
-        call_args_to_object_ids,
         get_created_sui_object_ids_by_type,
         get_sui_object,
         price_for_encoded_length,
@@ -68,8 +67,8 @@ pub enum SuiClientError {
     #[error("no compatible payment coin found")]
     NoCompatiblePaymentCoin,
     /// No matching gas coin found for the transaction.
-    #[error("no compatible gas coin found: {0}")]
-    NoCompatibleGasCoin(anyhow::Error),
+    #[error("no compatible gas coins found: {0}")]
+    NoCompatibleGasCoins(anyhow::Error),
     /// The Walrus system object does not exist.
     #[error(
         "the specified Walrus system object {0} does not exist; \
@@ -200,11 +199,7 @@ impl SuiContractClient {
             pt_builder.transfer_arg(self.wallet_address, Argument::NestedResult(result_index, i));
         }
 
-        self.sign_and_send_ptb(
-            pt_builder.finish(),
-            self.get_compatible_gas_coin(call_args).await?,
-        )
-        .await
+        self.sign_and_send_ptb(pt_builder.finish(), None).await
     }
 
     fn add_move_call_to_ptb(
@@ -225,30 +220,34 @@ impl SuiContractClient {
         Ok(result_index)
     }
 
-    async fn get_compatible_gas_coin(&self, call_args: Vec<CallArg>) -> SuiClientResult<ObjectRef> {
+    async fn get_compatible_gas_coins(
+        &self,
+        min_balance: Option<u64>,
+    ) -> SuiClientResult<Vec<ObjectRef>> {
         Ok(self
-            .wallet
-            .gas_for_owner_budget(
+            .read_client
+            .get_coins_with_total_balance(
                 self.wallet_address,
-                self.gas_budget,
-                call_args_to_object_ids(call_args),
+                None,
+                min_balance.unwrap_or(self.gas_budget),
             )
             .await
-            .map_err(SuiClientError::NoCompatibleGasCoin)?
-            .1
-            .object_ref())
+            .map_err(SuiClientError::NoCompatibleGasCoins)?
+            .iter()
+            .map(Coin::object_ref)
+            .collect())
     }
 
     async fn sign_and_send_ptb(
         &self,
         programmable_transaction: ProgrammableTransaction,
-        gas_coin: ObjectRef,
+        min_gas_coin_balance: Option<u64>,
     ) -> SuiClientResult<SuiTransactionBlockResponse> {
         let response = sign_and_send_ptb(
             self.wallet_address,
             &self.wallet,
             programmable_transaction,
-            gas_coin,
+            self.get_compatible_gas_coins(min_gas_coin_balance).await?,
             self.gas_budget,
         )
         .await?;
@@ -282,13 +281,77 @@ impl SuiContractClient {
         ))
     }
 
+    /// Returns a payment coin with sufficient balance to pay the `price`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SuiClientError::NoCompatiblePaymentCoin`] if no payment coin with sufficient
+    /// balance can be found or created (by merging coins).
     async fn get_payment_coin(&self, price: u64) -> SuiClientResult<Coin> {
         self.read_client
-            .get_payment_coins(self.wallet_address)
+            .get_coin_with_balance(
+                self.wallet_address,
+                Some(self.read_client.coin_type.to_canonical_string(true)),
+                price,
+                Default::default(),
+            )
             .await
-            .map_err(|_| SuiClientError::NoCompatiblePaymentCoin)?
-            .find(|coin| coin.balance >= price)
-            .ok_or_else(|| SuiClientError::NoCompatiblePaymentCoin)
+            .map_err(|_| SuiClientError::NoCompatiblePaymentCoin)
+    }
+
+    /// Adds an appropriate `reserve_space` transaction to the `pt_builder` depending on the used
+    /// coin type and returns the result index and the minimum balance of compatible gas coins.
+    ///
+    /// If the payment coin type is SUI, the storage resource is paid for with a coin split off from
+    /// the gas coin and adds the necessary transaction to the PTB). Otherwise, a separate coin with
+    /// sufficient balance is used.
+    async fn add_reserve_transaction(
+        &self,
+        pt_builder: &mut ProgrammableTransactionBuilder,
+        encoded_size: u64,
+        epochs_ahead: u64,
+    ) -> SuiClientResult<(u16, u64)> {
+        let price = self
+            .price_for_encoded_length(encoded_size, epochs_ahead)
+            .await?;
+        let system_object_arg = self.read_client.call_arg_from_system_obj(true).await?;
+
+        let payment_coin_arg = if self.read_client.uses_sui_coin() {
+            let price_argument = pt_builder.input(call_arg_pure!(&price))?;
+            let Argument::Result(split_result_index) =
+                pt_builder.command(Command::SplitCoins(Argument::GasCoin, vec![price_argument]))
+            else {
+                unreachable!("this always returns an `Argument::Result`")
+            };
+            Argument::NestedResult(split_result_index, 0)
+        } else {
+            pt_builder.input(self.get_payment_coin(price).await?.object_ref().into())?
+        };
+
+        let mut gas_coin_balance = self.gas_budget;
+        if self.read_client.uses_sui_coin() {
+            gas_coin_balance += price;
+        }
+
+        let reserve_arguments = vec![
+            pt_builder.input(system_object_arg.clone())?,
+            pt_builder.input(encoded_size.into())?,
+            pt_builder.input(epochs_ahead.into())?,
+            payment_coin_arg,
+        ];
+        let reserve_result_index = self.add_move_call_to_ptb(
+            pt_builder,
+            contracts::system::reserve_space
+                .with_type_params(&[self.read_client.coin_type.clone()]),
+            reserve_arguments,
+        )?;
+        // Transfer back payment coin.
+        pt_builder.transfer_arg(
+            self.wallet_address,
+            Argument::NestedResult(reserve_result_index, 1),
+        );
+
+        Ok((reserve_result_index, gas_coin_balance))
     }
 }
 
@@ -298,23 +361,20 @@ impl ContractClient for SuiContractClient {
         encoded_size: u64,
         epochs_ahead: u64,
     ) -> SuiClientResult<StorageResource> {
-        let payment_coin = self
-            .get_payment_coin(
-                self.price_for_encoded_length(encoded_size, epochs_ahead)
-                    .await?,
-            )
+        tracing::debug!(encoded_size, "starting to reserve storage for blob");
+        let mut pt_builder = ProgrammableTransactionBuilder::new();
+
+        let (reserve_result_index, min_gas_coin_balance) = self
+            .add_reserve_transaction(&mut pt_builder, encoded_size, epochs_ahead)
             .await?;
+        // Transfer the created storage resource.
+        pt_builder.transfer_arg(
+            self.wallet_address,
+            Argument::NestedResult(reserve_result_index, 0),
+        );
+
         let res = self
-            .move_call_and_transfer(
-                contracts::system::reserve_space
-                    .with_type_params(&[self.read_client.coin_type.clone()]),
-                vec![
-                    self.read_client.call_arg_from_system_obj(true).await?,
-                    encoded_size.into(),
-                    epochs_ahead.into(),
-                    payment_coin.object_ref().into(),
-                ],
-            )
+            .sign_and_send_ptb(pt_builder.finish(), Some(min_gas_coin_balance))
             .await?;
         let storage_id = get_created_sui_object_ids_by_type(
             &res,
@@ -373,39 +433,15 @@ impl ContractClient for SuiContractClient {
             .metadata()
             .encoded_size()
             .context("cannot compute encoded size")?;
-        let payment_coin = self
-            .get_payment_coin(
-                self.price_for_encoded_length(encoded_size, epochs_ahead)
-                    .await?,
-            )
-            .await?;
-        let system_object_arg = self.read_client.call_arg_from_system_obj(true).await?;
-        let mut pt_builder = ProgrammableTransactionBuilder::new();
         tracing::debug!(encoded_size, "starting to reserve and register blob");
+        let mut pt_builder = ProgrammableTransactionBuilder::new();
 
-        let reserve_arguments = [
-            system_object_arg.clone(),
-            encoded_size.into(),
-            epochs_ahead.into(),
-            payment_coin.object_ref().into(),
-        ]
-        .into_iter()
-        .map(|arg| pt_builder.input(arg))
-        .collect::<Result<Vec<_>>>()?;
-        let reserve_result_index = self.add_move_call_to_ptb(
-            &mut pt_builder,
-            contracts::system::reserve_space
-                .with_type_params(&[self.read_client.coin_type.clone()]),
-            reserve_arguments,
-        )?;
-        // Transfer back payment coin.
-        pt_builder.transfer_arg(
-            self.wallet_address,
-            Argument::NestedResult(reserve_result_index, 1),
-        );
+        let (reserve_result_index, min_gas_coin_balance) = self
+            .add_reserve_transaction(&mut pt_builder, encoded_size, epochs_ahead)
+            .await?;
 
         let register_arguments = vec![
-            pt_builder.input(system_object_arg)?,
+            pt_builder.input(self.read_client.call_arg_from_system_obj(true).await?)?,
             Argument::NestedResult(reserve_result_index, 0),
             pt_builder.input(call_arg_pure!(blob_metadata.blob_id()))?,
             pt_builder.input(call_arg_pure!(&blob_metadata
@@ -428,11 +464,7 @@ impl ContractClient for SuiContractClient {
         }
 
         let res = self
-            .sign_and_send_ptb(
-                pt_builder.finish(),
-                self.get_compatible_gas_coin(vec![payment_coin.object_ref().into()])
-                    .await?,
-            )
+            .sign_and_send_ptb(pt_builder.finish(), Some(min_gas_coin_balance))
             .await?;
         let blob_obj_id = get_created_sui_object_ids_by_type(
             &res,
