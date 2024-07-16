@@ -3,7 +3,6 @@
 
 #[test_only]
 module blob_store::blob_tests {
-
     use sui::coin;
     use sui::bcs;
 
@@ -15,17 +14,14 @@ module blob_store::blob_tests {
     use blob_store::blob;
     use blob_store::storage_node;
 
-    use blob_store::storage_resource::{
-        split_by_epoch,
-        destroy};
+    use blob_store::storage_resource::{split_by_epoch, destroy};
 
     const RED_STUFF: u8 = 0;
 
     public struct TESTWAL has store, drop {}
 
     #[test]
-    public fun test_blob_register_happy_path() : system::System<TESTWAL> {
-
+    public fun test_blob_register_happy_path(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -35,12 +31,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-            &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -51,9 +51,8 @@ module blob_store::blob_tests {
         system
     }
 
-    #[test, expected_failure(abort_code=blob::ERROR_RESOURCE_SIZE)]
-    public fun test_blob_insufficient_space() : system::System<TESTWAL> {
-
+    #[test, expected_failure(abort_code=blob::EResourceSize)]
+    public fun test_blob_insufficient_space(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -63,12 +62,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs - TOO LITTLE SPACE
         let (storage, fake_coin) = system::reserve_space(
-            &mut system, 5000, 3, fake_coin, &mut ctx);
+            &mut system,
+            5000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -80,8 +83,7 @@ module blob_store::blob_tests {
     }
 
     #[test]
-    public fun test_blob_certify_happy_path() : system::System<TESTWAL> {
-
+    public fun test_blob_certify_happy_path(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -91,12 +93,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -116,8 +122,7 @@ module blob_store::blob_tests {
     }
 
     #[test]
-    public fun test_blob_certify_single_function() : system::System<TESTWAL> {
-
+    public fun test_blob_certify_single_function(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // Derive blob ID and root_hash from bytes
@@ -135,7 +140,8 @@ module blob_store::blob_tests {
             119, 174, 25, 167, 128, 57, 96, 1,
             163, 56, 61, 132, 191, 35, 44, 18,
             231, 224, 79, 178, 85, 51, 69, 53,
-            214, 95, 198, 203, 56, 221, 111, 83];
+            214, 95, 198, 203, 56, 221, 111, 83
+        ];
 
         let mut encode = bcs::new(blob_id_vec);
         let blob_id = bcs::peel_u256(&mut encode);
@@ -166,14 +172,16 @@ module blob_store::blob_tests {
 
         // Create storage node
         // Pk corresponding to secret key scalar(117)
-        let public_key = vector[149, 234, 204, 58, 220, 9, 200, 39, 89, 63, 88, 30, 142, 45,
+        let public_key = vector[
+            149, 234, 204, 58, 220, 9, 200, 39, 89, 63, 88, 30, 142, 45,
             224, 104, 191, 76, 245, 208, 192, 235, 41, 229, 55, 47, 13, 35, 54, 71, 136, 238, 15,
-            155, 235, 17, 44, 138, 126, 156, 47, 12, 114, 4, 51, 112, 92, 240];
+            155, 235, 17, 44, 138, 126, 156, 47, 12, 114, 4, 51, 112, 92, 240
+        ];
         let storage_node = storage_node::create_storage_node_info(
             string::utf8(b"node"),
             string::utf8(b"127.0.0.1"),
             public_key,
-            vector[0, 1, 2, 3, 4, 5]
+            vector[0, 1, 2, 3, 4, 5],
         );
 
         // Create a new committee
@@ -181,8 +189,7 @@ module blob_store::blob_tests {
         let committee = committee::create_committee(&cap, 0, vector[storage_node]);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
@@ -190,7 +197,7 @@ module blob_store::blob_tests {
             1_000_000,
             3,
             fake_coin,
-            &mut ctx
+            &mut ctx,
         );
 
         // Register a Blob
@@ -201,7 +208,7 @@ module blob_store::blob_tests {
             root_hash,
             10000,
             RED_STUFF,
-            &mut ctx
+            &mut ctx,
         );
 
         // Set certify
@@ -215,9 +222,8 @@ module blob_store::blob_tests {
         system
     }
 
-    #[test, expected_failure(abort_code=blob::ERROR_WRONG_EPOCH)]
-    public fun test_blob_certify_bad_epoch() : system::System<TESTWAL> {
-
+    #[test, expected_failure(abort_code=blob::EWrongEpoch)]
+    public fun test_blob_certify_bad_epoch(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -227,12 +233,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -249,9 +259,8 @@ module blob_store::blob_tests {
         system
     }
 
-    #[test, expected_failure(abort_code=blob::ERROR_INVALID_BLOB_ID)]
-    public fun test_blob_certify_bad_blob_id() : system::System<TESTWAL> {
-
+    #[test, expected_failure(abort_code=blob::EInvalidBlobId)]
+    public fun test_blob_certify_bad_blob_id(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -261,12 +270,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -283,9 +296,8 @@ module blob_store::blob_tests {
         system
     }
 
-    #[test, expected_failure(abort_code=blob::ERROR_RESOURCE_BOUNDS)]
-    public fun test_blob_certify_past_epoch() : system::System<TESTWAL> {
-
+    #[test, expected_failure(abort_code=blob::EResourceBounds)]
+    public fun test_blob_certify_past_epoch(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -295,12 +307,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -333,8 +349,7 @@ module blob_store::blob_tests {
     }
 
     #[test]
-    public fun test_blob_happy_destroy() : system::System<TESTWAL> {
-
+    public fun test_blob_happy_destroy(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -344,12 +359,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -383,9 +402,8 @@ module blob_store::blob_tests {
         system
     }
 
-    #[test, expected_failure(abort_code=blob::ERROR_RESOURCE_BOUNDS)]
-    public fun test_blob_unhappy_destroy() : system::System<TESTWAL> {
-
+    #[test, expected_failure(abort_code=blob::EResourceBounds)]
+    public fun test_blob_unhappy_destroy(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -395,12 +413,16 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -421,10 +443,11 @@ module blob_store::blob_tests {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
-            ]);
+            ]
+        );
 
-            let message = blob::certify_blob_message(msg);
-            assert!(blob::message_blob_id(&message) == 0xAA, 0);
+        let message = blob::certify_blob_message(msg);
+        assert!(blob::message_blob_id(&message) == 0xAA, 0);
     }
 
     #[test, expected_failure]
@@ -435,15 +458,15 @@ module blob_store::blob_tests {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0,
-            ]);
+            ],
+        );
 
-            let message = blob::certify_blob_message(msg);
-            assert!(blob::message_blob_id(&message) == 0xAA, 0);
+        let message = blob::certify_blob_message(msg);
+        assert!(blob::message_blob_id(&message) == 0xAA, 0);
     }
 
     #[test]
-    public fun test_blob_extend_happy_path() : system::System<TESTWAL> {
-
+    public fun test_blob_extend_happy_path(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -453,20 +476,28 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Get a longer storage period
         let (mut storage_long, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 5, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            5,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Split by period
-        let trailing_storage =
-            split_by_epoch(&mut storage_long, 3, &mut ctx);
+        let trailing_storage = split_by_epoch(&mut storage_long, 3, &mut ctx);
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -489,8 +520,7 @@ module blob_store::blob_tests {
     }
 
     #[test, expected_failure]
-    public fun test_blob_extend_bad_period() : system::System<TESTWAL> {
-
+    public fun test_blob_extend_bad_period(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -500,20 +530,28 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Get a longer storage period
         let (mut storage_long, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 5, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            5,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Split by period
-        let trailing_storage =
-            split_by_epoch(&mut storage_long, 4, &mut ctx);
+        let trailing_storage = split_by_epoch(&mut storage_long, 4, &mut ctx);
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -532,9 +570,8 @@ module blob_store::blob_tests {
         system
     }
 
-    #[test,expected_failure(abort_code=blob::ERROR_RESOURCE_BOUNDS)]
-    public fun test_blob_unhappy_extend() : system::System<TESTWAL> {
-
+    #[test,expected_failure(abort_code=blob::EResourceBounds)]
+    public fun test_blob_unhappy_extend(): system::System<TESTWAL> {
         let mut ctx = tx_context::dummy();
 
         // A test coin.
@@ -544,20 +581,28 @@ module blob_store::blob_tests {
         let committee = committee::committee_for_testing(0);
 
         // Create a new system object
-        let mut system : system::System<TESTWAL> = system::new(committee,
-            1000000000, 5, &mut ctx);
+        let mut system: system::System<TESTWAL> = system::new(committee, 1000000000, 5, &mut ctx);
 
         // Get some space for a few epochs
         let (storage, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 3, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            3,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Get a longer storage period
         let (mut storage_long, fake_coin) = system::reserve_space(
-                &mut system, 1_000_000, 5, fake_coin, &mut ctx);
+            &mut system,
+            1_000_000,
+            5,
+            fake_coin,
+            &mut ctx,
+        );
 
         // Split by period
-        let trailing_storage =
-            split_by_epoch(&mut storage_long, 3, &mut ctx);
+        let trailing_storage = split_by_epoch(&mut storage_long, 3, &mut ctx);
 
         // Register a Blob
         let blob_id = blob::derive_blob_id(0xABC, RED_STUFF, 5000);
@@ -596,5 +641,4 @@ module blob_store::blob_tests {
         coin::burn_for_testing(fake_coin);
         system
     }
-
 }
