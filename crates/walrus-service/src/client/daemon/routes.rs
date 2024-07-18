@@ -1,18 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A client daemon who serves a set of simple HTTP endpoints to store, encode, or read blobs.
-
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, put},
     Json,
-    Router,
 };
 use reqwest::header::{
     ACCESS_CONTROL_ALLOW_HEADERS,
@@ -23,85 +19,36 @@ use reqwest::header::{
     X_CONTENT_TYPE_OPTIONS,
 };
 use serde::Deserialize;
-use tower_http::trace::TraceLayer;
 use tracing::Level;
+use utoipa::IntoParams;
 use walrus_core::encoding::Primary;
 use walrus_sui::client::ContractClient;
 
 use crate::{
+    api::{self, BlobIdString},
     client::{BlobStoreResult, Client, ClientErrorKind},
-    server::routes::BlobIdString,
 };
 
+/// OpenAPI documentation endpoint.
+pub const API_DOCS: &str = "/v1/api";
 /// The path to get the blob with the given blob ID.
 pub const BLOB_GET_ENDPOINT: &str = "/v1/:blobId";
-
 /// The path to store a blob.
 pub const BLOB_PUT_ENDPOINT: &str = "/v1/store";
 
-/// The client daemon.
-///
-/// Exposes different HTTP endpoints depending on which functions `with_*` were applied after
-/// constructing it with [`ClientDaemon::new`].
-#[derive(Debug, Clone)]
-pub struct ClientDaemon<T> {
-    client: Arc<Client<T>>,
-    network_address: SocketAddr,
-    router: Router<Arc<Client<T>>>,
-}
-
-impl<T: Send + Sync + 'static> ClientDaemon<T> {
-    /// Creates a new [`ClientDaemon`], which serves requests at the provided `network_address` and
-    /// interacts with Walrus through the `client`.
-    ///
-    /// The exposed APIs can be defined by calling a subset of the functions `with_*`. The daemon is
-    /// started through [`Self::run()`].
-    pub fn new(client: Client<T>, network_address: SocketAddr) -> Self {
-        ClientDaemon {
-            client: Arc::new(client),
-            network_address,
-            router: Router::new(),
-        }
-    }
-
-    /// Specifies that the daemon should expose the aggregator interface (read blobs).
-    pub fn with_aggregator(mut self) -> Self {
-        self.router = self.router.route(BLOB_GET_ENDPOINT, get(retrieve_blob));
-        self
-    }
-
-    /// Runs the daemon.
-    pub async fn run(self) -> Result<(), std::io::Error> {
-        let listener = tokio::net::TcpListener::bind(self.network_address).await?;
-        tracing::info!(address = %self.network_address, "the client daemon is starting");
-        axum::serve(
-            listener,
-            self.router
-                .with_state(self.client)
-                .layer(TraceLayer::new_for_http()),
-        )
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-    }
-}
-
-impl<T: ContractClient + 'static> ClientDaemon<T> {
-    /// Specifies that the daemon should expose the publisher interface (store blobs).
-    pub fn with_publisher(mut self, max_body_limit: usize) -> Self {
-        self.router = self.router.route(
-            BLOB_PUT_ENDPOINT,
-            put(store_blob)
-                .route_layer(DefaultBodyLimit::max(max_body_limit))
-                .options(store_blob_options),
-        );
-        self
-    }
-}
-
 #[tracing::instrument(level = Level::ERROR, skip_all, fields(%blob_id))]
-async fn retrieve_blob<T: Send + Sync>(
+#[utoipa::path(
+    get,
+    path = api::rewrite_route(BLOB_GET_ENDPOINT),
+    params(("blob_id" = BlobIdString,)),
+    responses(
+        (status = 200, description = "The blob was reconstructed successfully", body = [u8]),
+        (status = 404, description = "The requested blob does not exist"),
+        (status = 500, description = "Internal server error" ),
+        // TODO(mlegner): Improve error responses. (#178, #462)
+    ),
+)]
+pub(super) async fn get_blob<T: Send + Sync>(
     request_headers: HeaderMap,
     State(client): State<Arc<Client<T>>>,
     Path(BlobIdString(blob_id)): Path<BlobIdString>,
@@ -138,7 +85,21 @@ async fn retrieve_blob<T: Send + Sync>(
 }
 
 #[tracing::instrument(level = Level::ERROR, skip_all, fields(%epochs))]
-async fn store_blob<T: ContractClient>(
+#[utoipa::path(
+    put,
+    path = api::rewrite_route(BLOB_PUT_ENDPOINT),
+    request_body(content = [u8], description = "Unencoded blob"),
+    params(PublisherQuery),
+    responses(
+        (status = 200, description = "The blob was stored successfully", body = BlobStoreResult),
+        (status = 400, description = "The request is malformed"),
+        (status = 413, description = "The blob is too large"),
+        (status = 500, description = "Internal server error"),
+        (status = 504, description = "Communication problem with Walrus storage nodes"),
+        // TODO(mlegner): Document error responses. (#178, #462)
+    ),
+)]
+pub(super) async fn put_blob<T: ContractClient>(
     State(client): State<Arc<Client<T>>>,
     Query(PublisherQuery { epochs, force }): Query<PublisherQuery>,
     blob: Bytes,
@@ -175,7 +136,7 @@ async fn store_blob<T: ContractClient>(
 }
 
 #[tracing::instrument(level = Level::ERROR, skip_all)]
-async fn store_blob_options() -> impl IntoResponse {
+pub(super) async fn store_blob_options() -> impl IntoResponse {
     [
         (ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
         (ACCESS_CONTROL_ALLOW_METHODS, "PUT, OPTIONS"),
@@ -184,14 +145,14 @@ async fn store_blob_options() -> impl IntoResponse {
     ]
 }
 
-#[derive(Debug, Deserialize)]
-struct PublisherQuery {
+#[derive(Debug, Deserialize, IntoParams)]
+pub(super) struct PublisherQuery {
     #[serde(default = "default_epochs")]
     epochs: u64,
     #[serde(default)]
     force: bool,
 }
 
-fn default_epochs() -> u64 {
+pub(super) fn default_epochs() -> u64 {
     1
 }
