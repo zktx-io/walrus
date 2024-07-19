@@ -44,7 +44,7 @@ use crate::{
     committee::{CommitteeService, CommitteeServiceFactory, SuiCommitteeServiceFactory},
     config::{StorageNodeConfig, SuiConfig},
     contract_service::{SuiSystemContractService, SystemContractService},
-    storage::{EventProgress, ShardStorage, Storage},
+    storage::{blob_info::BlobInfoApi, EventProgress, ShardStorage, Storage},
     system_events::{SuiSystemEventProvider, SystemEventProvider},
 };
 
@@ -633,7 +633,7 @@ impl ServiceState for StorageNodeInner {
 
         if blob_info.is_invalid() {
             return Err(StoreMetadataError::InvalidBlob(
-                blob_info.current_status_event,
+                blob_info.current_status_event(),
             ));
         }
 
@@ -641,7 +641,7 @@ impl ServiceState for StorageNodeInner {
             return Err(StoreMetadataError::BlobExpired);
         }
 
-        if blob_info.is_metadata_stored {
+        if blob_info.is_metadata_stored() {
             return Ok(false);
         }
 
@@ -1468,7 +1468,7 @@ mod tests {
         store_at_shards(&blob3_details, &cluster, store_at_other_node_fn).await?;
         events.send(BlobCertified::for_testing(*blob3_details.blob_id()).into())?;
 
-        // All shards for blobs 1 and 2 should be synced by the node.
+        // All shards for blobs 1 and 3 should be synced by the node.
         for blob_details in [blob1_details, blob3_details] {
             for shard in own_shards {
                 let synced_sliver_pair = expect_sliver_pair_stored_before_timeout(
