@@ -23,6 +23,7 @@ use walrus_core::{
         InvalidBlobIdMsg,
         ProtocolMessage,
         SignedMessage,
+        SignedSyncShardRequest,
         StorageConfirmation,
     },
     metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
@@ -62,6 +63,7 @@ pub use self::errors::{
     ShardNotAssigned,
     StoreMetadataError,
     StoreSliverError,
+    SyncShardError,
 };
 
 mod blob_sync;
@@ -140,6 +142,13 @@ pub trait ServiceState {
 
     /// Returns the node health information of this ServiceState.
     fn health_info(&self) -> ServiceHealthInfo;
+
+    /// Returns the shard data with the provided signed request and the public key of the sender.
+    fn sync_shard(
+        &self,
+        public_key: PublicKey,
+        signed_request: SignedSyncShardRequest,
+    ) -> Result<(), SyncShardError>;
 }
 
 /// Builder to construct a [`StorageNode`].
@@ -644,6 +653,14 @@ impl ServiceState for StorageNode {
     fn health_info(&self) -> ServiceHealthInfo {
         self.inner.health_info()
     }
+
+    fn sync_shard(
+        &self,
+        public_key: PublicKey,
+        signed_request: SignedSyncShardRequest,
+    ) -> Result<(), SyncShardError> {
+        self.inner.sync_shard(public_key, signed_request)
+    }
 }
 
 impl ServiceState for StorageNodeInner {
@@ -833,6 +850,23 @@ impl ServiceState for StorageNodeInner {
             public_key: self.public_key().clone(),
         }
     }
+
+    fn sync_shard(
+        &self,
+        public_key: PublicKey,
+        signed_request: SignedSyncShardRequest,
+    ) -> Result<(), SyncShardError> {
+        if !self.committee_service.is_walrus_storage_node(&public_key) {
+            return Err(SyncShardError::Unauthorized);
+        }
+
+        let sync_shard_msg = signed_request.verify_signature_and_get_message(&public_key)?;
+        let request = sync_shard_msg.as_ref().contents();
+
+        tracing::debug!("Sync shard request received: {:?}", request);
+
+        Ok(())
+    }
 }
 
 #[tracing::instrument(skip_all, err)]
@@ -860,8 +894,12 @@ mod tests {
     use std::{sync::OnceLock, time::Duration};
 
     use fastcrypto::traits::KeyPair;
+    use reqwest::StatusCode;
     use tokio::sync::{broadcast::Sender, Mutex};
-    use walrus_core::encoding::{self, EncodingAxis, Primary, Secondary, SliverPair};
+    use walrus_core::{
+        encoding::{self, EncodingAxis, Primary, Secondary, SliverPair},
+        messages::{SyncShardMsg, SyncShardRequest},
+    };
     use walrus_sdk::{api::BlobCertificationStatus as SdkBlobCertificationStatus, client::Client};
     use walrus_sui::{
         test_utils::EventForTesting,
@@ -1611,6 +1649,65 @@ mod tests {
         )?;
 
         assert!(!is_newly_stored);
+
+        Ok(())
+    }
+
+    // Tests the basic `sync_shard` API.
+    #[tokio::test]
+    async fn sync_shard_node_api() -> TestResult {
+        let (cluster, _, _) =
+            cluster_with_partially_stored_blob(&[&[0], &[1]], BLOB, |_, _| true).await?;
+
+        // Tests successful sync shard operation.
+        assert!(cluster.nodes[0]
+            .client
+            .sync_shard::<Primary>(
+                ShardIndex(0),
+                BLOB_ID,
+                10,
+                1,
+                &cluster.nodes[0].as_ref().inner.protocol_key_pair,
+            )
+            .await
+            .is_ok());
+
+        // Tests unauthorized sync shard operation (requester is not a storage node in Walrus).
+        {
+            let response = cluster.nodes[0]
+                .client
+                .sync_shard::<Primary>(ShardIndex(0), BLOB_ID, 10, 1, &ProtocolKeyPair::generate())
+                .await;
+            assert!(matches!(response,
+                Err(err) if err.http_status_code() == Some(StatusCode::UNAUTHORIZED) &&
+                            err.to_string().contains("The client is not authorized to perform sync shard operation")));
+        }
+
+        // Tests signed SyncShardRequest verification error.
+        {
+            let request = SyncShardRequest::new(ShardIndex(0), true, BLOB_ID, 10, 1);
+            let sync_shard_msg = SyncShardMsg::new(1, request);
+            let signed_request = cluster.nodes[0]
+                .as_ref()
+                .inner
+                .protocol_key_pair
+                .sign_message(&sync_shard_msg);
+
+            let result = cluster.nodes[0].storage_node.sync_shard(
+                cluster.nodes[1]
+                    .as_ref()
+                    .inner
+                    .protocol_key_pair
+                    .0
+                    .public()
+                    .clone(),
+                signed_request,
+            );
+            assert!(matches!(
+                result,
+                Err(SyncShardError::MessageVerificationError(..))
+            ));
+        }
 
         Ok(())
     }

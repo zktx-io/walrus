@@ -3,6 +3,7 @@
 
 //! Client for interacting with the StorageNode API.
 
+use fastcrypto::traits::{EncodeDecodeBase64, KeyPair};
 use opentelemetry::propagation::Injector;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -18,13 +19,21 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use walrus_core::{
     encoding::{EncodingAxis, EncodingConfig, Primary, RecoverySymbol, Secondary, Sliver},
     inconsistency::InconsistencyProof,
+    keys::ProtocolKeyPair,
     merkle::MerkleProof,
-    messages::{InvalidBlobIdAttestation, SignedStorageConfirmation, StorageConfirmation},
+    messages::{
+        InvalidBlobIdAttestation,
+        SignedStorageConfirmation,
+        StorageConfirmation,
+        SyncShardMsg,
+        SyncShardRequest,
+    },
     metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
     BlobId,
     Epoch,
     InconsistencyProof as InconsistencyProofEnum,
     PublicKey,
+    ShardIndex,
     Sliver as SliverEnum,
     SliverPairIndex,
     SliverType,
@@ -44,6 +53,7 @@ const RECOVERY_URL_TEMPLATE: &str =
 const INCONSISTENCY_PROOF_URL_TEMPLATE: &str = "/v1/blobs/:blob_id/inconsistent/:sliver_type";
 const STATUS_URL_TEMPLATE: &str = "/v1/blobs/:blob_id/status";
 const HEALTH_URL_TEMPLATE: &str = "/v1/health";
+const SYNC_SHARD_TEMPLATE: &str = "/v1/migrate/sync_shard";
 
 #[derive(Debug, Clone)]
 struct UrlEndpoints(Url);
@@ -111,6 +121,10 @@ impl UrlEndpoints {
 
     fn server_health_info(&self) -> (Url, &'static str) {
         (self.0.join("/v1/health").unwrap(), HEALTH_URL_TEMPLATE)
+    }
+
+    fn sync_shard(&self) -> (Url, &'static str) {
+        (self.0.join("/v1/sync_shard").unwrap(), SYNC_SHARD_TEMPLATE)
     }
 }
 
@@ -468,6 +482,46 @@ impl Client {
             .await
     }
 
+    /// Syncs a shard from the storage node.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            walrus.shard_index = %shard_index,
+            walrus.epoch = epoch,
+            walrus.blob_id = %starting_blob_id,
+            walrus.sync.sliver_count = %sliver_count,
+        ),
+        err(level = Level::DEBUG)
+    )]
+    pub async fn sync_shard<A: EncodingAxis>(
+        &self,
+        shard_index: ShardIndex,
+        starting_blob_id: BlobId,
+        sliver_count: u64,
+        epoch: Epoch,
+        key_pair: &ProtocolKeyPair,
+    ) -> Result<(), NodeError> {
+        let (url, template) = self.endpoints.sync_shard();
+        let request = SyncShardRequest::new(
+            shard_index,
+            A::IS_PRIMARY,
+            starting_blob_id,
+            sliver_count,
+            epoch,
+        );
+
+        let sync_shard_msg = SyncShardMsg::new(epoch, request);
+        let signed_request = key_pair.sign_message(&sync_shard_msg);
+        let http_request = self.create_request_with_payload_and_public_key(
+            Method::POST,
+            url,
+            &signed_request,
+            key_pair.as_ref().public(),
+        )?;
+        self.send_and_parse_bcs_response(http_request, template)
+            .await
+    }
+
     /// Send a request with tracing and context propagation.
     ///
     /// The HTTP span ends after the parsing of the headers, since the response may be streamed.
@@ -556,6 +610,23 @@ impl Client {
             .body(bcs::to_bytes(body).expect("type must be bcs encodable"))
             .build()
             .map_err(NodeError::reqwest)
+    }
+
+    // Creates a request with a payload and a public key in the Authorization header.
+    fn create_request_with_payload_and_public_key<T: Serialize>(
+        &self,
+        method: Method,
+        url: Url,
+        body: &T,
+        public_key: &PublicKey,
+    ) -> Result<Request, NodeError> {
+        let mut request = self.create_request_with_payload(method, url, body)?;
+        let encoded_key = public_key.encode_base64();
+        let public_key_header = HeaderValue::from_str(&encoded_key).map_err(NodeError::other)?;
+        request
+            .headers_mut()
+            .insert(reqwest::header::AUTHORIZATION, public_key_header);
+        Ok(request)
     }
 }
 

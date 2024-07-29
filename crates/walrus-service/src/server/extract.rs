@@ -4,11 +4,12 @@
 use axum::{
     async_trait,
     body::Bytes,
-    extract::{rejection::BytesRejection, FromRequest, Request},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{rejection::BytesRejection, FromRequest, FromRequestParts, Request},
+    http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde::{de::DeserializeOwned, Serialize};
+use reqwest::header::AUTHORIZATION;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::api::{RestApiError, RestApiJsonError};
 
@@ -125,5 +126,32 @@ where
                 .into_response()
             }
         }
+    }
+}
+
+// The following code is used to extract the Authorization header from a request.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[must_use]
+pub struct Authorization(pub String);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for Authorization
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        let auth_header = parts.headers.get(AUTHORIZATION);
+
+        if auth_header.is_none() {
+            return Err((StatusCode::UNAUTHORIZED, "Missing Authorization header"));
+        }
+
+        let key_bytes = auth_header.unwrap().to_str();
+        if key_bytes.is_err() {
+            return Err((StatusCode::BAD_REQUEST, "Invalid Authorization header"));
+        }
+
+        Ok(Authorization(key_bytes.unwrap().to_string()))
     }
 }

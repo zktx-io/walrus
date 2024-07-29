@@ -7,7 +7,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{DefaultBodyLimit, MatchedPath, State},
-    routing::{get, put},
+    routing::{get, post, put},
     Router,
 };
 use prometheus::{register_histogram_vec_with_registry, HistogramVec, Registry};
@@ -84,6 +84,7 @@ where
             )
             .route(routes::STATUS_ENDPOINT, get(routes::get_blob_status))
             .route(routes::HEALTH_ENDPOINT, get(routes::health_info))
+            .route(routes::SYNC_SHARD_ENDPOINT, post(routes::sync_shard))
             .with_state(self.state.clone())
             // The following layers are executed from the bottom up
             .layer(
@@ -161,10 +162,11 @@ mod test {
         },
         keys::ProtocolKeyPair,
         merkle::MerkleProof,
-        messages::{InvalidBlobIdAttestation, StorageConfirmation},
+        messages::{InvalidBlobIdAttestation, SignedMessage, StorageConfirmation, SyncShardMsg},
         metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
         BlobId,
         InconsistencyProof,
+        PublicKey,
         RecoverySymbol,
         Sliver,
         SliverPairIndex,
@@ -193,6 +195,7 @@ mod test {
             RetrieveSymbolError,
             StoreMetadataError,
             StoreSliverError,
+            SyncShardError,
         },
         test_utils,
     };
@@ -323,6 +326,14 @@ mod test {
                 epoch: 0,
                 public_key: ProtocolKeyPair::generate().as_ref().public().clone(),
             }
+        }
+
+        fn sync_shard(
+            &self,
+            _public_key: PublicKey,
+            _signed_request: SignedMessage<SyncShardMsg>,
+        ) -> Result<(), SyncShardError> {
+            Ok(())
         }
     }
 

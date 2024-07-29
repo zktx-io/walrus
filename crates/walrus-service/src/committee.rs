@@ -128,6 +128,12 @@ pub trait CommitteeService: std::fmt::Debug + Send + Sync {
         inconsistency_proof: &InconsistencyProofEnum,
         n_shards: NonZeroU16,
     ) -> InvalidBlobCertificate;
+
+    /// Checks if the given public key belongs to a Walrus storage node.
+    /// TODO (#629): once node catching up is implemented, we need to make sure that the node
+    /// may not be part of the current committee (node from past committee in the previous epoch
+    /// or will be come new committee in the future) can still communicate with each other.
+    fn is_walrus_storage_node(&self, public_key: &PublicKey) -> bool;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -618,6 +624,14 @@ impl CommitteeService for NodeCommitteeService {
 
     fn committee(&self) -> &Committee {
         &self.inner.committee
+    }
+
+    fn is_walrus_storage_node(&self, public_key: &PublicKey) -> bool {
+        self.inner
+            .committee
+            .members()
+            .iter()
+            .any(|member| member.public_key == *public_key)
     }
 
     async fn get_and_verify_metadata(
