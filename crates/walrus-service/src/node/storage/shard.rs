@@ -4,15 +4,13 @@
 //! Walrus shard storage.
 
 use std::{
-    borrow::Borrow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, OnceLock},
 };
 
 use regex::Regex;
 use rocksdb::{Options, DB};
-use serde::{Deserialize, Serialize};
 use typed_store::{
     rocks::{errors::typed_store_err_from_rocks_err, DBBatch, DBMap, ReadWriteOptions, RocksDB},
     Map,
@@ -28,29 +26,11 @@ use walrus_core::{
 
 use super::DatabaseConfig;
 
-type PrimarySliverKey = SliverKey<true>;
-type SecondarySliverKey = SliverKey<false>;
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Deserialize, Serialize)]
-struct SliverKey<const P: bool>((bool, BlobId));
-
-impl<const P: bool> SliverKey<P> {
-    fn new(blob_id: BlobId) -> Self {
-        Self((P, blob_id))
-    }
-}
-
-impl<const P: bool, T: Borrow<BlobId>> From<T> for SliverKey<P> {
-    fn from(value: T) -> Self {
-        Self::new(*value.borrow())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ShardStorage {
     id: ShardIndex,
-    primary_slivers: DBMap<PrimarySliverKey, PrimarySliver>,
-    secondary_slivers: DBMap<SecondarySliverKey, SecondarySliver>,
+    primary_slivers: DBMap<BlobId, PrimarySliver>,
+    secondary_slivers: DBMap<BlobId, SecondarySliver>,
 }
 
 /// Storage corresponding to a single shard.
@@ -62,20 +42,27 @@ impl ShardStorage {
     ) -> Result<Self, TypedStoreError> {
         let rw_options = ReadWriteOptions::default();
 
-        // Both primary and secondary slivers are written into the same column family,
-        // and are differentiated by their keys.
-        let cf_name = slivers_column_family_name(id);
-
-        if database.cf_handle(&cf_name).is_none() {
-            let (_, options) = Self::slivers_column_family_options(id, db_config);
-            database
-                .create_cf(&cf_name, &options)
-                .map_err(typed_store_err_from_rocks_err)?;
+        let shard_cf_options = Self::slivers_column_family_options(id, db_config);
+        for (_, (cf_name, options)) in shard_cf_options.iter() {
+            if database.cf_handle(cf_name).is_none() {
+                database
+                    .create_cf(cf_name, options)
+                    .map_err(typed_store_err_from_rocks_err)?;
+            }
         }
 
-        // Open both typed storage as maps over the same column family.
-        let primary_slivers = DBMap::reopen(database, Some(&cf_name), &rw_options, false)?;
-        let secondary_slivers = DBMap::reopen(database, Some(&cf_name), &rw_options, false)?;
+        let primary_slivers = DBMap::reopen(
+            database,
+            Some(shard_cf_options[&SliverType::Primary].0.as_str()),
+            &rw_options,
+            false,
+        )?;
+        let secondary_slivers = DBMap::reopen(
+            database,
+            Some(shard_cf_options[&SliverType::Secondary].0.as_str()),
+            &rw_options,
+            false,
+        )?;
 
         Ok(Self {
             id,
@@ -92,10 +79,8 @@ impl ShardStorage {
         sliver: &Sliver,
     ) -> Result<(), TypedStoreError> {
         match sliver {
-            Sliver::Primary(primary) => self.primary_slivers.insert(&blob_id.into(), primary),
-            Sliver::Secondary(secondary) => {
-                self.secondary_slivers.insert(&blob_id.into(), secondary)
-            }
+            Sliver::Primary(primary) => self.primary_slivers.insert(blob_id, primary),
+            Sliver::Secondary(secondary) => self.secondary_slivers.insert(blob_id, secondary),
         }
     }
 
@@ -126,7 +111,7 @@ impl ShardStorage {
         &self,
         blob_id: &BlobId,
     ) -> Result<Option<PrimarySliver>, TypedStoreError> {
-        self.primary_slivers.get(&blob_id.into())
+        self.primary_slivers.get(blob_id)
     }
 
     /// Retrieves the stored secondary sliver for the given blob ID.
@@ -135,7 +120,7 @@ impl ShardStorage {
         &self,
         blob_id: &BlobId,
     ) -> Result<Option<SecondarySliver>, TypedStoreError> {
-        self.secondary_slivers.get(&blob_id.into())
+        self.secondary_slivers.get(blob_id)
     }
 
     /// Returns true iff the sliver-pair for the given blob ID is stored by the shard.
@@ -152,14 +137,8 @@ impl ShardStorage {
         batch: &mut DBBatch,
         blob_id: &BlobId,
     ) -> Result<(), TypedStoreError> {
-        batch.delete_batch(
-            &self.primary_slivers,
-            std::iter::once::<PrimarySliverKey>(blob_id.into()),
-        )?;
-        batch.delete_batch(
-            &self.secondary_slivers,
-            std::iter::once::<SecondarySliverKey>(blob_id.into()),
-        )?;
+        batch.delete_batch(&self.primary_slivers, std::iter::once(blob_id))?;
+        batch.delete_batch(&self.secondary_slivers, std::iter::once(blob_id))?;
         Ok(())
     }
 
@@ -178,20 +157,34 @@ impl ShardStorage {
         type_: SliverType,
     ) -> Result<bool, TypedStoreError> {
         match type_ {
-            SliverType::Primary => self.primary_slivers.contains_key(&blob_id.into()),
-            SliverType::Secondary => self.secondary_slivers.contains_key(&blob_id.into()),
+            SliverType::Primary => self.primary_slivers.contains_key(blob_id),
+            SliverType::Secondary => self.secondary_slivers.contains_key(blob_id),
         }
     }
 
-    /// Returns the name and options for the column family for a shard with the specified index.
+    /// Returns the name and options for the column families for a shard's primary and secondary sliver
+    /// with the specified index.
     pub(crate) fn slivers_column_family_options(
         id: ShardIndex,
         db_config: &DatabaseConfig,
-    ) -> (String, Options) {
-        (
-            slivers_column_family_name(id),
-            db_config.shard().to_options(),
-        )
+    ) -> HashMap<SliverType, (String, Options)> {
+        [
+            (
+                SliverType::Primary,
+                (
+                    primary_slivers_column_family_name(id),
+                    db_config.shard().to_options(),
+                ),
+            ),
+            (
+                SliverType::Secondary,
+                (
+                    secondary_slivers_column_family_name(id),
+                    db_config.shard().to_options(),
+                ),
+            ),
+        ]
+        .into()
     }
 
     /// Returns the ids of existing shards in the database at the provided path.
@@ -199,22 +192,34 @@ impl ShardStorage {
         DB::list_cf(options, path)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|cf_name| id_from_column_family_name(&cf_name))
+            .filter_map(|cf_name| match id_from_column_family_name(&cf_name) {
+                // To check existing shards, we only need to look at whether the secondary sliver column
+                // was created or not, as it was created after the primary sliver column.
+                Some((shard_index, SliverType::Secondary)) => Some(shard_index),
+                Some((_, SliverType::Primary)) | None => None,
+            })
             .collect()
     }
 }
 
-fn id_from_column_family_name(name: &str) -> Option<ShardIndex> {
+fn id_from_column_family_name(name: &str) -> Option<(ShardIndex, SliverType)> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^shard-(\d+)/slivers$").expect("valid static regex"))
-        .captures(name)
-        .and_then(|captures| {
-            let Ok(id) = captures.get(1)?.as_str().parse() else {
-                tracing::warn!(%name, "ignoring shard-like column family with an ID out of range");
-                return None;
-            };
-            Some(ShardIndex(id))
-        })
+    RE.get_or_init(|| {
+        Regex::new(r"^shard-(\d+)/(primary|secondary)-slivers$").expect("valid static regex")
+    })
+    .captures(name)
+    .and_then(|captures| {
+        let Ok(id) = captures.get(1)?.as_str().parse() else {
+            tracing::warn!(%name, "ignoring shard-like column family with an ID out of range");
+            return None;
+        };
+        let sliver_type = match captures.get(2)?.as_str() {
+            "primary" => SliverType::Primary,
+            "secondary" => SliverType::Secondary,
+            _ => panic!("Invalid sliver type in regex capture"),
+        };
+        Some((ShardIndex(id), sliver_type))
+    })
 }
 
 #[inline]
@@ -223,18 +228,25 @@ fn base_column_family_name(id: ShardIndex) -> String {
 }
 
 #[inline]
-fn slivers_column_family_name(id: ShardIndex) -> String {
-    base_column_family_name(id) + "/slivers"
+fn primary_slivers_column_family_name(id: ShardIndex) -> String {
+    base_column_family_name(id) + "/primary-slivers"
+}
+
+#[inline]
+fn secondary_slivers_column_family_name(id: ShardIndex) -> String {
+    base_column_family_name(id) + "/secondary-slivers"
 }
 
 #[cfg(test)]
 mod tests {
     use walrus_core::{
         encoding::{Primary, Secondary},
+        ShardIndex,
         SliverType,
     };
-    use walrus_test_utils::{async_param_test, Result as TestResult};
+    use walrus_test_utils::{async_param_test, param_test, Result as TestResult};
 
+    use super::id_from_column_family_name;
     use crate::{
         node::storage::tests::{
             empty_storage,
@@ -394,5 +406,21 @@ mod tests {
         assert_eq!(shard.is_sliver_pair_stored(&BLOB_ID)?, is_pair_stored);
 
         Ok(())
+    }
+
+    param_test! {
+        test_parse_column_family_name: [
+            primary: ("shard-10/primary-slivers", Some((ShardIndex(10), SliverType::Primary))),
+            secondary: ("shard-20/secondary-slivers", Some((ShardIndex(20), SliverType::Secondary))),
+            invalid_id: ("shard-a/primary-slivers", None),
+            invalid_sliver_type: ("shard-20/random-slivers", None),
+            invalid_sliver_name: ("shard-20/slivers", None),
+        ]
+    }
+    fn test_parse_column_family_name(
+        cf_name: &str,
+        expected_output: Option<(ShardIndex, SliverType)>,
+    ) {
+        assert_eq!(id_from_column_family_name(cf_name), expected_output);
     }
 }
