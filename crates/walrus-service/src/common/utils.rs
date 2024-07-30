@@ -7,7 +7,7 @@ use std::{
     fmt::Debug,
     future::Future,
     num::Saturating,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     task::{ready, Context, Poll},
@@ -24,8 +24,48 @@ use rand::{
     Rng,
     SeedableRng,
 };
-use serde::{de::Error, Deserialize, Deserializer};
+use serde::{
+    de::{DeserializeOwned, Error},
+    Deserialize,
+    Deserializer,
+};
 use tokio::{sync::Semaphore, time::Instant};
+
+/// The Git revision obtained through `git describe` at compile time.
+pub const GIT_REVISION: &str = {
+    if let Some(revision) = option_env!("GIT_REVISION") {
+        revision
+    } else {
+        let version = git_version::git_version!(
+            args = ["--always", "--abbrev=12", "--dirty", "--exclude", "*"],
+            fallback = ""
+        );
+        if version.is_empty() {
+            panic!("unable to query git revision");
+        }
+        version
+    }
+};
+
+/// The version consisting of the package version and git revision.
+// NB: This assumes that the package version remains in sync between this crate and all crates that
+// import this constant.
+pub const VERSION: &str =
+    walrus_core::concat_const_str!(env!("CARGO_PKG_VERSION"), "-", GIT_REVISION);
+
+/// Trait for loading configuration from a YAML file.
+pub trait LoadConfig: DeserializeOwned {
+    /// Load the configuration from a YAML file located at the provided path.
+    fn load<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
+        let path = path.as_ref();
+        tracing::debug!(path = %path.display(), "reading config from file");
+
+        let reader = std::fs::File::open(path)
+            .with_context(|| format!("Unable to load config from {}", path.display()))?;
+
+        Ok(serde_yaml::from_reader(reader)?)
+    }
+}
 
 /// The representation of a backoff strategy.
 pub(crate) trait BackoffStrategy {
@@ -133,7 +173,10 @@ impl<R: Rng> Iterator for ExponentialBackoff<R> {
         self.next_delay()
     }
 }
+
+/// Trait to unify checking for success on `Result` and `Option` types.
 pub(crate) trait SuccessOrFailure {
+    /// Returns true iff the value is considered successful.
     fn is_success(&self) -> bool;
 }
 
@@ -149,7 +192,9 @@ impl<T> SuccessOrFailure for Option<T> {
     }
 }
 
+/// Helper functions applied to futures.
 pub(crate) trait FutureHelpers: Future {
+    /// Limits the number of simultaneously executing futures.
     async fn batch_limit(self, permits: Arc<Semaphore>) -> Self::Output
     where
         Self: Future,
@@ -162,6 +207,7 @@ pub(crate) trait FutureHelpers: Future {
         self.await
     }
 
+    /// Limits the number of simultaneously executing futures and the number of successful results.
     async fn limit(self, permits: Arc<Semaphore>) -> Self::Output
     where
         <Self as Future>::Output: SuccessOrFailure,
@@ -180,6 +226,7 @@ pub(crate) trait FutureHelpers: Future {
         .await
     }
 
+    /// Applies a timeout to the future.
     async fn timeout_after<T>(self, duration: Duration) -> <Self as Future>::Output
     where
         Self: Sized,
@@ -194,6 +241,7 @@ pub(crate) trait FutureHelpers: Future {
         }
     }
 
+    /// Reports metrics for the future.
     fn observe<F, const N: usize>(
         self,
         histograms: HistogramVec,
@@ -209,7 +257,9 @@ pub(crate) trait FutureHelpers: Future {
 
 impl<T: Future> FutureHelpers for T {}
 
+/// Structure that can wrap a future to report metrics for that future.
 #[pin_project(PinnedDrop)]
+#[derive(Debug)]
 pub(crate) struct Observe<Fut, F, const N: usize>
 where
     Fut: Future,
@@ -294,6 +344,8 @@ where
     }
 }
 
+/// Repeatedly calls the provided function with the provided backoff strategy until it returns
+/// successfully.
 pub(crate) async fn retry<S, F, T, Fut>(mut strategy: S, mut func: F) -> T
 where
     S: BackoffStrategy,
