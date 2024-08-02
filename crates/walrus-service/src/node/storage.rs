@@ -11,6 +11,7 @@ use std::{
 use rocksdb::{DBCompressionType, MergeOperands, Options};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use shard::ShardStatus;
 use sui_sdk::types::event::EventID;
 use tracing::Level;
 use typed_store::{
@@ -170,12 +171,18 @@ pub struct DatabaseConfig {
     blob_info: DatabaseTableOptions,
     event_cursor: DatabaseTableOptions,
     shard: DatabaseTableOptions,
+    shard_status: DatabaseTableOptions,
 }
 
 impl DatabaseConfig {
     /// Returns the shard configuration.
     pub fn shard(&self) -> &DatabaseTableOptions {
         &self.shard
+    }
+
+    /// Returns the shard status database option.
+    pub fn shard_status(&self) -> &DatabaseTableOptions {
+        &self.shard_status
     }
 }
 
@@ -186,6 +193,7 @@ impl Default for DatabaseConfig {
             blob_info: DatabaseTableOptions::default(),
             event_cursor: DatabaseTableOptions::default(),
             shard: DatabaseTableOptions::optimized_for_blobs(),
+            shard_status: DatabaseTableOptions::default(),
         }
     }
 }
@@ -226,6 +234,9 @@ impl Storage {
                 ShardStorage::slivers_column_family_options(id, &db_config)
                     .into_iter()
                     .map(|(_, (cf_name, options))| (cf_name, options))
+                    .chain([ShardStorage::shard_status_column_family_options(
+                        id, &db_config,
+                    )])
             })
             .collect::<Vec<_>>();
 
@@ -265,7 +276,8 @@ impl Storage {
         let shards = existing_shards_ids
             .into_iter()
             .map(|id| {
-                ShardStorage::create_or_reopen(id, &database, &db_config).map(|shard| (id, shard))
+                ShardStorage::create_or_reopen(id, &database, &db_config, None)
+                    .map(|shard| (id, shard))
             })
             .collect::<Result<_, _>>()?;
 
@@ -287,8 +299,12 @@ impl Storage {
         match self.shards.entry(shard) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
-                let shard_storage =
-                    ShardStorage::create_or_reopen(shard, &self.database, &self.config)?;
+                let shard_storage = ShardStorage::create_or_reopen(
+                    shard,
+                    &self.database,
+                    &self.config,
+                    Some(ShardStatus::Active),
+                )?;
                 Ok(entry.insert(shard_storage))
             }
         }
@@ -441,6 +457,10 @@ impl Storage {
     #[tracing::instrument(skip_all)]
     pub fn is_stored_at_all_shards(&self, blob_id: &BlobId) -> Result<bool, TypedStoreError> {
         for shard in self.shards.values() {
+            if !shard.status()?.is_owned_by_node() {
+                continue;
+            }
+
             if !shard.is_sliver_pair_stored(blob_id)? {
                 return Ok(false);
             }
@@ -903,22 +923,37 @@ pub(crate) mod tests {
         }
     }
 
-    /// Open and populate the storage, then close it.
+    /// Open and populate the storage, optionally lock a shard, then close the storage.
     ///
     /// Runs in its own runtime to ensure that all tasked spawned by typed_store
     /// are dropped to free the storage lock.
     #[tokio::main(flavor = "current_thread")]
-    async fn populate_storage_then_close(spec: StorageSpec) -> TestResult<TempDir> {
-        Ok(populated_storage(spec)?.temp_dir)
+    async fn populate_storage_then_close(
+        spec: StorageSpec,
+        lock_shard: Option<ShardIndex>,
+    ) -> TestResult<TempDir> {
+        let storage = populated_storage(spec)?;
+        if let Some(shard) = lock_shard {
+            storage
+                .inner
+                .shard_storage(shard)
+                .unwrap()
+                .lock_shard_for_epoch_change()
+                .expect("shard should be sealed");
+        }
+        Ok(storage.temp_dir)
     }
 
     #[test]
     #[cfg_attr(msim, ignore)]
     fn can_reopen_storage_with_shards_and_access_data() -> TestResult {
-        let directory = populate_storage_then_close(&[
-            (SHARD_INDEX, vec![(BLOB_ID, WhichSlivers::Both)]),
-            (OTHER_SHARD_INDEX, vec![(BLOB_ID, WhichSlivers::Both)]),
-        ])?;
+        let directory = populate_storage_then_close(
+            &[
+                (SHARD_INDEX, vec![(BLOB_ID, WhichSlivers::Both)]),
+                (OTHER_SHARD_INDEX, vec![(BLOB_ID, WhichSlivers::Both)]),
+            ],
+            None,
+        )?;
 
         Runtime::new()?.block_on(async move {
             let storage = Storage::open(
@@ -939,6 +974,50 @@ pub(crate) mod tests {
                         .expect("sliver should be present");
                 }
             }
+
+            Result::<(), anyhow::Error>::Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    // Tests that shard status can be restored upon restart.
+    #[test]
+    #[cfg_attr(msim, ignore)]
+    fn can_reopen_storage_with_shards_status() -> TestResult {
+        let directory = populate_storage_then_close(
+            &[
+                (SHARD_INDEX, vec![(BLOB_ID, WhichSlivers::Both)]),
+                (OTHER_SHARD_INDEX, vec![(BLOB_ID, WhichSlivers::Both)]),
+            ],
+            Some(SHARD_INDEX), // Lock SHARD_INDEX
+        )?;
+
+        Runtime::new()?.block_on(async move {
+            let storage = Storage::open(
+                directory.path(),
+                DatabaseConfig::default(),
+                MetricConf::default(),
+            )?;
+
+            // Check that the shard status is restored correctly.
+            assert_eq!(
+                storage
+                    .shard_storage(SHARD_INDEX)
+                    .expect("shard should exist")
+                    .status()
+                    .expect("status should be present"),
+                ShardStatus::LockedToMove
+            );
+
+            assert_eq!(
+                storage
+                    .shard_storage(OTHER_SHARD_INDEX)
+                    .expect("shard should exist")
+                    .status()
+                    .expect("status should be present"),
+                ShardStatus::Active
+            );
 
             Result::<(), anyhow::Error>::Ok(())
         })?;
