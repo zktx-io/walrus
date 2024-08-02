@@ -31,27 +31,33 @@ use serde::{
 };
 use tokio::{sync::Semaphore, time::Instant};
 
-/// The Git revision obtained through `git describe` at compile time.
-pub const GIT_REVISION: &str = {
-    if let Some(revision) = option_env!("GIT_REVISION") {
-        revision
-    } else {
-        let version = git_version::git_version!(
-            args = ["--always", "--abbrev=12", "--dirty", "--exclude", "*"],
-            fallback = ""
-        );
-        if version.is_empty() {
-            panic!("unable to query git revision");
-        }
-        version
-    }
-};
+/// Defines a constant containing the version consisting of the package version and git revision.
+///
+/// We are using a macro as placing this logic into a library can result in unnecessary builds.
+#[macro_export]
+macro_rules! version {
+    () => {{
+        /// The Git revision obtained through `git describe` at compile time.
+        const GIT_REVISION: &str = {
+            if let Some(revision) = option_env!("GIT_REVISION") {
+                revision
+            } else {
+                let version = git_version::git_version!(
+                    args = ["--always", "--abbrev=12", "--dirty", "--exclude", "*"],
+                    fallback = ""
+                );
+                if version.is_empty() {
+                    panic!("unable to query git revision");
+                }
+                version
+            }
+        };
 
-/// The version consisting of the package version and git revision.
-// NB: This assumes that the package version remains in sync between this crate and all crates that
-// import this constant.
-pub const VERSION: &str =
-    walrus_core::concat_const_str!(env!("CARGO_PKG_VERSION"), "-", GIT_REVISION);
+        /// The version consisting of the package version and Git revision.
+        walrus_core::concat_const_str!(env!("CARGO_PKG_VERSION"), "-", GIT_REVISION)
+    }};
+}
+pub use version;
 
 /// Trait for loading configuration from a YAML file.
 pub trait LoadConfig: DeserializeOwned {

@@ -16,10 +16,11 @@ use tokio::sync::oneshot;
 use walrus_service::{
     node::config::defaults::{METRICS_PORT, REST_API_PORT},
     testbed,
-    utils::VERSION,
+    utils::version,
 };
 use walrus_sui::utils::SuiNetwork;
 
+const VERSION: &str = version!();
 #[derive(Parser)]
 #[clap(rename_all = "kebab-case")]
 #[clap(name = env!("CARGO_BIN_NAME"))]
