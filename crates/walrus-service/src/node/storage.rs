@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context;
 use rocksdb::{DBCompressionType, MergeOperands, Options};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -20,8 +21,10 @@ use typed_store::{
     TypedStoreError,
 };
 use walrus_core::{
+    messages::{SyncShardRequest, SyncShardResponse},
     metadata::{BlobMetadata, VerifiedBlobMetadataWithId},
     BlobId,
+    Epoch,
     ShardIndex,
 };
 use walrus_sui::types::BlobEvent;
@@ -30,6 +33,8 @@ use self::{
     blob_info::{BlobInfo, BlobInfoApi, BlobInfoMergeOperand, Mergeable as _},
     event_cursor_table::EventCursorTable,
 };
+use super::errors::ShardNotAssigned;
+use crate::node::SyncShardError;
 
 pub(crate) mod blob_info;
 
@@ -510,6 +515,41 @@ impl Storage {
     /// Returns the shards currently present in the storage.
     pub(crate) fn shards_present(&self) -> Vec<ShardIndex> {
         self.shards.keys().copied().collect()
+    }
+
+    /// Handles a sync shard request. The validity of the request should be checked before calling
+    /// this function.
+    pub fn handle_sync_shard_request(
+        &self,
+        request: &SyncShardRequest,
+        current_epoch: Epoch,
+    ) -> Result<SyncShardResponse, SyncShardError> {
+        let Some(shard) = self.shard_storage(request.shard_index()) else {
+            return Err(ShardNotAssigned(request.shard_index(), current_epoch).into());
+        };
+
+        // Scan certified slivers to fetch.
+        let blobs_to_fetch = self
+            .blob_info
+            .safe_iter_with_bounds(Some(request.starting_blob_id()), None)
+            .filter_map(|blob_info| match blob_info {
+                Ok((blob_id, blob_info)) => {
+                    if blob_info.is_certified() {
+                        Some(Ok(blob_id))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .take(request.sliver_count() as usize)
+            .collect::<Result<Vec<_>, TypedStoreError>>()
+            .context("Scanning blob_info table encountered RocksDb error.")?;
+
+        Ok(shard
+            .fetch_slivers(request.sliver_type(), &blobs_to_fetch)
+            .context("Fetching slivers encountered error.")?
+            .into())
     }
 }
 
@@ -1061,6 +1101,127 @@ pub(crate) mod tests {
             ShardStorage::existing_shards(storage.temp_dir.path(), &Options::default())
                 .contains(&test_shard_index)
         );
+
+        Ok(())
+    }
+
+    async_param_test! {
+        handle_sync_shard_request_behave_expected -> TestResult: [
+            scan_first: (SliverType::Primary, ShardIndex(3), 1, 1, &[1]),
+            scan_all: (SliverType::Primary, ShardIndex(5), 1, 5, &[1, 2, 3, 4, 5]),
+            scan_tail: (SliverType::Primary, ShardIndex(3), 3, 5, &[3, 4, 5]),
+            scan_head: (SliverType::Primary, ShardIndex(5), 0, 2, &[1, 2]),
+            scan_middle_single: (SliverType::Secondary, ShardIndex(5), 3, 1, &[3]),
+            scan_middle_range: (SliverType::Secondary, ShardIndex(3), 2, 2, &[2, 3]),
+            scan_end_over: (SliverType::Secondary, ShardIndex(5), 3, 5, &[3, 4, 5]),
+            scan_all_wide_range: (SliverType::Secondary, ShardIndex(3), 0, 100, &[1, 2, 3, 4, 5]),
+            scan_out_of_range: (SliverType::Secondary, ShardIndex(5), 6, 2, &[]),
+        ]
+    }
+    async fn handle_sync_shard_request_behave_expected(
+        sliver_type: SliverType,
+        shard_index: ShardIndex,
+        start_blob_index: u8,
+        count: u64,
+        expected_blob_index_in_response: &[u8],
+    ) -> TestResult {
+        let mut storage = empty_storage();
+
+        // All tests use the same setup:
+        // - 2 shards: 3 and 5
+        // - 5 blobs: 1, 2, 3, 4, 5
+        // - 2 slivers per blob: primary and secondary
+
+        let mut seed = 10u8;
+
+        let blob_ids = [
+            BlobId([1; 32]),
+            BlobId([2; 32]),
+            BlobId([3; 32]),
+            BlobId([4; 32]),
+            BlobId([5; 32]),
+        ];
+
+        let mut data: HashMap<ShardIndex, HashMap<BlobId, HashMap<SliverType, Sliver>>> =
+            HashMap::new();
+        for shard in [ShardIndex(3), ShardIndex(5)] {
+            storage.as_mut().create_storage_for_shard(shard).unwrap();
+            let shard_storage = storage.as_ref().shard_storage(shard).unwrap();
+            data.insert(shard, HashMap::new());
+            for blob in blob_ids.iter() {
+                data.get_mut(&shard).unwrap().insert(*blob, HashMap::new());
+                for sliver_type in [SliverType::Primary, SliverType::Secondary] {
+                    let sliver_data = get_sliver(sliver_type, seed);
+                    seed += 1;
+                    data.get_mut(&shard)
+                        .unwrap()
+                        .get_mut(blob)
+                        .unwrap()
+                        .insert(sliver_type, sliver_data.clone());
+                    shard_storage
+                        .put_sliver(blob, &sliver_data)
+                        .expect("Store should succeed");
+                }
+            }
+        }
+
+        for blob in blob_ids.iter() {
+            storage
+                .as_mut()
+                .merge_update_blob_info(
+                    blob,
+                    BlobInfoMergeOperand::ChangeStatus {
+                        blob_id: *blob,
+                        status_changing_epoch: 1,
+                        end_epoch: 2,
+                        status: BlobCertificationStatus::Certified,
+                        status_event: event_id_for_testing(),
+                    },
+                )
+                .expect("Writing blob info should succeed");
+        }
+
+        let request = SyncShardRequest::new(
+            shard_index,
+            sliver_type,
+            BlobId([start_blob_index; 32]),
+            count,
+            1,
+        );
+        let response = storage
+            .as_ref()
+            .handle_sync_shard_request(&request, 1)
+            .unwrap();
+
+        let SyncShardResponse::V1(slivers) = response;
+        let expected_response = expected_blob_index_in_response
+            .iter()
+            .map(|blob_index| {
+                (
+                    BlobId([*blob_index; 32]),
+                    data[&shard_index][&BlobId([*blob_index; 32])][&sliver_type].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(slivers, expected_response);
+
+        Ok(())
+    }
+
+    /// Tests that the storage returns correct error when trying to sync a shard that does not exist.
+    #[tokio::test]
+    async fn handle_sync_shard_request_shard_not_found() -> TestResult {
+        let storage = empty_storage();
+
+        let request =
+            SyncShardRequest::new(ShardIndex(123), SliverType::Primary, BlobId([1; 32]), 1, 1);
+        let response = storage
+            .as_ref()
+            .handle_sync_shard_request(&request, 0)
+            .unwrap_err();
+
+        assert!(matches!(response, SyncShardError::ShardNotAssigned(..)));
 
         Ok(())
     }

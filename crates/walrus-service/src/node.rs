@@ -29,6 +29,7 @@ use walrus_core::{
         SignedMessage,
         SignedSyncShardRequest,
         StorageConfirmation,
+        SyncShardResponse,
     },
     metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
     BlobId,
@@ -159,7 +160,7 @@ pub trait ServiceState {
         &self,
         public_key: PublicKey,
         signed_request: SignedSyncShardRequest,
-    ) -> Result<(), SyncShardError>;
+    ) -> Result<SyncShardResponse, SyncShardError>;
 }
 
 /// Builder to construct a [`StorageNode`].
@@ -669,7 +670,7 @@ impl ServiceState for StorageNode {
         &self,
         public_key: PublicKey,
         signed_request: SignedSyncShardRequest,
-    ) -> Result<(), SyncShardError> {
+    ) -> Result<SyncShardResponse, SyncShardError> {
         self.inner.sync_shard(public_key, signed_request)
     }
 }
@@ -874,7 +875,7 @@ impl ServiceState for StorageNodeInner {
         &self,
         public_key: PublicKey,
         signed_request: SignedSyncShardRequest,
-    ) -> Result<(), SyncShardError> {
+    ) -> Result<SyncShardResponse, SyncShardError> {
         if !self.committee_service.is_walrus_storage_node(&public_key) {
             return Err(SyncShardError::Unauthorized);
         }
@@ -884,7 +885,17 @@ impl ServiceState for StorageNodeInner {
 
         tracing::debug!("Sync shard request received: {:?}", request);
 
-        Ok(())
+        // If the epoch of the requester should not be older than the current epoch of the node.
+        // In a normal scenario, a storage node will never fetch shards from a future epoch.
+        if request.epoch() < self.current_epoch() {
+            return Err(SyncShardError::EpochTooOld(
+                request.epoch(),
+                self.current_epoch(),
+            ));
+        }
+
+        self.storage
+            .handle_sync_shard_request(request, self.current_epoch())
     }
 }
 
@@ -1331,6 +1342,35 @@ mod tests {
         Ok((cluster, events, blob_details))
     }
 
+    // Creates a test cluster with custom initial epoch and a blob that is already certified.
+    async fn cluster_with_initial_epoch_and_certified_blob<'a>(
+        assignment: &[&[u16]],
+        blob: &'a [u8],
+        initial_epoch: Epoch,
+    ) -> TestResult<(TestCluster, Sender<BlobEvent>, EncodedBlob)> {
+        let events = Sender::new(48);
+
+        let cluster = {
+            // Lock to avoid race conditions.
+            let _lock = global_test_lock().lock().await;
+            TestCluster::builder()
+                .with_shard_assignment(assignment)
+                .with_system_event_providers(events.clone())
+                .with_initial_epoch(initial_epoch)
+                .build()
+                .await?
+        };
+
+        let config = cluster.encoding_config();
+        let blob_details = EncodedBlob::new(blob, config);
+
+        events.send(BlobRegistered::for_testing(*blob_details.blob_id()).into())?;
+        store_at_shards(&blob_details, &cluster, |_, _| true).await?;
+        events.send(BlobCertified::for_testing(*blob_details.blob_id()).into())?;
+
+        Ok((cluster, events, blob_details))
+    }
+
     #[tokio::test]
     async fn retrieves_metadata_from_other_nodes_on_certified_blob_event() -> TestResult {
         let shards: &[&[u16]] = &[&[1], &[0, 2, 3, 4]];
@@ -1672,59 +1712,124 @@ mod tests {
 
     // Tests the basic `sync_shard` API.
     #[tokio::test]
-    async fn sync_shard_node_api() -> TestResult {
-        let (cluster, _, _) =
-            cluster_with_partially_stored_blob(&[&[0], &[1]], BLOB, |_, _| true).await?;
+    async fn sync_shard_node_api_success() -> TestResult {
+        let (cluster, _, blob_detail) =
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], BLOB, 0).await?;
+
+        let blob_id = *blob_detail.blob_id();
 
         // Tests successful sync shard operation.
-        assert!(cluster.nodes[0]
+        let status = cluster.nodes[0]
             .client
             .sync_shard::<Primary>(
                 ShardIndex(0),
-                BLOB_ID,
+                blob_id,
                 10,
                 1,
                 &cluster.nodes[0].as_ref().inner.protocol_key_pair,
             )
-            .await
-            .is_ok());
+            .await;
+        assert!(status.is_ok(), "Unexpected sync shard error: {:?}", status);
 
-        // Tests unauthorized sync shard operation (requester is not a storage node in Walrus).
-        {
-            let response = cluster.nodes[0]
-                .client
-                .sync_shard::<Primary>(ShardIndex(0), BLOB_ID, 10, 1, &ProtocolKeyPair::generate())
-                .await;
-            assert!(matches!(response,
+        let SyncShardResponse::V1(response) = status.unwrap();
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].0, blob_id);
+        assert_eq!(
+            response[0].1,
+            Sliver::Primary(
+                cluster.nodes[0]
+                    .storage_node
+                    .inner
+                    .storage
+                    .shard_storage(ShardIndex(0))
+                    .unwrap()
+                    .get_primary_sliver(&blob_id)
+                    .unwrap()
+                    .unwrap()
+            )
+        );
+
+        Ok(())
+    }
+
+    // Tests unauthorized sync shard operation (requester is not a storage node in Walrus).
+    #[tokio::test]
+    async fn sync_shard_node_api_unauthorized_error() -> TestResult {
+        let (cluster, _, _) =
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], BLOB, 0).await?;
+
+        let response = cluster.nodes[0]
+            .client
+            .sync_shard::<Primary>(ShardIndex(0), BLOB_ID, 10, 1, &ProtocolKeyPair::generate())
+            .await;
+        assert!(matches!(response,
                 Err(err) if err.http_status_code() == Some(StatusCode::UNAUTHORIZED) &&
                             err.to_string().contains("The client is not authorized to perform sync shard operation")));
-        }
 
-        // Tests signed SyncShardRequest verification error.
-        {
-            let request = SyncShardRequest::new(ShardIndex(0), true, BLOB_ID, 10, 1);
-            let sync_shard_msg = SyncShardMsg::new(1, request);
-            let signed_request = cluster.nodes[0]
+        Ok(())
+    }
+
+    // Tests signed SyncShardRequest verification error.
+    #[tokio::test]
+    async fn sync_shard_node_api_request_verification_error() -> TestResult {
+        let (cluster, _, _) =
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], BLOB, 0).await?;
+
+        let request = SyncShardRequest::new(ShardIndex(0), SliverType::Primary, BLOB_ID, 10, 1);
+        let sync_shard_msg = SyncShardMsg::new(1, request);
+        let signed_request = cluster.nodes[0]
+            .as_ref()
+            .inner
+            .protocol_key_pair
+            .sign_message(&sync_shard_msg);
+
+        let result = cluster.nodes[0].storage_node.sync_shard(
+            cluster.nodes[1]
                 .as_ref()
                 .inner
                 .protocol_key_pair
-                .sign_message(&sync_shard_msg);
+                .0
+                .public()
+                .clone(),
+            signed_request,
+        );
+        assert!(matches!(
+            result,
+            Err(SyncShardError::MessageVerificationError(..))
+        ));
 
-            let result = cluster.nodes[0].storage_node.sync_shard(
-                cluster.nodes[1]
-                    .as_ref()
-                    .inner
-                    .protocol_key_pair
-                    .0
-                    .public()
-                    .clone(),
-                signed_request,
-            );
-            assert!(matches!(
-                result,
-                Err(SyncShardError::MessageVerificationError(..))
-            ));
-        }
+        Ok(())
+    }
+
+    // Tests SyncShardRequest with wrong epoch.
+    #[tokio::test]
+    async fn sync_shard_node_api_wrong_epoch() -> TestResult {
+        // Creates a cluster with initial epoch set to 10.
+        let (cluster, _, blob_detail) =
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], BLOB, 10).await?;
+
+        cluster.nodes[0]
+            .storage_node
+            .inner
+            .committee_service
+            .committee();
+
+        // Requests a shard from epoch 0.
+        let status = cluster.nodes[0]
+            .client
+            .sync_shard::<Primary>(
+                ShardIndex(0),
+                *blob_detail.blob_id(),
+                10,
+                0,
+                &cluster.nodes[0].as_ref().inner.protocol_key_pair,
+            )
+            .await;
+
+        assert!(matches!(
+            status,
+            Err(err) if err.http_status_code() == Some(StatusCode::BAD_REQUEST) &&
+                err.to_string().contains("The request came from an epoch that is too old: 0. Current epoch is 10")));
 
         Ok(())
     }
