@@ -559,6 +559,9 @@ impl Client {
 
         match result {
             Ok(response) => {
+                // Check that the response is using HTTP 2 when not in release mode.
+                debug_assert!(response.version() == reqwest::Version::HTTP_2);
+
                 let status_code = response.status();
                 span.record("http.response.status_code", status_code.as_str());
 
