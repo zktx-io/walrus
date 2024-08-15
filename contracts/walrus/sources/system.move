@@ -4,14 +4,14 @@
 #[allow(unused_variable, unused_function, unused_field, unused_mut_parameter)]
 /// Module: system
 module walrus::system;
-use sui::coin::Coin;
-use sui::dynamic_field;
-use sui::sui::SUI;
-use walrus::committee::Committee;
-use walrus::storage_node::StorageNodeCap;
-use walrus::storage_resource::Storage;
-use walrus::system_state_inner::{Self, SystemStateInnerV1};
 
+use sui::{coin::Coin, dynamic_field, sui::SUI};
+use walrus::{
+    committee::Committee,
+    storage_node::StorageNodeCap,
+    storage_resource::Storage,
+    system_state_inner::SystemStateInnerV1
+};
 
 /// Flag to indicate the version of the system.
 const VERSION: u64 = 0;
@@ -97,6 +97,9 @@ fun inner(system: &System): &SystemStateInnerV1 {
 }
 
 // === Testing ===
+
+#[test_only]
+use walrus::system_state_inner;
 
 #[test_only]
 public(package) fun new_for_testing(ctx: &mut TxContext): System {

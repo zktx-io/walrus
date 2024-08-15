@@ -3,13 +3,14 @@
 
 #[allow(unused_variable, unused_mut_parameter, unused_field)]
 module walrus::system_state_inner;
-use sui::coin::Coin;
-use sui::sui::SUI;
-use walrus::committee::{Self, Committee};
-use walrus::storage_accounting::{Self, FutureAccountingRingBuffer};
-use walrus::storage_node::StorageNodeCap;
-use walrus::storage_resource::{Self, Storage};
 
+use sui::{coin::Coin, sui::SUI};
+use walrus::{
+    committee::Committee,
+    storage_accounting::FutureAccountingRingBuffer,
+    storage_node::StorageNodeCap,
+    storage_resource::{Self, Storage}
+};
 
 /// The maximum number of periods ahead we allow for storage reservations.
 /// TODO: the number here is a placeholder, and assumes an epoch is a week,
@@ -24,6 +25,7 @@ const ENotImplemented: u64 = 0;
 const EStorageExceeded: u64 = 1;
 const EInvalidPeriodsAhead: u64 = 2;
 
+#[test_only]
 // Epoch status values
 const EPOCH_STATUS_DONE: u8 = 0;
 #[allow(unused_const)]
@@ -164,6 +166,9 @@ public(package) fun n_shards(self: &SystemStateInnerV1): u16 {
 }
 
 // == Testing ==
+
+#[test_only]
+use walrus::{committee, storage_accounting};
 
 #[test_only]
 public(package) fun new_for_testing(ctx: &mut TxContext): SystemStateInnerV1 {
