@@ -48,6 +48,9 @@ struct DeploySystemContractArgs {
     #[clap(long, default_value = "./working_dir")]
     working_dir: PathBuf,
     /// Sui network for which the config is generated.
+    ///
+    /// Available options are `devnet`, `testnet`, and `localnet`, or a custom Sui network. To
+    /// specify a custom Sui network, pass a string of the format `<RPC_URL>;<FAUCET_URL>`.
     #[clap(long, default_value = "testnet")]
     sui_network: SuiNetwork,
     /// The directory in which the contracts are located.
@@ -231,7 +234,7 @@ mod commands {
         let client_config = create_client_config(
             testbed_config.system_object,
             working_dir.as_path(),
-            testbed_config.sui_network,
+            testbed_config.sui_network.clone(),
             set_config_dir.as_deref(),
         )
         .await?;

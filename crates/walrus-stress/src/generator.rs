@@ -91,11 +91,11 @@ impl LoadGenerator {
 
         // Set up write clients
         let (write_client_pool_tx, write_client_pool) = mpsc::channel(n_clients);
-        let mut write_clients = try_join_all(
-            (0..n_clients)
-                .map(|_| WriteClient::new(&client_config, network, DEFAULT_GAS_BUDGET, blob_size)),
-        )
-        .await?;
+        let mut write_clients =
+            try_join_all((0..n_clients).map(|_| {
+                WriteClient::new(&client_config, &network, DEFAULT_GAS_BUDGET, blob_size)
+            }))
+            .await?;
 
         let addresses = write_clients
             .iter_mut()
@@ -350,6 +350,7 @@ pub fn refill_gas(
             interval.tick().await;
             let sui_client = &sui_client;
             let metrics = &metrics;
+            let network_ref = &network;
             let _ = try_join_all(addresses.iter().cloned().map(|address| async move {
                 if sui_client
                     .coin_read_api()
@@ -361,7 +362,7 @@ pub fn refill_gas(
                     .len()
                     < MIN_NUM_COINS
                 {
-                    let result = send_faucet_request(address, network).await;
+                    let result = send_faucet_request(address, network_ref).await;
                     tracing::debug!("Clients gas coins refilled");
                     metrics.observe_gas_refill();
                     result
