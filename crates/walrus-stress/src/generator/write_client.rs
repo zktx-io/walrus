@@ -30,11 +30,13 @@ impl WriteClient {
         config: &Config,
         network: &SuiNetwork,
         gas_budget: u64,
-        blob_size: usize,
+        min_size_log2: u8,
+        max_size_log2: u8,
     ) -> anyhow::Result<Self> {
         let blob = BlobData::random(
             StdRng::from_rng(thread_rng()).expect("rng should be seedable from thread_rng"),
-            blob_size,
+            min_size_log2,
+            max_size_log2,
         )
         .await;
         let client = new_client(config, network, gas_budget).await?;
@@ -48,12 +50,12 @@ impl WriteClient {
 
     /// Stores a fresh consistent blob and returns the blob id and elapsed time.
     pub async fn write_fresh_blob(&mut self) -> Result<(BlobId, Duration), ClientError> {
-        self.blob.refresh();
+        let blob = self.blob.refresh_and_get_random_slice();
         let now = Instant::now();
         let blob_id = self
             .client
             .as_ref()
-            .reserve_and_store_blob(self.blob.as_ref(), 1, true)
+            .reserve_and_store_blob(blob, 1, true)
             .await?
             .blob_id()
             .to_owned();
@@ -67,8 +69,12 @@ impl WriteClient {
         &mut self,
     ) -> Result<(BlobId, Duration), ClientError> {
         self.blob.refresh();
+        let blob = self.blob.random_size_slice();
         let now = Instant::now();
-        let blob_id = self.write_inconsistent_blob().await?.blob_id;
+        let blob_id = self
+            .reserve_and_store_inconsistent_blob(blob)
+            .await?
+            .blob_id;
         let elapsed = now.elapsed();
         Ok((blob_id, elapsed))
     }
@@ -78,9 +84,8 @@ impl WriteClient {
     /// If there are enough storage nodes to achieve a quorum even without two nodes, the blob
     /// will be inconsistent in two slivers, s.t. each of them is held by a different storage
     /// node, if the shards are distributed equally and assigned sequentially.
-    async fn write_inconsistent_blob(&self) -> Result<Blob, ClientError> {
+    async fn reserve_and_store_inconsistent_blob(&self, blob: &[u8]) -> Result<Blob, ClientError> {
         let epochs = 1;
-        let blob = self.blob.as_ref();
         // Encode the blob with false metadata for one shard.
         let (pairs, metadata) = self
             .client
