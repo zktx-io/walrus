@@ -17,7 +17,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use tracing::{field, Instrument, Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use walrus_core::{
-    encoding::{EncodingAxis, EncodingConfig, Primary, RecoverySymbol, Secondary, Sliver},
+    encoding::{EncodingAxis, EncodingConfig, Primary, RecoverySymbol, Secondary, SliverData},
     inconsistency::InconsistencyProof,
     keys::ProtocolKeyPair,
     merkle::MerkleProof,
@@ -35,7 +35,7 @@ use walrus_core::{
     InconsistencyProof as InconsistencyProofEnum,
     PublicKey,
     ShardIndex,
-    Sliver as SliverEnum,
+    Sliver,
     SliverPairIndex,
     SliverType,
 };
@@ -238,7 +238,7 @@ impl Client {
         &self,
         blob_id: &BlobId,
         sliver_pair_index: SliverPairIndex,
-    ) -> Result<Sliver<A>, NodeError> {
+    ) -> Result<SliverData<A>, NodeError> {
         let (url, template) = self.endpoints.sliver::<A>(blob_id, sliver_pair_index);
         self.send_and_parse_bcs_response(Request::new(Method::GET, url), template)
             .await
@@ -252,16 +252,16 @@ impl Client {
         blob_id: &BlobId,
         sliver_pair_index: SliverPairIndex,
         sliver_type: SliverType,
-    ) -> Result<SliverEnum, NodeError> {
+    ) -> Result<Sliver, NodeError> {
         match sliver_type {
             SliverType::Primary => self
                 .get_sliver::<Primary>(blob_id, sliver_pair_index)
                 .await
-                .map(SliverEnum::Primary),
+                .map(Sliver::Primary),
             SliverType::Secondary => self
                 .get_sliver::<Secondary>(blob_id, sliver_pair_index)
                 .await
-                .map(SliverEnum::Secondary),
+                .map(Sliver::Secondary),
         }
     }
 
@@ -286,7 +286,7 @@ impl Client {
         sliver_pair_index: SliverPairIndex,
         metadata: &VerifiedBlobMetadataWithId,
         encoding_config: &EncodingConfig,
-    ) -> Result<Sliver<A>, NodeError> {
+    ) -> Result<SliverData<A>, NodeError> {
         assert!(
             metadata.is_encoding_config_applicable(encoding_config),
             "encoding config is not applicable to the provided metadata and blob"
@@ -393,7 +393,7 @@ impl Client {
         &self,
         blob_id: &BlobId,
         pair_index: SliverPairIndex,
-        sliver: &Sliver<A>,
+        sliver: &SliverData<A>,
     ) -> Result<(), NodeError> {
         tracing::trace!("starting to store sliver");
         let (url, template) = self.endpoints.sliver::<A>(blob_id, pair_index);
@@ -411,11 +411,11 @@ impl Client {
         &self,
         blob_id: &BlobId,
         pair_index: SliverPairIndex,
-        sliver: &SliverEnum,
+        sliver: &Sliver,
     ) -> Result<(), NodeError> {
         match sliver {
-            SliverEnum::Primary(sliver) => self.store_sliver(blob_id, pair_index, sliver).await,
-            SliverEnum::Secondary(sliver) => self.store_sliver(blob_id, pair_index, sliver).await,
+            Sliver::Primary(sliver) => self.store_sliver(blob_id, pair_index, sliver).await,
+            Sliver::Secondary(sliver) => self.store_sliver(blob_id, pair_index, sliver).await,
         }
     }
 

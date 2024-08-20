@@ -10,14 +10,14 @@ use reqwest::{Client as ReqwestClient, Url};
 use tokio::sync::Semaphore;
 use tracing::{Level, Span};
 use walrus_core::{
-    encoding::{EncodingAxis, EncodingConfig, Sliver, SliverPair},
+    encoding::{EncodingAxis, EncodingConfig, SliverData, SliverPair},
     messages::SignedStorageConfirmation,
     metadata::VerifiedBlobMetadataWithId,
     BlobId,
     Epoch,
     PublicKey,
     ShardIndex,
-    Sliver as SliverEnum,
+    Sliver,
     SliverPairIndex,
 };
 use walrus_sdk::{api::BlobStatus, client::Client as StorageNodeClient, error::NodeError};
@@ -194,9 +194,9 @@ impl<'a, W> NodeCommunication<'a, W> {
         &self,
         metadata: &VerifiedBlobMetadataWithId,
         shard_index: ShardIndex,
-    ) -> NodeResult<Sliver<T>, NodeError>
+    ) -> NodeResult<SliverData<T>, NodeError>
     where
-        Sliver<T>: TryFrom<SliverEnum>,
+        SliverData<T>: TryFrom<Sliver>,
     {
         tracing::debug!(%shard_index, sliver_type = T::NAME, "retrieving verified sliver");
         let sliver_pair_index = shard_index.to_pair_index(self.n_shards(), metadata.blob_id());
@@ -315,7 +315,7 @@ impl<'a> NodeWriteCommunication<'a> {
     async fn store_sliver<T: EncodingAxis>(
         &self,
         blob_id: &BlobId,
-        sliver: &Sliver<T>,
+        sliver: &SliverData<T>,
         pair_index: SliverPairIndex,
     ) -> Result<(), SliverStoreError> {
         utils::retry(self.backoff_strategy(), || {
