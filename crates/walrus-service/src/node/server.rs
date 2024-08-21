@@ -84,7 +84,7 @@ where
                 routes::INCONSISTENCY_PROOF_ENDPOINT,
                 put(routes::inconsistency_proof),
             )
-            .route(routes::STATUS_ENDPOINT, get(routes::get_blob_status))
+            .route(routes::BLOB_STATUS_ENDPOINT, get(routes::get_blob_status))
             .route(routes::HEALTH_ENDPOINT, get(routes::health_info))
             .route(routes::SYNC_SHARD_ENDPOINT, post(routes::sync_shard))
             .with_state(self.state.clone())
@@ -157,7 +157,7 @@ mod test {
     use tokio::{task::JoinHandle, time::Duration};
     use tokio_util::sync::CancellationToken;
     use walrus_core::{
-        encoding::Primary,
+        encoding::{EncodingAxis, Primary},
         inconsistency::{
             InconsistencyProof as InconsistencyProofInner,
             InconsistencyVerificationError,
@@ -185,6 +185,7 @@ mod test {
             BlobCertificationStatus as SdkBlobCertificationStatus,
             BlobStatus,
             ServiceHealthInfo,
+            SliverStatus,
         },
         client::Client,
     };
@@ -303,6 +304,18 @@ mod test {
                 Ok(BlobStatus::Nonexistent)
             } else {
                 Err(anyhow::anyhow!("Internal error").into())
+            }
+        }
+
+        fn is_sliver_stored<A: EncodingAxis>(
+            &self,
+            blob_id: &BlobId,
+            _sliver_pair_index: SliverPairIndex,
+        ) -> Result<SliverStatus, RetrieveSliverError> {
+            if blob_id.0[0] == 0 {
+                Ok(SliverStatus::Stored)
+            } else {
+                Ok(SliverStatus::Nonexistent)
             }
         }
 
