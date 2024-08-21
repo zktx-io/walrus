@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sui_types::event::EventID;
+use typed_store::TypedStoreError;
 use walrus_core::{
     encoding::SliverVerificationError,
     inconsistency::InconsistencyVerificationError,
@@ -10,6 +11,8 @@ use walrus_core::{
     Epoch,
     ShardIndex,
 };
+
+use super::storage::ShardStatus;
 
 /// Type used for internal errors.
 pub type InternalError = anyhow::Error;
@@ -128,4 +131,12 @@ pub enum SyncShardError {
     EpochTooOld(Epoch, Epoch),
     #[error(transparent)]
     Internal(#[from] InternalError),
+    #[error("The destination node does not have a valid client to talk to the source node")]
+    NoSyncClient,
+    #[error("Unable to find the owner for shard {0}")]
+    NoOwnerForShard(ShardIndex),
+    #[error(transparent)]
+    StorageError(#[from] TypedStoreError),
+    #[error("The shard {0} is not in a valid status for syncing: {1}")]
+    InvalidShardStatusToSync(ShardIndex, ShardStatus),
 }

@@ -3,12 +3,16 @@
 
 //! Walrus shard storage.
 
+use core::fmt::{self, Display};
 use std::{
     collections::{HashMap, HashSet},
+    ops::Bound::{Excluded, Unbounded},
     path::Path,
     sync::{Arc, OnceLock},
 };
 
+use anyhow::Context;
+use fastcrypto::traits::KeyPair;
 use regex::Regex;
 use rocksdb::{Options, DB};
 use serde::{Deserialize, Serialize};
@@ -20,26 +24,50 @@ use typed_store::{
 use walrus_core::{
     encoding::{EncodingAxis, Primary, PrimarySliver, Secondary, SecondarySliver},
     BlobId,
+    Epoch,
     ShardIndex,
     Sliver,
     SliverType,
 };
 
-use super::DatabaseConfig;
+use super::{blob_info::BlobInfoApi, DatabaseConfig, Storage};
+use crate::node::{errors::SyncShardError, StorageNodeInner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShardStatus {
+    /// Initial status of the shard when just created.
+    None,
+
     /// The shard is active in this node serving reads and writes.
     Active,
+
+    /// The shard is being synced to the last epoch.
+    ActiveSync,
 
     /// The shard is locked for moving to another node. Shard does not accept any more writes in
     /// this status.
     LockedToMove,
 }
 
+impl Display for ShardStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl ShardStatus {
     pub fn is_owned_by_node(&self) -> bool {
         self != &ShardStatus::LockedToMove
+    }
+
+    /// Provides a string representation of the enum variant.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ShardStatus::None => "None",
+            ShardStatus::Active => "Active",
+            ShardStatus::ActiveSync => "ActiveSync",
+            ShardStatus::LockedToMove => "LockedToMove",
+        }
     }
 }
 
@@ -248,7 +276,7 @@ impl ShardStorage {
     pub(crate) fn status(&self) -> Result<ShardStatus, TypedStoreError> {
         self.shard_status
             .get(&())
-            .map(|s| s.unwrap_or(ShardStatus::Active))
+            .map(|s| s.unwrap_or(ShardStatus::None))
     }
 
     /// Fetches the slivers with `sliver_type` for the provided blob IDs.
@@ -284,10 +312,156 @@ impl ShardStorage {
         })
     }
 
+    /// Syncs the shard to the current epoch from the previous shard owner.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            walrus.node = %node.protocol_key_pair.as_ref().public(),
+            walrus.shard_index = %self.id
+        ),
+        err
+    )]
+    pub async fn start_sync_shard_before_epoch(
+        &self,
+        epoch: Epoch,
+        node: Arc<StorageNodeInner>,
+    ) -> Result<(), SyncShardError> {
+        tracing::info!("Syncing shard to before epoch: {}", epoch);
+        if self.status()? == ShardStatus::None {
+            self.shard_status
+                .insert(&(), &ShardStatus::ActiveSync)
+                .context("Update shard status encountered error")?;
+        }
+
+        assert_eq!(self.status()?, ShardStatus::ActiveSync);
+
+        // TODO(#705): handle better crash recovery (we shouldn't always restart from beginning
+        //             to sync).
+        // TODO(#705): handle missing individual blobs.
+        // TODO(#259): handle non-happy path.
+        self.sync_shard_before_epoch_internal(epoch, node.clone(), SliverType::Primary)
+            .await?;
+        self.sync_shard_before_epoch_internal(epoch, node, SliverType::Secondary)
+            .await?;
+
+        self.shard_status
+            .insert(&(), &ShardStatus::Active)
+            .context("Update shard status encountered error")?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            walrus.sliver_type = %sliver_type
+        ),
+        err
+    )]
+    async fn sync_shard_before_epoch_internal(
+        &self,
+        epoch: Epoch,
+        node: Arc<StorageNodeInner>,
+        sliver_type: SliverType,
+    ) -> Result<(), SyncShardError> {
+        let mut starting_blob_id = None;
+        while let Some(next_starting_blob_id) =
+            next_certified_blob_id_before_epoch(&node.storage, epoch, starting_blob_id)
+                .context("Scanning certified blobs encountered error")?
+        {
+            tracing::debug!(
+                "Syncing shard to before epoch: {}. Starting blob id: {}",
+                epoch,
+                next_starting_blob_id,
+            );
+            let mut batch = match sliver_type {
+                SliverType::Primary => self.primary_slivers.batch(),
+                SliverType::Secondary => self.secondary_slivers.batch(),
+            };
+
+            for blob in node
+                .committee_service
+                .sync_shard_before_epoch(
+                    self.id(),
+                    next_starting_blob_id,
+                    sliver_type,
+                    10, // TODO(#705): make this configurable.
+                    epoch,
+                    &node.protocol_key_pair,
+                )
+                .await?
+            {
+                tracing::debug!("Synced blob id: {} to before epoch: {}.", blob.0, epoch,);
+                //TODO(#705): Track missing blobs.
+                //TODO(#705): verify sliver validity.
+                //  - blob is certified
+                //  - metadata is correct
+                match blob.1 {
+                    Sliver::Primary(primary) => {
+                        assert_eq!(sliver_type, SliverType::Primary);
+                        batch.insert_batch(&self.primary_slivers, [(blob.0, primary)])?;
+                    }
+                    Sliver::Secondary(secondary) => {
+                        assert_eq!(sliver_type, SliverType::Secondary);
+                        batch.insert_batch(&self.secondary_slivers, [(blob.0, secondary)])?;
+                    }
+                }
+                starting_blob_id = Some(blob.0);
+            }
+            batch.write()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sliver_count(&self, sliver_type: SliverType) -> usize {
+        match sliver_type {
+            SliverType::Primary => self.primary_slivers.keys().count(),
+            SliverType::Secondary => self.secondary_slivers.keys().count(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn lock_shard_for_epoch_change(&self) -> Result<(), TypedStoreError> {
         self.shard_status.insert(&(), &ShardStatus::LockedToMove)
     }
+
+    #[cfg(test)]
+    pub(crate) fn update_status_in_test(&self, status: ShardStatus) -> Result<(), TypedStoreError> {
+        self.shard_status.insert(&(), &status)
+    }
+}
+
+// Helper function to find the next certified blob ID after the provided blob ID.
+fn next_certified_blob_id_before_epoch(
+    storage: &Storage,
+    certified_before_epoch: Epoch,
+    after_blob: Option<BlobId>,
+) -> Result<Option<BlobId>, TypedStoreError> {
+    // The query starts from the blob after the provided blob ID in `after_blob`.
+    let iter = storage.blob_info_iter(Some((
+        if let Some(starting_blob_id) = after_blob {
+            Excluded(starting_blob_id)
+        } else {
+            Unbounded
+        },
+        Unbounded,
+    )));
+
+    for result in iter {
+        let (blob_id, blob_info) = result?;
+        if blob_info.is_certified()
+            && blob_info
+                .status_changing_epoch(super::blob_info::BlobCertificationStatus::Certified)
+                .unwrap()
+                < certified_before_epoch
+        {
+            return Ok(Some(blob_id));
+        }
+    }
+
+    Ok(None)
 }
 
 fn id_from_column_family_name(name: &str) -> Option<(ShardIndex, SliverType)> {
@@ -334,7 +508,7 @@ fn shard_status_column_family_name(id: ShardIndex) -> String {
 mod tests {
     use std::collections::HashMap;
 
-    use typed_store::TypedStoreError;
+    use typed_store::{Map, TypedStoreError};
     use walrus_core::{
         encoding::{Primary, Secondary},
         BlobId,
@@ -342,11 +516,14 @@ mod tests {
         Sliver,
         SliverType,
     };
+    use walrus_sui::test_utils::event_id_for_testing;
     use walrus_test_utils::{async_param_test, param_test, Result as TestResult, WithTempDir};
 
     use super::id_from_column_family_name;
     use crate::{
         node::storage::{
+            blob_info::{BlobCertificationStatus, BlobInfo},
+            shard,
             tests::{empty_storage, get_sliver, BLOB_ID, OTHER_SHARD_INDEX, SHARD_INDEX},
             Storage,
         },
@@ -670,6 +847,113 @@ mod tests {
                 (blob_ids[0], data[&blob_ids[0]][&sliver_type].clone()),
                 (blob_ids[2], data[&blob_ids[2]][&sliver_type].clone())
             ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_next_certified_blob_id_before_epoch() -> TestResult {
+        let storage = empty_storage();
+        let blob_info = storage.inner.blob_info.clone();
+        let new_epoch = 3;
+
+        let blob_ids = [
+            BlobId([1; 32]), // Not certified.
+            BlobId([2; 32]), // Not exist.
+            BlobId([3; 32]), // Certified within epoch 2
+            BlobId([4; 32]), // Certified after epoch 2
+            BlobId([5; 32]), // Invalid
+            BlobId([6; 32]), // Certified within epoch 2
+        ];
+
+        blob_info.insert(
+            &blob_ids[0],
+            &BlobInfo::new_for_testing(
+                10,
+                BlobCertificationStatus::Registered,
+                event_id_for_testing(),
+                Some(0),
+                None,
+                None,
+            ),
+        )?;
+
+        blob_info.insert(
+            &blob_ids[2],
+            &BlobInfo::new_for_testing(
+                10,
+                BlobCertificationStatus::Certified,
+                event_id_for_testing(),
+                Some(0),
+                Some(1),
+                None,
+            ),
+        )?;
+
+        blob_info.insert(
+            &blob_ids[3],
+            &BlobInfo::new_for_testing(
+                10,
+                BlobCertificationStatus::Certified,
+                event_id_for_testing(),
+                Some(0),
+                Some(3),
+                None,
+            ),
+        )?;
+
+        blob_info.insert(
+            &blob_ids[4],
+            &BlobInfo::new_for_testing(
+                10,
+                BlobCertificationStatus::Invalid,
+                event_id_for_testing(),
+                Some(0),
+                Some(1),
+                Some(1),
+            ),
+        )?;
+
+        blob_info.insert(
+            &blob_ids[5],
+            &BlobInfo::new_for_testing(
+                10,
+                BlobCertificationStatus::Certified,
+                event_id_for_testing(),
+                Some(0),
+                Some(2),
+                None,
+            ),
+        )?;
+
+        assert_eq!(
+            shard::next_certified_blob_id_before_epoch(&storage.inner, new_epoch, None)?,
+            Some(blob_ids[2])
+        );
+        assert_eq!(
+            shard::next_certified_blob_id_before_epoch(
+                &storage.inner,
+                new_epoch,
+                Some(blob_ids[1])
+            )?,
+            Some(blob_ids[2])
+        );
+        assert_eq!(
+            shard::next_certified_blob_id_before_epoch(
+                &storage.inner,
+                new_epoch,
+                Some(blob_ids[2])
+            )?,
+            Some(blob_ids[5])
+        );
+        assert_eq!(
+            shard::next_certified_blob_id_before_epoch(
+                &storage.inner,
+                new_epoch,
+                Some(blob_ids[5])
+            )?,
+            None,
         );
 
         Ok(())

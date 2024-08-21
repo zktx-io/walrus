@@ -39,7 +39,9 @@ use walrus_core::{
     NetworkPublicKey,
     PublicKey,
     ShardIndex,
+    Sliver,
     SliverPairIndex,
+    SliverType,
 };
 use walrus_sdk::client::Client;
 use walrus_sui::types::{
@@ -513,6 +515,18 @@ impl CommitteeService for StubCommitteeService {
         _inconsistency_proof: &InconsistencyProofEnum,
         _n_shards: NonZeroU16,
     ) -> InvalidBlobCertificate {
+        std::future::pending().await
+    }
+
+    async fn sync_shard_before_epoch(
+        &self,
+        _shard_index: ShardIndex,
+        _starting_blob_id: BlobId,
+        _sliver_type: SliverType,
+        _sliver_count: u64,
+        _epoch: Epoch,
+        _key_pair: &ProtocolKeyPair,
+    ) -> Result<Vec<(BlobId, Sliver)>, anyhow::Error> {
         std::future::pending().await
     }
 

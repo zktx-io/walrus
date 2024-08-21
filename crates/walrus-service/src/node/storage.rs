@@ -4,6 +4,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Debug,
+    ops::RangeBounds,
     path::Path,
     sync::Arc,
 };
@@ -12,7 +13,6 @@ use anyhow::Context;
 use rocksdb::{DBCompressionType, MergeOperands, Options};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use shard::ShardStatus;
 use sui_sdk::types::event::EventID;
 use tracing::Level;
 use typed_store::{
@@ -44,7 +44,7 @@ pub(super) use event_cursor_table::EventProgress;
 mod event_sequencer;
 
 mod shard;
-pub(crate) use shard::ShardStorage;
+pub(crate) use shard::{ShardStatus, ShardStorage};
 
 /// Options for configuring a column family.
 #[serde_with::serde_as]
@@ -213,7 +213,7 @@ pub struct Storage {
     metadata: DBMap<BlobId, BlobMetadata>,
     blob_info: DBMap<BlobId, BlobInfo>,
     event_cursor: EventCursorTable,
-    shards: HashMap<ShardIndex, ShardStorage>,
+    shards: HashMap<ShardIndex, Arc<ShardStorage>>,
     config: DatabaseConfig,
 }
 
@@ -282,7 +282,7 @@ impl Storage {
             .into_iter()
             .map(|id| {
                 ShardStorage::create_or_reopen(id, &database, &db_config, None)
-                    .map(|shard| (id, shard))
+                    .map(|shard| (id, Arc::new(shard)))
             })
             .collect::<Result<_, _>>()?;
 
@@ -304,12 +304,12 @@ impl Storage {
         match self.shards.entry(shard) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
-                let shard_storage = ShardStorage::create_or_reopen(
+                let shard_storage = Arc::new(ShardStorage::create_or_reopen(
                     shard,
                     &self.database,
                     &self.config,
                     Some(ShardStatus::Active),
-                )?;
+                )?);
                 Ok(entry.insert(shard_storage))
             }
         }
@@ -321,7 +321,7 @@ impl Storage {
     }
 
     /// Returns a handle over the storage for a single shard.
-    pub fn shard_storage(&self, shard: ShardIndex) -> Option<&ShardStorage> {
+    pub fn shard_storage(&self, shard: ShardIndex) -> Option<&Arc<ShardStorage>> {
         self.shards.get(&shard)
     }
 
@@ -347,6 +347,18 @@ impl Storage {
     #[tracing::instrument(skip_all)]
     pub fn get_blob_info(&self, blob_id: &BlobId) -> Result<Option<BlobInfo>, TypedStoreError> {
         self.blob_info.get(blob_id)
+    }
+
+    /// Returns an iterator over the blob info table.
+    #[tracing::instrument(skip_all)]
+    pub fn blob_info_iter(
+        &self,
+        range: Option<impl RangeBounds<BlobId>>,
+    ) -> impl Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + '_ {
+        match range {
+            Some(range) => self.blob_info.safe_range_iter(range),
+            None => self.blob_info.safe_iter(),
+        }
     }
 
     /// Get the event cursor for `event_type`
