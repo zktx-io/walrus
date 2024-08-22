@@ -30,7 +30,7 @@ module blob_store::storage_node {
         network_public_key: vector<u8>,
         shard_ids: vector<u16>,
     ): StorageNodeInfo {
-        assert!(network_public_key.length() == 32, EInvalidNetworkPublicKey);
+        assert!(network_public_key.length() == 33, EInvalidNetworkPublicKey);
         StorageNodeInfo {
             name,
             network_address,
@@ -69,7 +69,8 @@ module blob_store::storage_node {
             name: b"node".to_string(),
             network_address: b"127.0.0.1".to_string(),
             public_key: g1_from_bytes(&public_key),
-            network_public_key: x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677",
+            network_public_key:
+                x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677ab",
             shard_ids,
         }
     }
