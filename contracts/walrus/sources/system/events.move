@@ -48,6 +48,36 @@ public struct InvalidBlobID has copy, drop {
     blob_id: u256,
 }
 
+/// Signals that epoch `epoch` has started and the epoch change is in progress.
+public struct EpochChangeStart has copy, drop {
+    epoch: u64,
+}
+
+/// Signals that a set of storage nodes holding at least 2f+1 shards have finished the epoch
+/// change, i.e., received all of their assigned shards.
+public struct EpochChangeDone has copy, drop {
+    epoch: u64,
+}
+
+/// Signals that a node has received the specified shards for the new epoch.
+public struct ShardsReceived has copy, drop {
+    epoch: u64,
+    shards: vector<u16>,
+}
+
+/// Signals that the committee and the system parameters for `next_epoch` have been selected.
+public struct EpochParametersSelected has copy, drop {
+    next_epoch: u64,
+}
+
+/// Signals that the given shards can be recovered using the shard recovery endpoint.
+public struct ShardRecoveryStart has copy, drop {
+    epoch: u64,
+    shards: vector<u16>,
+}
+
+// == Functions to emit the events from other modules ==
+
 public(package) fun emit_blob_registered(
     epoch: u64,
     blob_id: u256,
@@ -85,4 +115,24 @@ public(package) fun emit_invalid_blob_id(epoch: u64, blob_id: u256) {
 
 public(package) fun emit_blob_deleted(epoch: u64, blob_id: u256, end_epoch: u64, object_id: ID) {
     event::emit(BlobDeleted { epoch, blob_id, end_epoch, object_id });
+}
+
+public(package) fun emit_epoch_change_start(epoch: u64) {
+    event::emit(EpochChangeStart { epoch })
+}
+
+public(package) fun emit_epoch_change_done(epoch: u64) {
+    event::emit(EpochChangeDone { epoch })
+}
+
+public(package) fun emit_shards_received(epoch: u64, shards: vector<u16>) {
+    event::emit(ShardsReceived { epoch, shards })
+}
+
+public(package) fun emit_epoch_parameters_selected(next_epoch: u64) {
+    event::emit(EpochParametersSelected { next_epoch })
+}
+
+public(package) fun emit_shard_recovery_start(epoch: u64, shards: vector<u16>) {
+    event::emit(ShardRecoveryStart { epoch, shards })
 }
