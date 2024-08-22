@@ -20,6 +20,7 @@ use crate::client::{
         HumanReadableMist,
     },
     responses::{
+        BlobIdConversionOutput,
         BlobIdOutput,
         BlobStatusOutput,
         DryRunOutput,
@@ -162,6 +163,12 @@ impl CliOutput for BlobStatusOutput {
                 format_event_id(&status_event),
             ),
         }
+    }
+}
+
+impl CliOutput for BlobIdConversionOutput {
+    fn print_cli_output(&self) {
+        println!("Walrus blob ID: {}", self.0);
     }
 }
 

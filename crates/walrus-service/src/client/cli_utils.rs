@@ -7,12 +7,16 @@ use std::{
     fmt::{self, Display},
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use anyhow::{anyhow, Context, Result};
 use colored::{ColoredString, Colorize};
+use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
 use sui_sdk::{wallet_context::WalletContext, SuiClientBuilder};
 use sui_types::event::EventID;
+use walrus_core::BlobId;
 use walrus_sui::client::{SuiContractClient, SuiReadClient};
 
 use super::{default_configuration_paths, Blocklist, Client, Config};
@@ -50,8 +54,8 @@ pub fn load_wallet_context(path: &Option<PathBuf>) -> Result<WalletContext> {
         default_paths.push(home_dir.join(".sui").join("sui_config").join("client.yaml"))
     }
     let path = path_or_defaults_if_exist(path, &default_paths)
-        .ok_or(anyhow!("could not find a valid wallet config file."))?;
-    tracing::info!("Using wallet configuration from {}", path.display());
+        .ok_or(anyhow!("could not find a valid wallet config file"))?;
+    tracing::info!("using Sui wallet configuration from '{}'", path.display());
     WalletContext::new(&path, None, None)
 }
 
@@ -287,6 +291,93 @@ pub fn format_event_id(event_id: &EventID) -> String {
     format!("(tx: {}, seq: {})", event_id.tx_digest, event_id.event_seq)
 }
 
+/// Error type distinguishing between a decimal value that corresponds to a valid blob ID and any
+/// other parse error.
+#[derive(Debug, thiserror::Error)]
+pub enum BlobIdParseError {
+    /// Returned when attempting to parse a decimal value for the blob ID.
+    #[error(
+        "you seem to be using a numeric value in decimal format corresponding to a Walrus blob ID \
+        (maybe copied from a Sui explorer) whereas Walrus uses URL-safe base64 encoding;\n\
+        the Walrus blob ID corresponding to the provided value is {0}"
+    )]
+    BlobIdInDecimalFormat(BlobId),
+    /// Returned when attempting to parse any other invalid string as a blob ID.
+    #[error("the provided blob ID is invalid")]
+    InvalidBlobId,
+}
+
+/// Attempts to parse the blob ID and provides a detailed error when the blob ID was provided in
+/// decimal format.
+pub fn parse_blob_id(input: &str) -> Result<BlobId, BlobIdParseError> {
+    if let Ok(blob_id) = BlobId::from_str(input) {
+        return Ok(blob_id);
+    }
+    Err(match BlobIdDecimal::from_str(input) {
+        Err(_) => BlobIdParseError::InvalidBlobId,
+        Ok(blob_id) => BlobIdParseError::BlobIdInDecimalFormat(blob_id.into()),
+    })
+}
+
+/// Helper struct to parse and format blob IDs as decimal numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
+#[repr(transparent)]
+pub struct BlobIdDecimal(BlobId);
+
+/// Error returned when unable to parse a decimal value corresponding to a Walrus blob ID.
+#[derive(Debug, thiserror::Error)]
+pub enum BlobIdDecimalParseError {
+    /// Returned when attempting to parse an actual Walrus blob ID.
+    #[error(
+        "the provided value is already a valid Walrus blob ID;\n\
+        the value represented as a decimal number is {0}"
+    )]
+    BlobIdInBase64Format(BlobIdDecimal),
+    /// Returned when attempting to parse any other invalid string as a decimal blob ID.
+    #[error("the provided value cannot be converted to a Walrus blob ID")]
+    InvalidBlobId,
+}
+
+impl FromStr for BlobIdDecimal {
+    type Err = BlobIdDecimalParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some(number) = BigUint::parse_bytes(s.as_bytes(), 10) {
+            let bytes = number.to_bytes_le();
+
+            if bytes.len() <= BlobId::LENGTH {
+                let mut blob_id = [0; BlobId::LENGTH];
+                blob_id[..bytes.len()].copy_from_slice(&bytes);
+                return Ok(Self(BlobId(blob_id)));
+            }
+        }
+
+        Err(if let Ok(blob_id) = BlobId::from_str(s) {
+            BlobIdDecimalParseError::BlobIdInBase64Format(blob_id.into())
+        } else {
+            BlobIdDecimalParseError::InvalidBlobId
+        })
+    }
+}
+
+impl From<BlobIdDecimal> for BlobId {
+    fn from(value: BlobIdDecimal) -> Self {
+        value.0
+    }
+}
+
+impl From<BlobId> for BlobIdDecimal {
+    fn from(value: BlobId) -> Self {
+        Self(value)
+    }
+}
+
+impl Display for BlobIdDecimal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", BigUint::from_bytes_le(self.0.as_ref()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use walrus_test_utils::param_test;
@@ -362,5 +453,57 @@ mod tests {
     }
     fn test_human_readable_mist(mist: u64, expected: &str) {
         assert_eq!(&format!("{}", HumanReadableMist(mist)), expected,)
+    }
+
+    param_test! {
+        test_parse_blob_id_matches_expected_slice_prefix: [
+            valid_base64: ("M5YQinGO3RoRLaW_KbCfvXStVlWEqO5dGDe5cSiN07I", &[]),
+            // A 43-digit decimal value is parsed as a base-64 string.
+            valid_base64_and_decimal: (
+                "1000000000000000000000000000000000000000000",
+                &[215, 77, 52, 211, 77, 52, 211, 77, 52, 211, 77, 52, 211, 77, 52]),
+    ]}
+    fn test_parse_blob_id_matches_expected_slice_prefix(
+        input_string: &str,
+        expected_result: &[u8],
+    ) {
+        let blob_id = parse_blob_id(input_string).unwrap();
+        assert_eq!(blob_id.0[..expected_result.len()], expected_result[..]);
+    }
+
+    param_test! {
+        test_parse_blob_id_provides_correct_decimal_error: [
+            zero: ("0", &[0; 32]),
+            ten: ("256", &[0, 1]),
+            valid_decimal: (
+                "80885466015098902458382552429473803233277035186046880821304527730792838764083",
+                &[]
+            ),
+    ]}
+    fn test_parse_blob_id_provides_correct_decimal_error(
+        input_string: &str,
+        expected_result: &[u8],
+    ) {
+        let Err(BlobIdParseError::BlobIdInDecimalFormat(blob_id)) = parse_blob_id(input_string)
+        else {
+            panic!()
+        };
+        assert_eq!(blob_id.0[..expected_result.len()], expected_result[..]);
+    }
+
+    param_test! {
+        test_parse_blob_id_failure: [
+            empty: (""),
+            too_short_base64: ("aaaa"),
+            two_pow_256: (
+                "115792089237316195423570985008687907853269984665640564039457584007913129639936"
+            )
+        ]
+    }
+    fn test_parse_blob_id_failure(input_string: &str) {
+        assert!(matches!(
+            parse_blob_id(input_string),
+            Err(BlobIdParseError::InvalidBlobId)
+        ));
     }
 }

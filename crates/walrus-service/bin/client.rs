@@ -31,11 +31,20 @@ use walrus_service::{
             get_sui_read_client_from_rpc_node_or_wallet,
             load_configuration,
             load_wallet_context,
+            parse_blob_id,
             read_blob_from_file,
+            BlobIdDecimal,
             CliOutput,
             HumanReadableBytes,
         },
-        responses::{BlobIdOutput, BlobStatusOutput, DryRunOutput, InfoOutput, ReadOutput},
+        responses::{
+            BlobIdConversionOutput,
+            BlobIdOutput,
+            BlobStatusOutput,
+            DryRunOutput,
+            InfoOutput,
+            ReadOutput,
+        },
         Client,
         ClientDaemon,
     },
@@ -139,7 +148,7 @@ enum Commands {
     Read {
         /// The blob ID to be read.
         #[serde_as(as = "DisplayFromStr")]
-        #[clap(allow_hyphen_values = true)]
+        #[clap(allow_hyphen_values = true, value_parser = parse_blob_id)]
         blob_id: BlobId,
         /// The file path where to write the blob.
         ///
@@ -256,6 +265,12 @@ enum Commands {
         #[serde(flatten)]
         rpc_arg: RpcArg,
     },
+    /// Convert a decimal value to the Walrus blob ID (using URL-safe base64 encoding).
+    ConvertBlobId {
+        /// The decimal value to be converted to the Walrus blob ID.
+        #[serde_as(as = "DisplayFromStr")]
+        blob_id_decimal: BlobIdDecimal,
+    },
 }
 
 #[derive(Debug, Clone, Args, Deserialize)]
@@ -309,7 +324,7 @@ struct FileOrBlobId {
     #[serde(default)]
     file: Option<PathBuf>,
     /// The blob ID to be checked.
-    #[clap(short, long, allow_hyphen_values = true)]
+    #[clap(short, long, allow_hyphen_values = true, value_parser = parse_blob_id)]
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     blob_id: Option<BlobId>,
@@ -393,6 +408,7 @@ impl PublisherArgs {
 
 async fn client() -> Result<()> {
     init_tracing_subscriber()?;
+    tracing::info!("client version: {}", VERSION);
     let mut app = App::parse();
 
     while let Commands::Json { command_string } = app.command {
@@ -624,6 +640,9 @@ async fn run_app(app: App) -> Result<()> {
                 .compute_metadata();
 
             BlobIdOutput::new(&file, &metadata).print_output(app.json)?;
+        }
+        Commands::ConvertBlobId { blob_id_decimal } => {
+            BlobIdConversionOutput::from(blob_id_decimal).print_output(app.json)?;
         }
     }
     Ok(())
