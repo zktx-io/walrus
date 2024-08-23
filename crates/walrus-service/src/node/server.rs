@@ -309,6 +309,10 @@ where
                     .get(routes::get_sliver),
             )
             .route(
+                routes::SLIVER_STATUS_ENDPOINT,
+                get(routes::get_sliver_status),
+            )
+            .route(
                 routes::STORAGE_CONFIRMATION_ENDPOINT,
                 get(routes::get_storage_confirmation),
             )
@@ -556,12 +560,12 @@ mod tests {
             }
         }
 
-        fn is_sliver_stored<A: EncodingAxis>(
+        fn sliver_status<A: EncodingAxis>(
             &self,
-            blob_id: &BlobId,
-            _sliver_pair_index: SliverPairIndex,
+            _blob_id: &BlobId,
+            SliverPairIndex(sliver_pair_index): SliverPairIndex,
         ) -> Result<SliverStatus, RetrieveSliverError> {
-            if blob_id.0[0] == 0 {
+            if sliver_pair_index == 0 {
                 Ok(SliverStatus::Stored)
             } else {
                 Ok(SliverStatus::Nonexistent)
@@ -792,6 +796,27 @@ mod tests {
             .get_sliver::<Primary>(&blob_id, sliver_pair_id)
             .await
             .expect("should successfully retrieve sliver");
+    }
+
+    #[tokio::test]
+    async fn retrieve_sliver_status() {
+        let (config, _handle) = start_rest_api_with_test_config().await;
+        let client = storage_node_client(config.as_ref());
+
+        let blob_id = walrus_core::test_utils::random_blob_id();
+
+        let stored_sliver = client
+            .get_sliver_status::<Primary>(&blob_id, SliverPairIndex(0)) // 0 triggers "stored"
+            .await
+            .expect("should successfully retrieve sliver status");
+
+        let nonexistent_sliver = client
+            .get_sliver_status::<Primary>(&blob_id, SliverPairIndex(1)) // 1 triggers "nonexistent"
+            .await
+            .expect("should successfully retrieve sliver status");
+
+        assert_eq!(stored_sliver, SliverStatus::Stored);
+        assert_eq!(nonexistent_sliver, SliverStatus::Nonexistent);
     }
 
     #[tokio::test]
