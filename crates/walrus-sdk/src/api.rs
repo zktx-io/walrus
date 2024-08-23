@@ -130,16 +130,16 @@ impl Ord for BlobStatus {
     }
 }
 
-/// Contains the status of a sliver.
+/// Contains the storage status of a sliver or metadata.
 #[derive(
     Debug, Deserialize, Serialize, PartialEq, Eq, Clone, Copy, Default, Hash, utoipa::ToSchema,
 )]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
-pub enum SliverStatus {
-    /// The sliver does not exist on the storage node.
+pub enum StoredOnNodeStatus {
+    /// The sliver or metadata does not exist on the storage node.
     #[default]
     Nonexistent,
-    /// The sliver is stored on the storage node.
+    /// The sliver or metadata is stored on the storage node.
     Stored,
 }
 
