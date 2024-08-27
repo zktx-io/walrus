@@ -103,7 +103,12 @@ public(package) fun new(
     StakingPool {
         id,
         state,
-        params: PoolParams { commission_rate, storage_price, write_price, node_capacity },
+        params: PoolParams {
+            commission_rate,
+            storage_price,
+            write_price,
+            node_capacity,
+        },
         node_info: storage_node::new(
             name,
             node_id,
@@ -168,7 +173,6 @@ public(package) fun stake(
 ///
 /// TODO: rewards calculation.
 /// TODO: if pool is out and is withdrawing, we can perform the withdrawal immediately
-/// TODO: mark stake for withdrawing for the current ctx.sender()
 /// TODO: Only if the pool is already withdrawn.
 public(package) fun request_withdraw_stake(
     pool: &mut StakingPool,
@@ -181,8 +185,15 @@ public(package) fun request_withdraw_stake(
     assert!(staked_wal.node_id() == pool.id.to_inner());
     assert!(staked_wal.activation_epoch() <= wctx.epoch());
 
-    // depend on the committee selection + whether a node is active / has been active
-    staked_wal.set_withdrawing(wctx.epoch() + 1);
+    let node_in_committee = wctx.committee().contains(pool.id.as_inner());
+
+    // If the node is in the committee, the stake will be withdrawn in E+2,
+    // otherwise in E+1.
+    if (node_in_committee && wctx.committee_selected()) {
+        staked_wal.set_withdrawing(wctx.epoch() + 2);
+    } else {
+        staked_wal.set_withdrawing(wctx.epoch() + 1);
+    };
 
     let principal = staked_wal.value();
     pool.pending_withdrawal_amount = pool.pending_withdrawal_amount + principal;
@@ -295,16 +306,6 @@ public(package) fun advance_epoch(pool: &mut StakingPool, wctx: &WalrusContext) 
     if (pool.params_next_epoch.is_some()) {
         pool.params = pool.params_next_epoch.extract()
     }
-}
-
-/// Assign shards.
-public(package) fun assign_shards(pool: &mut StakingPool, shards: vector<u16>) {
-    pool.node_info.assign_shards(shards);
-}
-
-/// Add shards.
-public(package) fun add_shards(pool: &mut StakingPool, shards: vector<u16>) {
-    pool.node_info.add_shards(shards);
 }
 
 /// Set the state of the pool to `Active`.
