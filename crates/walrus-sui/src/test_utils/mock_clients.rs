@@ -15,7 +15,7 @@ use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 use walrus_core::{
     messages::{ConfirmationCertificate, InvalidBlobCertificate, InvalidBlobIdMsg},
     metadata::BlobMetadataWithId,
-    test_utils,
+    test_utils::{self, random_blob_id},
     BlobId,
     EncodingType,
     Epoch,
@@ -268,6 +268,24 @@ impl ContractClient for MockContractClient {
 
     fn read_client(&self) -> &impl ReadClient {
         &self.read_client
+    }
+
+    async fn owned_blobs(&self) -> SuiClientResult<Vec<Blob>> {
+        let blob = Blob {
+            id: ObjectID::random(),
+            stored_epoch: self.current_epoch,
+            blob_id: random_blob_id(),
+            size: 10_0000,
+            erasure_code_type: EncodingType::RedStuff,
+            certified_epoch: None,
+            storage: StorageResource {
+                id: ObjectID::random(),
+                start_epoch: self.current_epoch,
+                end_epoch: self.current_epoch + 1,
+                storage_size: 50_000,
+            },
+        };
+        Ok(vec![blob])
     }
 }
 
