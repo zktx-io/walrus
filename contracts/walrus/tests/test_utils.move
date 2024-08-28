@@ -15,7 +15,8 @@ use sui::{
 use walrus::{
     staking_inner::StakingInnerV1,
     staking_pool::{Self, StakingPool},
-    walrus_context::{Self, WalrusContext}
+    walrus_context::{Self, WalrusContext},
+    bls_aggregate,
 };
 
 // === Coins and Context ===
@@ -56,7 +57,7 @@ public struct PoolBuilder has copy, drop {
 ///     .name(b"my node".to_string())
 ///     .network_address(b"0.0.0.0".to_string())
 ///     .public_key(x"a60e75190e62b6a54142d147289a735c4ce11a9d997543da539a3db57def5ed83ba40b74e55065f02b35aa1d504c404b") // editorconfig-checker-disable-line
-///     .network_public_key(x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677")
+///     .network_public_key(x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677ab")
 ///     .commission_rate(1000)
 ///     .storage_price(1000)
 ///     .write_price(1000)
@@ -144,7 +145,7 @@ public fun build(self: PoolBuilder, wctx: &WalrusContext, ctx: &mut TxContext): 
             x"a60e75190e62b6a54142d147289a735c4ce11a9d997543da539a3db57def5ed83ba40b74e55065f02b35aa1d504c404b", // editorconfig-checker-disable-line
         ),
         network_public_key.destroy_with_default(
-            x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677",
+            x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677ab",
         ),
         commission_rate.destroy_with_default(1000),
         storage_price.destroy_with_default(1000),
@@ -176,7 +177,7 @@ public fun register(self: PoolBuilder, inner: &mut StakingInnerV1, ctx: &mut TxC
             x"a60e75190e62b6a54142d147289a735c4ce11a9d997543da539a3db57def5ed83ba40b74e55065f02b35aa1d504c404b", // editorconfig-checker-disable-line
         ),
         network_public_key.destroy_with_default(
-            x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677",
+            x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677ab",
         ),
         commission_rate.destroy_with_default(1000),
         storage_price.destroy_with_default(1000),
@@ -186,7 +187,7 @@ public fun register(self: PoolBuilder, inner: &mut StakingInnerV1, ctx: &mut TxC
     )
 }
 
-// == BLS Helpers ==
+// === BLS Helpers ===
 
 public fun bls_min_pk_sign(msg: &vector<u8>, sk: &vector<u8>): vector<u8> {
     let sk_element = bls12381::scalar_from_bytes(sk);
@@ -244,7 +245,17 @@ public fun bls_aggregate_sigs(signatures: &vector<vector<u8>>): vector<u8> {
     *aggregate.bytes()
 }
 
-// == Unit Tests ==
+/// Test committee with one committee member and 100 shards, using
+/// `test_utils::bls_sk_for_testing()` as secret key.
+public fun new_bls_committee_for_testing(epoch: u32): bls_aggregate::BlsCommittee {
+    let node_id = tx_context::dummy().fresh_object_address().to_id();
+    let sk = bls_sk_for_testing();
+    let pub_key = bls12381::g1_from_bytes(&bls_min_pk_from_sk(&sk));
+    let member = bls_aggregate::new_bls_committee_member(pub_key, 100, node_id);
+    bls_aggregate::new_bls_committee(epoch, vector[member])
+}
+
+// === Unit Tests ===
 
 #[test]
 fun test_bls_pk() {

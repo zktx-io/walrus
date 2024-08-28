@@ -9,7 +9,7 @@ use std::string::String;
 use sui::{clock::Clock, coin::Coin, dynamic_field as df, sui::SUI};
 use walrus::{
     staked_wal::StakedWal,
-    staking_inner::StakingInnerV1,
+    staking_inner::{Self, StakingInnerV1},
     storage_node::{Self, StorageNodeCap},
     system::System
 };
@@ -24,6 +24,14 @@ const VERSION: u64 = 0;
 public struct Staking has key {
     id: UID,
     version: u64,
+}
+
+/// Creates and shares a new staking object.
+/// Must only be called by the initialization function.
+public(package) fun create(n_shards: u16, clock: &Clock, ctx: &mut TxContext) {
+    let mut staking = Staking { id: object::new(ctx), version: VERSION };
+    df::add(&mut staking.id, VERSION, staking_inner::new(n_shards, clock, ctx));
+    transfer::share_object(staking)
 }
 
 // === Public API: Storage Node ===
@@ -96,15 +104,20 @@ public fun vote_for_price_next_epoch(
 
 /// Ends the voting period and runs the apportionment if the current time allows.
 /// Permissionless, can be called by anyone.
-/// Emits: `VotingEnd` event.
+/// Emits: `EpochParametersSelected` event.
 public fun voting_end(staking: &mut Staking, clock: &Clock) {
     staking.inner_mut().voting_end(clock)
 }
 
 /// Initiates the epoch change if the current time allows.
-/// Emits: `EpochChangeSync` event.
+/// Emits: `EpochChangeStart` event.
 public fun initiate_epoch_change(staking: &mut Staking, system: &mut System, clock: &Clock) {
-    abort ENotImplemented
+    let staking_inner = staking.inner_mut();
+    let balance = system.advance_epoch(
+        staking_inner.next_bls_committee(),
+        staking_inner.next_epoch_params(),
+    );
+    staking_inner.initiate_epoch_change(clock, balance);
 }
 
 /// Checks if the node should either have received the specified shards from the specified node
@@ -116,9 +129,14 @@ public fun initiate_epoch_change(staking: &mut Staking, system: &mut System, clo
 public fun shard_transfer_failed(
     staking: &mut Staking,
     cap: &StorageNodeCap,
-    node_identity: vector<u8>,
+    other_node_id: ID,
     shard_ids: vector<u16>,
 ) {
+    abort ENotImplemented
+}
+
+/// Signals to the contract that the node has received all its shards for the new epoch.
+public fun epoch_sync_done(staking: &mut Staking, cap: &StorageNodeCap) {
     abort ENotImplemented
 }
 
@@ -163,25 +181,31 @@ fun inner_mut(staking: &mut Staking): &mut StakingInnerV1 {
     df::borrow_mut(&mut staking.id, VERSION)
 }
 
-// === Tests ===
+/// Get an immutable reference to `StakingInner` from the `Staking`.
+fun inner(staking: &Staking): &StakingInnerV1 {
+    assert!(staking.version == VERSION);
+    df::borrow(&staking.id, VERSION)
+}
 
-#[test_only]
-use walrus::staking_inner;
+// === Tests ===
 
 #[test_only]
 use sui::{clock, coin};
 
 #[test_only]
-fun new(ctx: &mut TxContext): Staking {
+public(package) fun new_for_testing(ctx: &mut TxContext): Staking {
+    let clock = clock::create_for_testing(ctx);
     let mut staking = Staking { id: object::new(ctx), version: VERSION };
-    df::add(&mut staking.id, VERSION, staking_inner::new(1000, ctx));
+    df::add(&mut staking.id, VERSION, staking_inner::new(1000, &clock, ctx));
+    clock.destroy_for_testing();
     staking
 }
 
 #[test, expected_failure]
 fun test_register_candidate() {
     let ctx = &mut tx_context::dummy();
-    let cap = new(ctx).register_candidate(
+    let clock = clock::create_for_testing(ctx);
+    let cap = new_for_testing(ctx).register_candidate(
         b"node".to_string(),
         b"127.0.0.1".to_string(),
         x"820e2b273530a00de66c9727c40f48be985da684286983f398ef7695b8a44677",
@@ -198,7 +222,8 @@ fun test_register_candidate() {
 #[test, expected_failure]
 fun test_withdraw_node() {
     let ctx = &mut tx_context::dummy();
-    let mut staking = new(ctx);
+    let clock = clock::create_for_testing(ctx);
+    let mut staking = new_for_testing(ctx);
     let mut cap = staking.register_candidate(
         b"node".to_string(),
         b"127.0.0.1".to_string(),
@@ -217,7 +242,8 @@ fun test_withdraw_node() {
 #[test, expected_failure]
 fun test_set_next_commission() {
     let ctx = &mut tx_context::dummy();
-    let mut staking = new(ctx);
+    let clock = clock::create_for_testing(ctx);
+    let mut staking = new_for_testing(ctx);
     let cap = staking.register_candidate(
         b"node".to_string(),
         b"127.0.0.1".to_string(),
@@ -236,16 +262,18 @@ fun test_set_next_commission() {
 #[test, expected_failure]
 fun test_collect_commission() {
     let ctx = &mut tx_context::dummy();
+    let clock = clock::create_for_testing(ctx);
     let cap = storage_node::new_cap_for_testing(new_id(ctx), ctx);
-    let coin = new(ctx).collect_commission(&cap);
+    let coin = new_for_testing(ctx).collect_commission(&cap);
     abort 1337
 }
 
 #[test, expected_failure]
 fun test_vote_for_price_next_epoch() {
     let ctx = &mut tx_context::dummy();
+    let clock = clock::create_for_testing(ctx);
     let cap = storage_node::new_cap_for_testing(new_id(ctx), ctx);
-    new(ctx).vote_for_price_next_epoch(&cap, 0, 0, 0);
+    new_for_testing(ctx).vote_for_price_next_epoch(&cap, 0, 0, 0);
     abort 1337
 }
 
@@ -253,24 +281,26 @@ fun test_vote_for_price_next_epoch() {
 fun test_voting_end() {
     let ctx = &mut tx_context::dummy();
     let clock = clock::create_for_testing(ctx);
-    new(ctx).voting_end(&clock);
+    new_for_testing(ctx).voting_end(&clock);
     abort 1337
 }
 
 #[test, expected_failure]
 fun test_shard_transfer_failed() {
     let ctx = &mut tx_context::dummy();
+    let clock = clock::create_for_testing(ctx);
     let cap = storage_node::new_cap_for_testing(new_id(ctx), ctx);
-    new(ctx).shard_transfer_failed(&cap, vector[], vector[]);
+    new_for_testing(ctx).shard_transfer_failed(&cap, new_id(ctx), vector[]);
     abort 1337
 }
 
 #[test, expected_failure]
 fun test_stake_with_pool() {
     let ctx = &mut tx_context::dummy();
+    let clock = clock::create_for_testing(ctx);
     let coin = coin::mint_for_testing<SUI>(100, ctx);
     let cap = storage_node::new_cap_for_testing(new_id(ctx), ctx);
-    let staked_wal = new(ctx).stake_with_pool(coin, cap.node_id(), ctx);
+    let staked_wal = new_for_testing(ctx).stake_with_pool(coin, cap.node_id(), ctx);
     abort 1337
 }
 
