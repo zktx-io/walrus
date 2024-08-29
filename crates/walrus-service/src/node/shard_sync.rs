@@ -6,15 +6,19 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Duration};
 use walrus_core::ShardIndex;
+use walrus_sdk::error::ServiceError;
 
 use super::{
-    errors::SyncShardError,
+    errors::SyncShardClientError,
     storage::{ShardStatus, ShardStorage},
     StorageNodeInner,
 };
-use crate::node::errors::ShardNotAssigned;
+use crate::{
+    node::errors::ShardNotAssigned,
+    utils::{self, ExponentialBackoff},
+};
 
 /// Manages tasks for syncing shards during epoch change.
 #[derive(Debug, Clone)]
@@ -36,12 +40,12 @@ impl ShardSyncHandler {
     pub async fn start_new_shard_sync(
         &self,
         shard_index: ShardIndex,
-    ) -> Result<(), SyncShardError> {
+    ) -> Result<(), SyncShardClientError> {
         match self.node.storage.shard_storage(shard_index) {
             Some(shard_storage) => {
                 let shard_status = shard_storage.status()?;
                 if shard_status != ShardStatus::None {
-                    return Err(SyncShardError::InvalidShardStatusToSync(
+                    return Err(SyncShardClientError::InvalidShardStatusToSync(
                         shard_index,
                         shard_status,
                     ));
@@ -96,24 +100,57 @@ impl ShardSyncHandler {
         let shard_sync_handler_clone = self.clone();
         let shard_sync_task = tokio::spawn(async move {
             let shard_index = shard_storage.id();
-            let sync_result = shard_storage
-                .start_sync_shard_before_epoch(current_epoch, node_clone)
-                .await;
 
-            if let Err(err) = sync_result {
-                tracing::error!(
-                    "Failed to sync shard index: {} to before epoch: {}. Error: {}",
-                    shard_index,
-                    current_epoch,
-                    err
-                );
-            } else {
-                tracing::info!(
-                    "Successfully synced shard index: {} to before epoch: {}",
-                    shard_index,
-                    current_epoch
-                );
-            }
+            let backoff = ExponentialBackoff::new_with_seed(
+                // TODO(#704): make these configurable.
+                Duration::from_secs(60),
+                Duration::from_secs(600),
+                None,
+                shard_index.0 as u64, // Seed the backoff with the shard index.
+            );
+
+            utils::retry(backoff, || async {
+                let sync_result = shard_storage
+                    .start_sync_shard_before_epoch(current_epoch, node_clone.clone())
+                    .await;
+
+                if let Err(err) = sync_result {
+                    tracing::error!(
+                        "Failed to sync shard index: {} to before epoch: {}. Error: {:?}",
+                        shard_index,
+                        current_epoch,
+                        err
+                    );
+
+                    if let SyncShardClientError::RequestError(node_error) = err {
+                        if let Some(ServiceError::InvalidEpoch {
+                            request_epoch,
+                            server_epoch,
+                        }) = node_error.service_error()
+                        {
+                            if request_epoch > server_epoch {
+                                tracing::info!(
+                                    "Source storage node hasn't reached the epoch yet.
+                                Client epoch: {}, Server epoch: {}",
+                                    request_epoch,
+                                    server_epoch
+                                );
+                                // Retry the sync after backoff.
+                                return false;
+                            }
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        "Successfully synced shard index: {} to before epoch: {}",
+                        shard_index,
+                        current_epoch
+                    );
+                }
+                // TODO(#705): also do retries for other retriable errors. E.g. RPC error.
+                true
+            })
+            .await;
 
             // Remove the task from the shard_sync_in_progress map upon completion.
             shard_sync_handler_clone
@@ -185,7 +222,7 @@ mod tests {
 
         assert!(matches!(
             shard_sync_handler.start_new_shard_sync(ShardIndex(0)).await,
-            Err(SyncShardError::InvalidShardStatusToSync(..))
+            Err(SyncShardClientError::InvalidShardStatusToSync(..))
         ));
 
         cluster.nodes[0]
@@ -212,7 +249,7 @@ mod tests {
 
         assert!(matches!(
             shard_sync_handler.start_new_shard_sync(ShardIndex(1)).await,
-            Err(SyncShardError::ShardNotAssigned(..))
+            Err(SyncShardClientError::ShardNotAssigned(..))
         ));
     }
 }

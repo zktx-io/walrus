@@ -4,6 +4,8 @@
 //! Errors that may be encountered while interacting with a storage node.
 
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use walrus_core::Epoch;
 
 use crate::tls::VerifierBuildError;
 
@@ -55,6 +57,14 @@ impl NodeError {
     pub(crate) fn reqwest(err: reqwest::Error) -> Self {
         Kind::Reqwest(err).into()
     }
+
+    /// Returns the reason for the error, if any.
+    pub fn service_error(&self) -> Option<ServiceError> {
+        match &self.kind {
+            Kind::StatusWithMessage { service_error, .. } => *service_error,
+            _ => None,
+        }
+    }
 }
 
 /// Errors returned during the communication with a storage node.
@@ -68,6 +78,7 @@ pub(crate) enum Kind {
     StatusWithMessage {
         inner: reqwest::Error,
         message: String,
+        service_error: Option<ServiceError>,
     },
     #[error("node returned an error in a non-error response {code}: {message}")]
     ErrorInNonErrorMessage { code: u16, message: String },
@@ -103,4 +114,17 @@ pub(crate) enum BuildErrorKind {
     Reqwest(#[from] reqwest::Error),
     #[error("unable to load trusted certificates from the OS: {0}")]
     FailedToLoadCerts(#[from] std::io::Error),
+}
+
+/// Defines a more detailed server side error that can be returned to the client.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[serde(tag = "reason", content = "metadata", rename_all = "camelCase")]
+pub enum ServiceError {
+    /// The requested epoch is invalid.
+    InvalidEpoch {
+        /// The epoch client is in.
+        request_epoch: Epoch,
+        /// The epoch server is in.
+        server_epoch: Epoch,
+    },
 }

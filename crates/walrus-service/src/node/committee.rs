@@ -47,17 +47,17 @@ use walrus_core::{
     InconsistencyProof as InconsistencyProofEnum,
     PublicKey,
     ShardIndex,
-    Sliver as GeneralSliver,
+    Sliver,
     SliverPairIndex,
     SliverType,
 };
-use walrus_sdk::client::Client as StorageNodeClient;
+use walrus_sdk::{client::Client as StorageNodeClient, error::NodeError};
 use walrus_sui::{
     client::ReadClient,
     types::{Committee, StorageNode as SuiStorageNode},
 };
 
-use super::errors::SyncShardError;
+use super::errors::SyncShardClientError;
 use crate::{
     common::utils::{self, ExponentialBackoff, FutureHelpers},
     node::config::CommitteeServiceConfig,
@@ -146,7 +146,7 @@ pub trait CommitteeService: std::fmt::Debug + Send + Sync {
         sliver_count: u64,
         epoch: Epoch,
         key_pair: &ProtocolKeyPair,
-    ) -> Result<Vec<(BlobId, GeneralSliver)>, anyhow::Error>;
+    ) -> Result<Vec<(BlobId, Sliver)>, SyncShardClientError>;
 
     /// Checks if the given public key belongs to a Walrus storage node.
     /// TODO (#629): once node catching up is implemented, we need to make sure that the node
@@ -186,7 +186,7 @@ trait NodeClient {
         sliver_count: u64,
         epoch: Epoch,
         key_pair: &ProtocolKeyPair,
-    ) -> Option<SyncShardResponse>;
+    ) -> Result<SyncShardResponse, NodeError>;
 }
 
 /// Constructs [`NodeCommitteeService`]s by reading the current storage committee from the chain.
@@ -587,9 +587,9 @@ where
         sliver_count: u64,
         epoch: Epoch,
         key_pair: &ProtocolKeyPair,
-    ) -> Result<Vec<(BlobId, GeneralSliver)>, anyhow::Error> {
+    ) -> Result<Vec<(BlobId, Sliver)>, SyncShardClientError> {
         let Some(member_index) = self.committee.member_index_for_shard(shard) else {
-            return Err(SyncShardError::NoOwnerForShard(shard).into());
+            return Err(SyncShardClientError::NoOwnerForShard(shard));
         };
 
         let node = self.node(member_index);
@@ -597,11 +597,10 @@ where
         if let Some(client) = node.client() {
             Ok(client
                 .sync_shard::<A>(shard, starting_blob_id, sliver_count, epoch, key_pair)
-                .await
-                .unwrap_or_default()
+                .await?
                 .into())
         } else {
-            Err(SyncShardError::NoSyncClient.into())
+            Err(SyncShardClientError::NoSyncClient)
         }
     }
 }
@@ -738,7 +737,7 @@ impl CommitteeService for NodeCommitteeService {
         sliver_count: u64,
         epoch: Epoch,
         key_pair: &ProtocolKeyPair,
-    ) -> Result<Vec<(BlobId, GeneralSliver)>, anyhow::Error> {
+    ) -> Result<Vec<(BlobId, Sliver)>, SyncShardClientError> {
         tracing::info!("syncing shard to epoch");
         match sliver_type {
             SliverType::Primary => {

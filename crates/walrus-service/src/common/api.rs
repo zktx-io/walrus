@@ -34,6 +34,7 @@ use utoipa::{
     ToSchema,
 };
 use walrus_core::BlobId;
+use walrus_sdk::error::ServiceError;
 
 /// A blob ID encoded as a URL-safe Base64 string, without the trailing equal (=) signs.
 #[serde_as]
@@ -147,7 +148,7 @@ macro_rules! api_success_alias {
 
         impl<'r> ToSchema<'r> for $alias {
             fn schema() -> (&'r str, RefOr<Schema>) {
-                (stringify!($alias), $crate::common::api::api_success_alias!(@schema $method $name))
+                (stringify!($alias), $crate::api_success_alias!(@schema $method $name))
             }
         }
     };
@@ -160,15 +161,21 @@ macro_rules! api_success_alias {
 #[derive(ToSchema, Debug, Serialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum RestApiJsonError<'a> {
-    Error { code: u16, message: &'a str },
+    Error {
+        code: u16,
+        message: &'a str,
+        #[serde(flatten)]
+        reason: Option<ServiceError>,
+    },
 }
 
 impl<'a> RestApiJsonError<'a> {
     /// Creates a new error with the provided status code and message.
-    pub(crate) fn new(code: StatusCode, message: &'a str) -> Self {
+    pub(crate) fn new(code: StatusCode, message: &'a str, reason: Option<ServiceError>) -> Self {
         Self::Error {
             code: code.as_u16(),
             message,
+            reason,
         }
     }
 }
@@ -188,6 +195,9 @@ pub(crate) trait RestApiError: Sized {
     /// Returns the text to be written to the HTTP body.
     fn body_text(&self) -> String;
 
+    /// Returns the detailed server side error, if any.
+    fn service_error(&self) -> Option<ServiceError>;
+
     /// Converts the error into a [`Response`].
     fn to_response(&self) -> Response {
         let mut message = self.body_text();
@@ -197,7 +207,8 @@ pub(crate) trait RestApiError: Sized {
                 .expect("writing to a string must succeed");
         }
 
-        RestApiJsonError::new(self.status(), &self.body_text()).into_response()
+        RestApiJsonError::new(self.status(), &self.body_text(), self.service_error())
+            .into_response()
     }
 }
 
@@ -215,11 +226,12 @@ macro_rules! rest_api_error {
     };
 
     ($enum:ident: [
-        $( ($variant:pat, $code:ident, $($desc:tt)*) ),+$(,)?
+        $( ($variant:pat, $code:ident, $reason:expr, $($desc:tt)*) ),+$(,)?
     ]) => {
         impl RestApiError for $enum {
             fn status(&self) -> StatusCode {
                 use $enum::*;
+                #[allow(unused_variables)]
                 match self {
                     $( $variant => StatusCode::$code ),+
                 }
@@ -227,6 +239,13 @@ macro_rules! rest_api_error {
 
             fn body_text(&self) -> String {
                 self.to_string()
+            }
+
+            fn service_error(&self) -> Option<ServiceError> {
+                use $enum::*;
+                match self {
+                    $( $variant => $reason ),+
+                }
             }
         }
 
@@ -282,7 +301,7 @@ where
             .canonical_reason()
             .expect("all used codes have canonical reasons");
         let example_reason = format!("'{canonical_reason}' or more detailed information");
-        let example = RestApiJsonError::new(code, &example_reason);
+        let example = RestApiJsonError::new(code, &example_reason, None);
         let content = ContentBuilder::new()
             .schema(schema::Ref::from_schema_name("RestApiJsonError"))
             .example(Some(json!(example)))
@@ -305,8 +324,3 @@ pub(crate) fn rewrite_route(path: &str) -> String {
         .as_ref()
         .into()
 }
-
-#[allow(unused_imports)]
-pub(crate) use api_success_alias;
-#[allow(unused_imports)]
-pub(crate) use rest_api_error;

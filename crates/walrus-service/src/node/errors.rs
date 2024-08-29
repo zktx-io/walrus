@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use serde::Serialize;
 use sui_types::event::EventID;
 use typed_store::TypedStoreError;
 use walrus_core::{
@@ -11,6 +12,7 @@ use walrus_core::{
     Epoch,
     ShardIndex,
 };
+use walrus_sdk::error::NodeError;
 
 use super::storage::ShardStatus;
 
@@ -119,24 +121,44 @@ pub enum BlobStatusError {
     Internal(#[from] InternalError),
 }
 
+/// Error returned when the epoch in a request is invalid.
+#[derive(Debug, thiserror::Error, Serialize, Clone)]
+#[error("Invalid epoch. Client epoch: {request_epoch}. Server epoch: {server_epoch}")]
+pub struct InvalidEpochError {
+    pub request_epoch: Epoch,
+    pub server_epoch: Epoch,
+}
+
 #[derive(Debug, thiserror::Error)]
-pub enum SyncShardError {
+pub enum SyncShardServiceError {
     #[error("The client is not authorized to perform sync shard operation")]
     Unauthorized,
     #[error(transparent)]
     MessageVerificationError(#[from] MessageVerificationError),
     #[error(transparent)]
     ShardNotAssigned(#[from] ShardNotAssigned),
-    #[error("The request came from an epoch that is too old: {0}. Current epoch is {1}")]
-    EpochTooOld(Epoch, Epoch),
+    #[error(transparent)]
+    InvalidEpoch(#[from] InvalidEpochError),
     #[error(transparent)]
     Internal(#[from] InternalError),
+    #[error(transparent)]
+    StorageError(#[from] TypedStoreError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncShardClientError {
     #[error("The destination node does not have a valid client to talk to the source node")]
     NoSyncClient,
     #[error("Unable to find the owner for shard {0}")]
     NoOwnerForShard(ShardIndex),
-    #[error(transparent)]
-    StorageError(#[from] TypedStoreError),
     #[error("The shard {0} is not in a valid status for syncing: {1}")]
     InvalidShardStatusToSync(ShardIndex, ShardStatus),
+    #[error(transparent)]
+    ShardNotAssigned(#[from] ShardNotAssigned),
+    #[error(transparent)]
+    StorageError(#[from] TypedStoreError),
+    #[error(transparent)]
+    Internal(#[from] InternalError),
+    #[error(transparent)]
+    RequestError(#[from] NodeError),
 }

@@ -10,6 +10,8 @@ use sui_types::event::EventID;
 use tokio::time::Duration;
 use walrus_core::{Epoch, PublicKey};
 
+use crate::error::ServiceError;
+
 /// Error message returned by the service.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +29,9 @@ pub enum ServiceResponse<T> {
         code: u16,
         /// The error message.
         message: String,
+        /// Optionally contains a more detailed server side reason for the error.
+        #[serde(flatten)]
+        reason: Option<ServiceError>,
     },
 }
 

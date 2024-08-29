@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context;
+use blob_info::BlobCertificationStatus;
 use rocksdb::{DBCompressionType, MergeOperands, Options};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -33,8 +33,7 @@ use self::{
     blob_info::{BlobInfo, BlobInfoApi, BlobInfoMergeOperand, Mergeable as _},
     event_cursor_table::EventCursorTable,
 };
-use super::errors::ShardNotAssigned;
-use crate::node::SyncShardError;
+use super::errors::{ShardNotAssigned, SyncShardServiceError};
 
 pub(crate) mod blob_info;
 
@@ -542,7 +541,7 @@ impl Storage {
         &self,
         request: &SyncShardRequest,
         current_epoch: Epoch,
-    ) -> Result<SyncShardResponse, SyncShardError> {
+    ) -> Result<SyncShardResponse, SyncShardServiceError> {
         let Some(shard) = self.shard_storage(request.shard_index()) else {
             return Err(ShardNotAssigned(request.shard_index(), current_epoch).into());
         };
@@ -553,21 +552,18 @@ impl Storage {
             .safe_iter_with_bounds(Some(request.starting_blob_id()), None)
             .filter_map(|blob_info| match blob_info {
                 Ok((blob_id, blob_info)) => {
-                    if blob_info.is_certified() {
-                        Some(Ok(blob_id))
-                    } else {
-                        None
+                    match blob_info.status_changing_epoch(BlobCertificationStatus::Certified) {
+                        Some(epoch) if epoch < current_epoch => Some(Ok(blob_id)),
+                        _ => None,
                     }
                 }
                 Err(e) => Some(Err(e)),
             })
             .take(request.sliver_count() as usize)
-            .collect::<Result<Vec<_>, TypedStoreError>>()
-            .context("Scanning blob_info table encountered RocksDb error.")?;
+            .collect::<Result<Vec<_>, TypedStoreError>>()?;
 
         Ok(shard
-            .fetch_slivers(request.sliver_type(), &blobs_to_fetch)
-            .context("Fetching slivers encountered error.")?
+            .fetch_slivers(request.sliver_type(), &blobs_to_fetch)?
             .into())
     }
 }
@@ -1191,7 +1187,7 @@ pub(crate) mod tests {
                     blob,
                     BlobInfoMergeOperand::ChangeStatus {
                         blob_id: *blob,
-                        status_changing_epoch: 1,
+                        status_changing_epoch: 0,
                         end_epoch: 2,
                         status: BlobCertificationStatus::Certified,
                         status_event: event_id_for_testing(),
@@ -1241,7 +1237,10 @@ pub(crate) mod tests {
             .handle_sync_shard_request(&request, 0)
             .unwrap_err();
 
-        assert!(matches!(response, SyncShardError::ShardNotAssigned(..)));
+        assert!(matches!(
+            response,
+            SyncShardServiceError::ShardNotAssigned(..)
+        ));
 
         Ok(())
     }

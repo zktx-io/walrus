@@ -13,7 +13,6 @@ use std::{
 
 #[cfg(feature = "failure_injection")]
 use anyhow::anyhow;
-use anyhow::Context;
 use fastcrypto::traits::KeyPair;
 use regex::Regex;
 use rocksdb::{Options, DB};
@@ -33,7 +32,7 @@ use walrus_core::{
 };
 
 use super::{blob_info::BlobInfoApi, DatabaseConfig, Storage};
-use crate::node::{errors::SyncShardError, StorageNodeInner};
+use crate::node::{errors::SyncShardClientError, StorageNodeInner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShardStatus {
@@ -379,12 +378,10 @@ impl ShardStorage {
         &self,
         epoch: Epoch,
         node: Arc<StorageNodeInner>,
-    ) -> Result<(), SyncShardError> {
+    ) -> Result<(), SyncShardClientError> {
         tracing::info!("Syncing shard to before epoch: {}", epoch);
         if self.status()? == ShardStatus::None {
-            self.shard_status
-                .insert(&(), &ShardStatus::ActiveSync)
-                .context("Update shard status encountered error")?;
+            self.shard_status.insert(&(), &ShardStatus::ActiveSync)?
         }
 
         assert_eq!(self.status()?, ShardStatus::ActiveSync);
@@ -432,9 +429,7 @@ impl ShardStorage {
         let mut batch = self.shard_status.batch();
         batch.insert_batch(&self.shard_status, [((), ShardStatus::Active)])?;
         batch.delete_batch(&self.shard_sync_progress, [()])?;
-        batch
-            .write()
-            .context("Update shard status encountered error")?;
+        batch.write()?;
 
         Ok(())
     }
@@ -452,13 +447,12 @@ impl ShardStorage {
         node: Arc<StorageNodeInner>,
         sliver_type: SliverType,
         mut last_synced_blob_id: Option<BlobId>,
-    ) -> Result<(), SyncShardError> {
+    ) -> Result<(), SyncShardClientError> {
         // Helper to track the number of scanned blobs to test recovery. Not used in production.
         #[cfg(feature = "failure_injection")]
         let mut scan_count = 0;
         while let Some(next_starting_blob_id) =
-            next_certified_blob_id_before_epoch(&node.storage, epoch, last_synced_blob_id)
-                .context("Scanning certified blobs encountered error")?
+            next_certified_blob_id_before_epoch(&node.storage, epoch, last_synced_blob_id)?
         {
             tracing::debug!(
                 "Syncing shard to before epoch: {}. Starting blob id: {}",
