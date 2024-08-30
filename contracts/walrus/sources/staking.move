@@ -28,9 +28,18 @@ public struct Staking has key {
 
 /// Creates and shares a new staking object.
 /// Must only be called by the initialization function.
-public(package) fun create(n_shards: u16, clock: &Clock, ctx: &mut TxContext) {
+public(package) fun create(
+    epoch_zero_duration: u64,
+    n_shards: u16,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
     let mut staking = Staking { id: object::new(ctx), version: VERSION };
-    df::add(&mut staking.id, VERSION, staking_inner::new(n_shards, clock, ctx));
+    df::add(
+        &mut staking.id,
+        VERSION,
+        staking_inner::new(epoch_zero_duration, n_shards, clock, ctx),
+    );
     transfer::share_object(staking)
 }
 
@@ -38,13 +47,11 @@ public(package) fun create(n_shards: u16, clock: &Clock, ctx: &mut TxContext) {
 
 /// Creates a staking pool for the candidate, registers the candidate as a storage node.
 public fun register_candidate(
-    staking: &mut Staking,
-    // node info
+    staking: &mut Staking, // node info
     name: String,
     network_address: String,
     public_key: vector<u8>,
-    network_public_key: vector<u8>,
-    // voting parameters
+    network_public_key: vector<u8>, // voting parameters
     commission_rate: u64,
     storage_price: u64,
     write_price: u64,
@@ -196,7 +203,7 @@ use sui::{clock, coin};
 public(package) fun new_for_testing(ctx: &mut TxContext): Staking {
     let clock = clock::create_for_testing(ctx);
     let mut staking = Staking { id: object::new(ctx), version: VERSION };
-    df::add(&mut staking.id, VERSION, staking_inner::new(1000, &clock, ctx));
+    df::add(&mut staking.id, VERSION, staking_inner::new(0, 1000, &clock, ctx));
     clock.destroy_for_testing();
     staking
 }
