@@ -4,21 +4,74 @@
 //! Walrus contract bindings. Provides an interface for looking up contract function,
 //! modules, and type names.
 
+use core::fmt;
+
 use anyhow::{Context, Result};
 use move_core_types::{identifier::Identifier, language_storage::StructTag as MoveStructTag};
+use serde::de::DeserializeOwned;
 use sui_sdk::{
-    rpc_types::{SuiEvent, SuiMoveStruct},
+    rpc_types::{SuiData, SuiEvent, SuiObjectData},
     types::base_types::ObjectID,
 };
 use sui_types::TypeTag;
+use thiserror::Error;
+use tracing::instrument;
+use walrus_core::ensure;
+
+/// Error returned when converting a Sui object or event to a rust struct.
+#[derive(Debug, Error)]
+pub enum MoveConversionError {
+    #[error("object data does not contain bcs")]
+    /// Error if the object data we are trying to convert does not contain bcs.
+    NoBcs,
+    #[error("not a move object")]
+    /// Error if the object data is not a move object.
+    NotMoveObject,
+    /// Error resulting if the object or event does not have the expected type.
+    #[error("the move struct {actual} does not match the expected type {expected}")]
+    TypeMismatch {
+        /// Expected type of the struct.
+        expected: String,
+        /// Actual type of the struct.
+        actual: String,
+    },
+    #[error(transparent)]
+    /// Error during BCS deserialization.
+    Bcs(#[from] bcs::Error),
+}
 
 /// A trait for types that correspond to a contract type.
 ///
-/// Implementors of this trait are convertible from [SuiMoveStruct]s and can
+/// Implementors of this trait are convertible from [SuiObjectData]s and can
 /// identify their associated contract type.
-pub trait AssociatedContractStruct: TryFrom<SuiMoveStruct> {
+pub trait AssociatedContractStruct: DeserializeOwned {
     /// [`StructTag`] corresponding to the Move struct associated type.
     const CONTRACT_STRUCT: StructTag<'static>;
+
+    /// Converts a [`SuiObjectData`] to [`Self`].
+    #[instrument(err, skip_all)]
+    fn try_from_object_data(sui_object_data: &SuiObjectData) -> Result<Self, MoveConversionError> {
+        tracing::debug!(
+            "converting move object to rust struct {:?}",
+            Self::CONTRACT_STRUCT,
+        );
+        let raw = sui_object_data
+            .bcs
+            .as_ref()
+            .ok_or(MoveConversionError::NoBcs)?;
+        let raw = raw
+            .try_as_move()
+            .ok_or(MoveConversionError::NotMoveObject)?;
+        ensure!(
+            raw.type_.name.as_str() == Self::CONTRACT_STRUCT.name
+                && raw.type_.module.as_str() == Self::CONTRACT_STRUCT.module,
+            MoveConversionError::TypeMismatch {
+                expected: Self::CONTRACT_STRUCT.to_string(),
+                actual: format!("{}::{}", raw.type_.module.as_str(), raw.type_.name.as_str()),
+            }
+        );
+        Ok(bcs::from_bytes(&raw.bcs_bytes)?)
+    }
 }
 
 /// A trait for types that correspond to a Sui event.
@@ -88,6 +141,12 @@ impl<'a> From<&'a MoveStructTag> for StructTag<'a> {
             name: value.name.as_str(),
             module: value.module.as_str(),
         }
+    }
+}
+
+impl<'a> fmt::Display for StructTag<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}::{}", self.module, self.name)
     }
 }
 
