@@ -4,7 +4,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Debug,
-    ops::RangeBounds,
+    ops::Bound::{Excluded, Unbounded},
     path::Path,
     sync::Arc,
 };
@@ -177,6 +177,7 @@ pub struct DatabaseConfig {
     shard: DatabaseTableOptions,
     shard_status: DatabaseTableOptions,
     shard_sync_progress: DatabaseTableOptions,
+    pending_recover_slivers: DatabaseTableOptions,
 }
 
 impl DatabaseConfig {
@@ -194,6 +195,11 @@ impl DatabaseConfig {
     pub fn shard_sync_progress(&self) -> &DatabaseTableOptions {
         &self.shard_sync_progress
     }
+
+    /// Returns the pending recover slivers database option.
+    pub fn pending_recover_slivers(&self) -> &DatabaseTableOptions {
+        &self.pending_recover_slivers
+    }
 }
 
 impl Default for DatabaseConfig {
@@ -205,6 +211,7 @@ impl Default for DatabaseConfig {
             shard: DatabaseTableOptions::optimized_for_blobs(),
             shard_status: DatabaseTableOptions::default(),
             shard_sync_progress: DatabaseTableOptions::default(),
+            pending_recover_slivers: DatabaseTableOptions::default(),
         }
     }
 }
@@ -222,6 +229,71 @@ pub struct Storage {
     shards: HashMap<ShardIndex, Arc<ShardStorage>>,
     config: DatabaseConfig,
 }
+
+/// A iterator over the blob info table.
+pub struct BlobInfoIter<I: ?Sized>
+where
+    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
+{
+    iter: Box<I>,
+    before_epoch: Epoch,
+    only_certified: bool,
+}
+
+impl<I: ?Sized> BlobInfoIter<I>
+where
+    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
+{
+    pub fn new(iter: Box<I>, before_epoch: Epoch, only_certified: bool) -> Self {
+        Self {
+            iter,
+            before_epoch,
+            only_certified,
+        }
+    }
+}
+
+impl<I: ?Sized> Debug for BlobInfoIter<I>
+where
+    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobInfoIter")
+            .field("before_epoch", &self.before_epoch)
+            .field("only_certified", &self.only_certified)
+            .finish()
+    }
+}
+
+impl<I: ?Sized> Iterator for BlobInfoIter<I>
+where
+    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
+{
+    type Item = Result<(BlobId, BlobInfo), TypedStoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut item = self.iter.next();
+        if !self.only_certified {
+            return item;
+        }
+
+        while let Some(Ok((_, ref blob_info))) = item {
+            if blob_info.is_certified()
+                && blob_info
+                    .status_changing_epoch(blob_info::BlobCertificationStatus::Certified)
+                    .expect("We just checked that the blob is certified")
+                    < self.before_epoch
+            {
+                return item;
+            }
+            item = self.iter.next();
+        }
+        item
+    }
+}
+
+pub type BlobInfoIterator<'a> =
+    BlobInfoIter<dyn Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send + 'a>;
 
 impl Storage {
     const METADATA_COLUMN_FAMILY_NAME: &'static str = "metadata";
@@ -357,14 +429,21 @@ impl Storage {
 
     /// Returns an iterator over the blob info table.
     #[tracing::instrument(skip_all)]
-    pub fn blob_info_iter(
+    pub fn certified_blob_info_iter_before_epoch(
         &self,
-        range: Option<impl RangeBounds<BlobId>>,
-    ) -> impl Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + '_ {
-        match range {
-            Some(range) => self.blob_info.safe_range_iter(range),
-            None => self.blob_info.safe_iter(),
-        }
+        before_epoch: Epoch,
+        last_synced_blob_id: Option<BlobId>,
+    ) -> BlobInfoIterator {
+        BlobInfoIter::new(
+            Box::new(match last_synced_blob_id {
+                Some(starting_blob_id) => self
+                    .blob_info
+                    .safe_range_iter((Excluded(starting_blob_id), Unbounded)),
+                None => self.blob_info.safe_iter(),
+            }),
+            before_epoch,
+            true,
+        )
     }
 
     /// Get the event cursor for `event_type`
@@ -1241,6 +1320,103 @@ pub(crate) mod tests {
             response,
             SyncShardServiceError::ShardNotAssigned(..)
         ));
+
+        Ok(())
+    }
+
+    fn registered_blob_info(epoch: Epoch) -> BlobInfo {
+        BlobInfo::new_for_testing(
+            100,
+            BlobCertificationStatus::Registered,
+            event_id_for_testing(),
+            Some(epoch),
+            None,
+            None,
+        )
+    }
+
+    fn certified_blob_info(epoch: Epoch) -> BlobInfo {
+        BlobInfo::new_for_testing(
+            100,
+            BlobCertificationStatus::Certified,
+            event_id_for_testing(),
+            Some(epoch),
+            Some(epoch),
+            None,
+        )
+    }
+
+    fn invalid_blob_info(epoch: Epoch) -> BlobInfo {
+        BlobInfo::new_for_testing(
+            100,
+            BlobCertificationStatus::Invalid,
+            event_id_for_testing(),
+            Some(epoch),
+            Some(epoch),
+            Some(epoch),
+        )
+    }
+
+    fn all_certified_blob_ids(
+        storage: &WithTempDir<Storage>,
+        after_blob: Option<BlobId>,
+        new_epoch: Epoch,
+    ) -> Result<Vec<BlobId>, TypedStoreError> {
+        storage
+            .inner
+            .certified_blob_info_iter_before_epoch(new_epoch, after_blob)
+            .map(|result| result.map(|(id, _info)| id))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    #[tokio::test]
+    async fn test_certified_blob_info_iter_before_epoch() -> TestResult {
+        let storage = empty_storage();
+        let blob_info = storage.inner.blob_info.clone();
+        let new_epoch = 3;
+
+        let blob_ids = [
+            BlobId([0; 32]), // Not certified.
+            BlobId([1; 32]), // Not exist.
+            BlobId([2; 32]), // Certified within epoch 2
+            BlobId([3; 32]), // Certified after epoch 2
+            BlobId([4; 32]), // Invalid
+            BlobId([5; 32]), // Certified within epoch 2
+            BlobId([6; 32]), // Not exist.
+        ];
+
+        let blob_info_map = HashMap::from([
+            (blob_ids[0], registered_blob_info(1)),
+            (blob_ids[2], certified_blob_info(2)),
+            (blob_ids[3], certified_blob_info(3)),
+            (blob_ids[4], invalid_blob_info(2)),
+            (blob_ids[5], certified_blob_info(2)),
+        ]);
+
+        let mut batch = blob_info.batch();
+        batch.insert_batch(&blob_info, blob_info_map.iter())?;
+        batch.write()?;
+
+        assert_eq!(
+            all_certified_blob_ids(&storage, None, new_epoch)?,
+            vec![blob_ids[2], blob_ids[5]]
+        );
+
+        for blob_id in blob_ids.iter().take(2) {
+            assert_eq!(
+                all_certified_blob_ids(&storage, Some(*blob_id), new_epoch)?,
+                vec![blob_ids[2], blob_ids[5]]
+            );
+        }
+        for blob_id in blob_ids.iter().take(5).skip(2) {
+            assert_eq!(
+                all_certified_blob_ids(&storage, Some(*blob_id), new_epoch)?,
+                vec![blob_ids[5]]
+            );
+        }
+        for blob_id in blob_ids.iter().take(6).skip(5) {
+            assert!(all_certified_blob_ids(&storage, Some(*blob_id), new_epoch)?.is_empty());
+        }
 
         Ok(())
     }

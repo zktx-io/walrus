@@ -416,7 +416,7 @@ impl BlobSynchronizer {
     }
 }
 
-async fn recover_sliver<A: EncodingAxis>(
+pub async fn recover_sliver<A: EncodingAxis>(
     committee_service: &dyn CommitteeService,
     metadata: &VerifiedBlobMetadataWithId,
     sliver_id: SliverPairIndex,

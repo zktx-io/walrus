@@ -71,7 +71,9 @@ impl ShardSyncHandler {
 
             // Restart the syncing task for shards that were previously syncing (in ActiveSync
             // status).
-            if shard_storage.status()? == ShardStatus::ActiveSync {
+            let shard_status = shard_storage.status()?;
+            if shard_status == ShardStatus::ActiveSync || shard_status == ShardStatus::ActiveRecover
+            {
                 self.start_shard_sync_impl(shard_storage.clone()).await;
             }
         }
@@ -102,7 +104,7 @@ impl ShardSyncHandler {
             let shard_index = shard_storage.id();
 
             let backoff = ExponentialBackoff::new_with_seed(
-                // TODO(#704): make these configurable.
+                // TODO(#705): make these configurable.
                 Duration::from_secs(60),
                 Duration::from_secs(600),
                 None,
@@ -199,10 +201,7 @@ mod tests {
             .restart_syncs()
             .await
             .expect("Failed to restart syncs");
-        assert_eq!(
-            shard_sync_handler.shard_sync_in_progress.lock().await.len(),
-            2
-        );
+        assert_eq!(shard_sync_handler.current_sync_task_count().await, 2);
         assert!(shard_sync_handler
             .shard_sync_in_progress
             .lock()
@@ -234,18 +233,12 @@ mod tests {
             .update_status_in_test(ShardStatus::None)
             .expect("Failed to update shard status");
 
-        assert_eq!(
-            shard_sync_handler.shard_sync_in_progress.lock().await.len(),
-            0
-        );
+        assert_eq!(shard_sync_handler.current_sync_task_count().await, 0);
         shard_sync_handler
             .start_new_shard_sync(ShardIndex(0))
             .await
             .expect("Failed to start new shard sync");
-        assert_eq!(
-            shard_sync_handler.shard_sync_in_progress.lock().await.len(),
-            1
-        );
+        assert_eq!(shard_sync_handler.current_sync_task_count().await, 1);
 
         assert!(matches!(
             shard_sync_handler.start_new_shard_sync(ShardIndex(1)).await,
