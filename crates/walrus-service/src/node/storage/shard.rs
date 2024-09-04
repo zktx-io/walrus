@@ -5,7 +5,7 @@
 
 use core::fmt::{self, Display};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -132,6 +132,17 @@ pub struct ShardStorage {
     pending_recover_slivers: DBMap<(SliverType, BlobId), ()>,
 }
 
+macro_rules! reopen_cf {
+    ($cf_options:expr, $db:expr, $rw_options:expr) => {{
+        let (cf_name, cf_db_option) = $cf_options;
+        if $db.cf_handle(&cf_name).is_none() {
+            $db.create_cf(&cf_name, &cf_db_option)
+                .map_err(typed_store_err_from_rocks_err)?;
+        }
+        DBMap::reopen($db, Some(&cf_name), &$rw_options, false)?
+    }};
+}
+
 /// Storage corresponding to a single shard.
 impl ShardStorage {
     pub(crate) fn create_or_reopen(
@@ -142,67 +153,32 @@ impl ShardStorage {
     ) -> Result<Self, TypedStoreError> {
         let rw_options = ReadWriteOptions::default();
 
-        // TODO(#766): cleanup all the column family initiation as they are highly repetitive
-        let shard_cf_options = Self::slivers_column_family_options(id, db_config);
-        for (_, (cf_name, options)) in shard_cf_options.iter() {
-            if database.cf_handle(cf_name).is_none() {
-                database
-                    .create_cf(cf_name, options)
-                    .map_err(typed_store_err_from_rocks_err)?;
-            }
-        }
+        let primary_slivers = reopen_cf!(
+            Self::primary_slivers_column_family_options(id, db_config),
+            database,
+            rw_options
+        );
+        let secondary_slivers = reopen_cf!(
+            Self::secondary_slivers_column_family_options(id, db_config),
+            database,
+            rw_options
+        );
 
-        let shard_status_cf_name = shard_status_column_family_name(id);
-        if database.cf_handle(&shard_status_cf_name).is_none() {
-            let (_, options) = Self::shard_status_column_family_options(id, db_config);
-            database
-                .create_cf(&shard_status_cf_name, &options)
-                .map_err(typed_store_err_from_rocks_err)?;
-        }
-        let shard_sync_progress_cf_name = shard_sync_progress_column_family_name(id);
-        if database.cf_handle(&shard_sync_progress_cf_name).is_none() {
-            let (_, options) = Self::shard_sync_progress_column_family_options(id, db_config);
-            database
-                .create_cf(&shard_sync_progress_cf_name, &options)
-                .map_err(typed_store_err_from_rocks_err)?;
-        }
-        let pending_recover_slivers_cf_name = pending_recover_slivers_column_family_name(id);
-        if database
-            .cf_handle(&pending_recover_slivers_cf_name)
-            .is_none()
-        {
-            let (_, options) = Self::pending_recover_slivers_column_family_options(id, db_config);
-            database
-                .create_cf(&pending_recover_slivers_cf_name, &options)
-                .map_err(typed_store_err_from_rocks_err)?;
-        }
-
-        let primary_slivers = DBMap::reopen(
+        let shard_status = reopen_cf!(
+            Self::shard_status_column_family_options(id, db_config),
             database,
-            Some(shard_cf_options[&SliverType::Primary].0.as_str()),
-            &rw_options,
-            false,
-        )?;
-        let secondary_slivers = DBMap::reopen(
+            rw_options
+        );
+        let shard_sync_progress = reopen_cf!(
+            Self::shard_sync_progress_column_family_options(id, db_config),
             database,
-            Some(shard_cf_options[&SliverType::Secondary].0.as_str()),
-            &rw_options,
-            false,
-        )?;
-        let shard_status =
-            DBMap::reopen(database, Some(&shard_status_cf_name), &rw_options, false)?;
-        let shard_sync_progress = DBMap::reopen(
+            rw_options
+        );
+        let pending_recover_slivers = reopen_cf!(
+            Self::pending_recover_slivers_column_family_options(id, db_config),
             database,
-            Some(&shard_sync_progress_cf_name),
-            &rw_options,
-            false,
-        )?;
-        let pending_recover_slivers = DBMap::reopen(
-            database,
-            Some(&pending_recover_slivers_cf_name),
-            &rw_options,
-            false,
-        )?;
+            rw_options
+        );
 
         if let Some(status) = initial_shard_status {
             shard_status.insert(&(), &status)?;
@@ -309,57 +285,62 @@ impl ShardStorage {
         }
     }
 
-    /// Returns the name and options for the column families for a shard's primary and secondary
+    /// Returns the name and options for the column families for a shard's primary
     /// sliver with the specified index.
-    pub(crate) fn slivers_column_family_options(
+    pub(crate) fn primary_slivers_column_family_options(
         id: ShardIndex,
         db_config: &DatabaseConfig,
-    ) -> HashMap<SliverType, (String, Options)> {
-        [
-            (
-                SliverType::Primary,
-                (
-                    primary_slivers_column_family_name(id),
-                    db_config.shard().to_options(),
-                ),
-            ),
-            (
-                SliverType::Secondary,
-                (
-                    secondary_slivers_column_family_name(id),
-                    db_config.shard().to_options(),
-                ),
-            ),
-        ]
-        .into()
+    ) -> (String, Options) {
+        (
+            base_column_family_name(id) + "/primary-slivers",
+            db_config.shard().to_options(),
+        )
     }
 
+    /// Returns the name and options for the column families for a shard's secondary
+    /// sliver with the specified index.
+    pub(crate) fn secondary_slivers_column_family_options(
+        id: ShardIndex,
+        db_config: &DatabaseConfig,
+    ) -> (String, Options) {
+        (
+            base_column_family_name(id) + "/secondary-slivers",
+            db_config.shard().to_options(),
+        )
+    }
+
+    /// Returns the name and options for the column families for a shard's operating status
+    /// with the specified index.
     pub(crate) fn shard_status_column_family_options(
         id: ShardIndex,
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            shard_status_column_family_name(id),
+            base_column_family_name(id) + "/status",
             db_config.shard_status().to_options(),
         )
     }
 
+    /// Returns the name and options for the column families for a shard's sync progress
+    /// with the specified index.
     pub(crate) fn shard_sync_progress_column_family_options(
         id: ShardIndex,
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            shard_sync_progress_column_family_name(id),
+            base_column_family_name(id) + "/sync-progress",
             db_config.shard_sync_progress().to_options(),
         )
     }
 
+    /// Returns the name and options for the column families for a shard's pending recover slivers
+    /// with the specified index.
     pub(crate) fn pending_recover_slivers_column_family_options(
         id: ShardIndex,
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            pending_recover_slivers_column_family_name(id),
+            base_column_family_name(id) + "/pending-recover-slivers",
             db_config.pending_recover_slivers().to_options(),
         )
     }
@@ -896,31 +877,6 @@ fn id_from_column_family_name(name: &str) -> Option<(ShardIndex, SliverType)> {
 #[inline]
 fn base_column_family_name(id: ShardIndex) -> String {
     format!("shard-{}", id.0)
-}
-
-#[inline]
-fn primary_slivers_column_family_name(id: ShardIndex) -> String {
-    base_column_family_name(id) + "/primary-slivers"
-}
-
-#[inline]
-fn secondary_slivers_column_family_name(id: ShardIndex) -> String {
-    base_column_family_name(id) + "/secondary-slivers"
-}
-
-#[inline]
-fn shard_status_column_family_name(id: ShardIndex) -> String {
-    base_column_family_name(id) + "/status"
-}
-
-#[inline]
-fn shard_sync_progress_column_family_name(id: ShardIndex) -> String {
-    base_column_family_name(id) + "/sync_progress"
-}
-
-#[inline]
-fn pending_recover_slivers_column_family_name(id: ShardIndex) -> String {
-    base_column_family_name(id) + "/pending_recover_slivers"
 }
 
 #[cfg(feature = "failure_injection")]
