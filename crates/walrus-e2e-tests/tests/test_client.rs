@@ -9,6 +9,7 @@ use walrus_core::{
     merkle::Node,
     metadata::VerifiedBlobMetadataWithId,
     BlobId,
+    EpochCount,
     SliverPairIndex,
 };
 use walrus_service::{
@@ -165,7 +166,7 @@ async fn test_inconsistency(failed_shards: &[usize]) -> anyhow::Result<()> {
     // Register blob.
     let blob_sui_object = client
         .as_ref()
-        .reserve_and_register_blob(&metadata, 1)
+        .reserve_and_register_blob(&metadata, 1, false)
         .await?;
 
     // Wait to ensure that the storage nodes received the registration event.
@@ -238,8 +239,8 @@ async_param_test! {
 /// `should_match` is a boolean that indicates if the storage object used in the final upload should
 /// be the same as the first one registered.
 async fn test_store_with_existing_blob_resource(
-    epochs_ahead_registered: u64,
-    epochs_ahead_required: u64,
+    epochs_ahead_registered: EpochCount,
+    epochs_ahead_required: EpochCount,
     should_match: bool,
 ) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -259,7 +260,7 @@ async fn test_store_with_existing_blob_resource(
     // Register a new blob.
     let original_blob_object = client
         .as_ref()
-        .reserve_and_register_blob(&metadata, epochs_ahead_registered)
+        .reserve_and_register_blob(&metadata, epochs_ahead_registered, false)
         .await?;
 
     // Wait to ensure that the storage nodes received the registration event.
