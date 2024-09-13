@@ -38,6 +38,7 @@ use walrus_core::{
     metadata::BlobMetadataWithId,
     BlobId,
     EncodingType,
+    Epoch,
     EpochCount,
 };
 
@@ -156,6 +157,26 @@ pub trait ContractClient: Send + Sync {
         &self,
         include_expired: bool,
     ) -> impl Future<Output = SuiClientResult<Vec<Blob>>> + Send;
+
+    /// Returns the list of [`StorageResource`] objects owned by the wallet currently in use.
+    fn owned_storage(
+        &self,
+        include_expired: bool,
+    ) -> impl Future<Output = SuiClientResult<Vec<StorageResource>>> + Send;
+
+    /// Returns the closest-matching owned storage resources for given size and number of epochs.
+    ///
+    /// Among all the owned [`StorageResource`] objects, returns the one that:
+    /// - has the closest size to `storage_size`; and
+    /// - breaks ties by taking the one with the smallest end epoch that is greater or equal to the
+    ///   requested `end_epoch`.
+    ///
+    /// Returns `None` if no matching storage resource is found.
+    fn owned_storage_for_size_and_epoch(
+        &self,
+        storage_size: u64,
+        end_epoch: Epoch,
+    ) -> impl Future<Output = SuiClientResult<Option<StorageResource>>> + Send;
 
     /// Registers a candidate node.
     fn register_candidate(
@@ -350,7 +371,7 @@ impl SuiContractClient {
     }
 
     /// Adds a call to `reserve_space` to the `pt_builder` and returns the result index.
-    async fn add_reserve_transaction(
+    pub async fn add_reserve_transaction(
         &self,
         pt_builder: &mut ProgrammableTransactionBuilder,
         encoded_size: u64,
@@ -697,12 +718,7 @@ impl ContractClient for SuiContractClient {
     }
 
     async fn owned_blobs(&self, include_expired: bool) -> SuiClientResult<Vec<Blob>> {
-        let current_epoch = if !include_expired {
-            self.read_client.current_committee().await?.epoch
-        } else {
-            0
-        };
-
+        let current_epoch = self.read_client.current_committee().await?.epoch;
         Ok(get_owned_objects::<Blob>(
             &self.read_client.sui_client,
             self.wallet_address,
@@ -712,6 +728,37 @@ impl ContractClient for SuiContractClient {
         .await?
         .filter(|blob| include_expired || blob.storage.end_epoch > current_epoch)
         .collect())
+    }
+
+    async fn owned_storage(&self, include_expired: bool) -> SuiClientResult<Vec<StorageResource>> {
+        let current_epoch = self.read_client.current_committee().await?.epoch;
+        Ok(get_owned_objects::<StorageResource>(
+            &self.read_client.sui_client,
+            self.wallet_address,
+            self.read_client.system_pkg_id,
+            &[],
+        )
+        .await?
+        .filter(|storage| include_expired || storage.end_epoch > current_epoch)
+        .collect())
+    }
+
+    async fn owned_storage_for_size_and_epoch(
+        &self,
+        storage_size: u64,
+        end_epoch: Epoch,
+    ) -> SuiClientResult<Option<StorageResource>> {
+        Ok(self
+            .owned_storage(false)
+            .await?
+            .into_iter()
+            .filter(|storage| {
+                storage.storage_size >= storage_size && storage.end_epoch >= end_epoch
+            })
+            // Pick the smallest storage size. Break ties by comparing the end epoch, and take the
+            // one that is the closest to `end_epoch`. NOTE: we are already sure that these values
+            // are above the minimum.
+            .min_by_key(|a| (a.storage_size, a.end_epoch)))
     }
 }
 
