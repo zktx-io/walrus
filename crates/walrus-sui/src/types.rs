@@ -16,7 +16,17 @@ use anyhow::bail;
 use thiserror::Error;
 
 mod events;
-pub use events::{BlobCertified, BlobEvent, BlobRegistered, InvalidBlobId};
+pub use events::{
+    BlobCertified,
+    BlobEvent,
+    BlobRegistered,
+    ContractEvent,
+    EpochChangeDone,
+    EpochChangeEvent,
+    EpochChangeStart,
+    EpochParametersSelected,
+    InvalidBlobId,
+};
 
 pub mod move_structs;
 pub use move_structs::{
@@ -183,15 +193,6 @@ impl Committee {
     #[inline]
     pub fn is_above_validity(&self, num: usize) -> bool {
         num > usize::from(bft::max_n_faulty(self.n_shards))
-    }
-
-    /// Return the shards handed by the specified storage node,
-    /// based on its index in the committee list.
-    pub fn shards_for_node(&self, node_id: usize) -> Vec<ShardIndex> {
-        self.members
-            .get(node_id)
-            .map(|node| node.shard_ids.clone())
-            .unwrap_or_default()
     }
 
     /// Return the shards handed by the specified storage node, based on its public key.

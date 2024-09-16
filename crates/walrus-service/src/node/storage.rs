@@ -576,7 +576,7 @@ pub(crate) mod tests {
             metadata.metadata().clone(),
         );
 
-        storage.update_blob_info(&BlobEvent::Certified(BlobCertified::for_testing(*blob_id)))?;
+        storage.update_blob_info(&BlobCertified::for_testing(*blob_id).into())?;
 
         storage.put_metadata(metadata.blob_id(), metadata.metadata())?;
         let retrieved = storage.get_metadata(blob_id)?;
@@ -593,10 +593,8 @@ pub(crate) mod tests {
         let metadata = walrus_core::test_utils::verified_blob_metadata();
         let blob_id = metadata.blob_id();
 
-        storage.update_blob_info(&BlobEvent::Registered(BlobRegistered::for_testing(
-            *blob_id,
-        )))?;
-        storage.update_blob_info(&BlobEvent::Certified(BlobCertified::for_testing(*blob_id)))?;
+        storage.update_blob_info(&BlobRegistered::for_testing(*blob_id).into())?;
+        storage.update_blob_info(&BlobCertified::for_testing(*blob_id).into())?;
 
         storage.put_metadata(metadata.blob_id(), metadata.metadata())?;
 

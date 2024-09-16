@@ -31,7 +31,7 @@ use typed_store::{
     rocks::{errors::typed_store_err_from_rocks_err, DBMap, MetricConf, ReadWriteOptions},
     Map,
 };
-use walrus_sui::types::BlobEvent;
+use walrus_sui::types::ContractEvent;
 
 use crate::{EventProcessorConfig, EventSequenceNumber, IndexedStreamElement};
 
@@ -232,13 +232,13 @@ impl EventProcessor {
                         None,
                         move_datatype_layout,
                     )?;
-                    let blob_event: BlobEvent = sui_event.try_into()?;
+                    let contract_event: ContractEvent = sui_event.try_into()?;
                     let event_sequence_number = EventSequenceNumber::new(
                         *checkpoint.checkpoint_summary.sequence_number(),
                         counter,
                     );
                     let walrus_event =
-                        IndexedStreamElement::new(blob_event, event_sequence_number.clone());
+                        IndexedStreamElement::new(contract_event, event_sequence_number.clone());
                     write_batch
                         .insert_batch(
                             &self.event_store,

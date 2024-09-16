@@ -39,6 +39,7 @@ use crate::{
         },
         BlobEvent,
         Committee,
+        ContractEvent,
         StakingObject,
         StorageNode,
         SystemObject,
@@ -69,11 +70,11 @@ pub trait ReadClient: Send + Sync {
     /// after the event with the provided [`EventID`]. Otherwise the event stream contains all
     /// events available from the connected full node. Since the full node may prune old
     /// events, the stream is not guaranteed to contain historic events.
-    fn blob_events(
+    fn event_stream(
         &self,
         polling_interval: Duration,
         cursor: Option<EventID>,
-    ) -> impl Future<Output = SuiClientResult<impl Stream<Item = BlobEvent> + Send>> + Send;
+    ) -> impl Future<Output = SuiClientResult<impl Stream<Item = ContractEvent> + Send>> + Send;
 
     /// Returns the blob event with the given Event ID.
     fn get_blob_event(
@@ -320,12 +321,12 @@ impl ReadClient for SuiReadClient {
             .write_price_per_unit_size)
     }
 
-    async fn blob_events(
+    async fn event_stream(
         &self,
         polling_interval: Duration,
         cursor: Option<EventID>,
-    ) -> SuiClientResult<impl Stream<Item = BlobEvent>> {
-        let (tx_event, rx_event) = mpsc::channel::<BlobEvent>(EVENT_CHANNEL_CAPACITY);
+    ) -> SuiClientResult<impl Stream<Item = ContractEvent>> {
+        let (tx_event, rx_event) = mpsc::channel::<ContractEvent>(EVENT_CHANNEL_CAPACITY);
 
         let event_api = self.sui_client.event_api().clone();
 

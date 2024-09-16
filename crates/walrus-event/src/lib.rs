@@ -11,7 +11,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use sui_types::{event::EventID, messages_checkpoint::CheckpointSequenceNumber};
 use walrus_core::BlobId;
-use walrus_sui::types::BlobEvent;
+use walrus_sui::types::{BlobEvent, ContractEvent};
 
 pub mod event_processor;
 
@@ -64,29 +64,29 @@ impl EventSequenceNumber {
 /// markers
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventStreamElement {
-    BlobEvent(BlobEvent),
+    ContractEvent(ContractEvent),
     CheckpointBoundary,
 }
 
 impl EventStreamElement {
     pub fn event_id(&self) -> Option<EventID> {
         match self {
-            EventStreamElement::BlobEvent(event) => Some(event.event_id()),
+            EventStreamElement::ContractEvent(event) => Some(event.event_id()),
             EventStreamElement::CheckpointBoundary => None,
         }
     }
 
     pub fn blob_id(&self) -> Option<BlobId> {
         match self {
-            EventStreamElement::BlobEvent(event) => Some(event.blob_id()),
+            EventStreamElement::ContractEvent(event) => event.blob_id(),
             EventStreamElement::CheckpointBoundary => None,
         }
     }
 
-    pub fn event(&self) -> Option<&BlobEvent> {
+    pub fn blob_event(&self) -> Option<&BlobEvent> {
         match self {
-            EventStreamElement::BlobEvent(event) => Some(event),
-            EventStreamElement::CheckpointBoundary => None,
+            EventStreamElement::ContractEvent(ContractEvent::BlobEvent(event)) => Some(event),
+            _ => None,
         }
     }
 }
@@ -102,12 +102,13 @@ pub struct IndexedStreamElement {
 
 impl IndexedStreamElement {
     #[allow(dead_code)]
-    pub fn new(blob_event: BlobEvent, event_sequence_number: EventSequenceNumber) -> Self {
+    pub fn new(contract_event: ContractEvent, event_sequence_number: EventSequenceNumber) -> Self {
         Self {
-            element: EventStreamElement::BlobEvent(blob_event),
+            element: EventStreamElement::ContractEvent(contract_event),
             global_sequence_number: event_sequence_number,
         }
     }
+
     /// Creates a new (non-existent) marker event that indicates the end of a checkpoint. This is
     /// used to commit the blob file at the end of every N checkpoints.
     pub fn new_checkpoint_boundary(

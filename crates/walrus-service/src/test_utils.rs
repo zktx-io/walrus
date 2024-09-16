@@ -45,8 +45,8 @@ use walrus_core::{
 use walrus_event::{EventSequenceNumber, EventStreamCursor, IndexedStreamElement};
 use walrus_sdk::client::Client;
 use walrus_sui::types::{
-    BlobEvent,
     Committee,
+    ContractEvent,
     NetworkAddress,
     NodeRegistrationParams,
     StorageNode as SuiStorageNode,
@@ -402,7 +402,7 @@ impl StorageNodeHandleBuilder {
 impl Default for StorageNodeHandleBuilder {
     fn default() -> Self {
         Self {
-            event_provider: Box::<Vec<BlobEvent>>::default(),
+            event_provider: Box::<Vec<ContractEvent>>::default(),
             committee_service_factory: None,
             storage: Default::default(),
             run_rest_api: Default::default(),
@@ -507,7 +507,7 @@ pub struct StubCommitteeService(pub Committee);
 #[async_trait]
 impl CommitteeService for StubCommitteeService {
     fn get_epoch(&self) -> Epoch {
-        0
+        1
     }
 
     fn get_shard_count(&self) -> NonZeroU16 {
@@ -600,7 +600,7 @@ fn try_unused_socket_address() -> anyhow::Result<SocketAddr> {
 }
 
 #[async_trait::async_trait]
-impl SystemEventProvider for Vec<BlobEvent> {
+impl SystemEventProvider for Vec<ContractEvent> {
     async fn events(
         &self,
         _cursor: EventStreamCursor,
@@ -618,7 +618,7 @@ impl SystemEventProvider for Vec<BlobEvent> {
 }
 
 #[async_trait::async_trait]
-impl SystemEventProvider for tokio::sync::broadcast::Sender<BlobEvent> {
+impl SystemEventProvider for tokio::sync::broadcast::Sender<ContractEvent> {
     async fn events(
         &self,
         _cursor: EventStreamCursor,

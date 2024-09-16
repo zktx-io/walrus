@@ -412,7 +412,7 @@ mod tests {
         for i in 0..100 {
             let event = IndexedStreamElement {
                 global_sequence_number: EventSequenceNumber::new(i as u64, 0),
-                element: EventStreamElement::BlobEvent(
+                element: EventStreamElement::ContractEvent(
                     BlobCertified::for_testing(BlobId([7; 32])).into(),
                 ),
             };

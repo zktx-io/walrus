@@ -47,7 +47,7 @@ use walrus_event::event_processor::EventProcessor;
 use walrus_sdk::api::{BlobStatus, ServiceHealthInfo, StoredOnNodeStatus};
 use walrus_sui::{
     client::SuiReadClient,
-    types::{BlobCertified, BlobEvent, InvalidBlobId},
+    types::{BlobCertified, BlobEvent, ContractEvent, EpochChangeEvent, InvalidBlobId},
 };
 
 use self::{
@@ -498,21 +498,48 @@ impl StorageNode {
                     .event_process_duration_seconds
                     .with_label_values(&[stream_element.element.label()])
                     .start_timer();
-                if let Some(blob_event) = stream_element.element.event() {
+                if let Some(blob_event) = stream_element.element.blob_event() {
                     storage.update_blob_info(blob_event)?;
                 }
                 match stream_element.element {
-                    EventStreamElement::BlobEvent(BlobEvent::Certified(event)) => {
+                    EventStreamElement::ContractEvent(ContractEvent::BlobEvent(
+                        BlobEvent::Certified(event),
+                    )) => {
                         self.process_blob_certified_event(element_index, event)
                             .await?;
                     }
-                    EventStreamElement::BlobEvent(BlobEvent::InvalidBlobID(event)) => {
+                    EventStreamElement::ContractEvent(ContractEvent::BlobEvent(
+                        BlobEvent::InvalidBlobID(event),
+                    )) => {
                         self.process_blob_invalid_event(element_index, event)
                             .await?;
                     }
-                    EventStreamElement::BlobEvent(event @ BlobEvent::Registered(_)) => {
+                    EventStreamElement::ContractEvent(ContractEvent::BlobEvent(
+                        BlobEvent::Registered(event),
+                    )) => {
                         self.inner
-                            .mark_event_completed(element_index, &event.event_id())?;
+                            .mark_event_completed(element_index, &event.event_id)?;
+                    }
+                    EventStreamElement::ContractEvent(ContractEvent::EpochChangeEvent(
+                        EpochChangeEvent::EpochParametersSelected(event),
+                    )) => {
+                        tracing::info!("EpochParametersSelected event received: {:?}", event,);
+                        self.inner
+                            .mark_event_completed(element_index, &event.event_id)?;
+                    }
+                    EventStreamElement::ContractEvent(ContractEvent::EpochChangeEvent(
+                        EpochChangeEvent::EpochChangeStart(event),
+                    )) => {
+                        tracing::info!("EpochChangeStart event received: {:?}", event);
+                        self.inner
+                            .mark_event_completed(element_index, &event.event_id)?;
+                    }
+                    EventStreamElement::ContractEvent(ContractEvent::EpochChangeEvent(
+                        EpochChangeEvent::EpochChangeDone(event),
+                    )) => {
+                        tracing::info!("EpochChangeDone event received: {:?}", event);
+                        self.inner
+                            .mark_event_completed(element_index, &event.event_id)?;
                     }
                     EventStreamElement::CheckpointBoundary => {
                         self.inner.mark_element_at_index(element_index)?;
@@ -1156,9 +1183,7 @@ mod tests {
     async fn services_slivers_for_shards_managed_according_to_committee() -> TestResult {
         let shard_for_node = ShardIndex(0);
         let node = StorageNodeHandle::builder()
-            .with_system_event_provider(vec![BlobEvent::Registered(BlobRegistered::for_testing(
-                BLOB_ID,
-            ))])
+            .with_system_event_provider(vec![BlobRegistered::for_testing(BLOB_ID).into()])
             .with_shard_assignment(&[shard_for_node])
             .with_node_started(true)
             .build()
@@ -1191,9 +1216,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(storage.is_stored_at_all_shards(&BLOB_ID)?);
-        events.send(BlobEvent::InvalidBlobID(InvalidBlobId::for_testing(
-            BLOB_ID,
-        )))?;
+        events.send(InvalidBlobId::for_testing(BLOB_ID).into())?;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!storage.is_stored_at_all_shards(&BLOB_ID)?);
@@ -1204,7 +1227,7 @@ mod tests {
     async fn returns_correct_blob_status() -> TestResult {
         let blob_event = BlobRegistered::for_testing(BLOB_ID);
         let node = StorageNodeHandle::builder()
-            .with_system_event_provider(vec![BlobEvent::Registered(blob_event.clone())])
+            .with_system_event_provider(vec![blob_event.clone().into()])
             .with_shard_assignment(&[ShardIndex(0)])
             .with_node_started(true)
             .build()
@@ -1309,9 +1332,7 @@ mod tests {
 
         // create a storage node with a registered event for the blob id
         let node = StorageNodeHandle::builder()
-            .with_system_event_provider(vec![BlobEvent::Registered(BlobRegistered::for_testing(
-                blob_id,
-            ))])
+            .with_system_event_provider(vec![BlobRegistered::for_testing(blob_id).into()])
             .with_shard_assignment(&shards)
             .with_node_started(true)
             .build()
@@ -1495,7 +1516,7 @@ mod tests {
         assignment: &[&[u16]],
         blob: &'a [u8],
         store_at_shard: F,
-    ) -> TestResult<(TestCluster, Sender<BlobEvent>, EncodedBlob)>
+    ) -> TestResult<(TestCluster, Sender<ContractEvent>, EncodedBlob)>
     where
         F: FnMut(&ShardIndex, SliverType) -> bool,
     {
@@ -1525,7 +1546,7 @@ mod tests {
         assignment: &[&[u16]],
         blobs: &[&'a [u8]],
         initial_epoch: Epoch,
-    ) -> TestResult<(TestCluster, Sender<BlobEvent>, Vec<EncodedBlob>)> {
+    ) -> TestResult<(TestCluster, Sender<ContractEvent>, Vec<EncodedBlob>)> {
         let events = Sender::new(48);
 
         let cluster = {
@@ -1961,7 +1982,7 @@ mod tests {
     #[tokio::test]
     async fn sync_shard_node_api_success() -> TestResult {
         let (cluster, _, blob_detail) =
-            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 1).await?;
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 2).await?;
 
         let blob_id = *blob_detail[0].blob_id();
 
@@ -1972,7 +1993,7 @@ mod tests {
                 ShardIndex(0),
                 blob_id,
                 10,
-                1,
+                2,
                 &cluster.nodes[0].as_ref().inner.protocol_key_pair,
             )
             .await;
@@ -2004,7 +2025,7 @@ mod tests {
     async fn sync_shard_do_not_send_certified_after_requested_epoch() -> TestResult {
         // Note that the blobs are certified in epoch 0.
         let (cluster, _, blob_detail) =
-            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 0).await?;
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 1).await?;
 
         let blob_id = *blob_detail[0].blob_id();
 
@@ -2014,7 +2035,7 @@ mod tests {
                 ShardIndex(0),
                 blob_id,
                 10,
-                0,
+                1,
                 &cluster.nodes[0].as_ref().inner.protocol_key_pair,
             )
             .await;
@@ -2030,7 +2051,7 @@ mod tests {
     #[tokio::test]
     async fn sync_shard_node_api_unauthorized_error() -> TestResult {
         let (cluster, _, _) =
-            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 0).await?;
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 1).await?;
 
         let response: Result<SyncShardResponse, walrus_sdk::error::NodeError> = cluster.nodes[0]
             .client
@@ -2050,7 +2071,7 @@ mod tests {
     #[tokio::test]
     async fn sync_shard_node_api_request_verification_error() -> TestResult {
         let (cluster, _, _) =
-            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 0).await?;
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], 1).await?;
 
         let request = SyncShardRequest::new(ShardIndex(0), SliverType::Primary, BLOB_ID, 10, 1);
         let sync_shard_msg = SyncShardMsg::new(1, request);
@@ -2094,12 +2115,6 @@ mod tests {
         let (cluster, _, blob_detail) =
             cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], cluster_epoch)
                 .await?;
-
-        cluster.nodes[0]
-            .storage_node
-            .inner
-            .committee_service
-            .committee();
 
         // Requests a shard from epoch 0.
         let status = cluster.nodes[0]
@@ -2219,7 +2234,7 @@ mod tests {
         let blobs: Vec<[u8; 32]> = (1..24).map(|i| [i; 32]).collect();
         let blobs: Vec<_> = blobs.iter().map(|b| &b[..]).collect();
         let (cluster, _, blob_details) =
-            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &blobs, 1).await?;
+            cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &blobs, 2).await?;
 
         // Makes storage inner mutable so that we can manually add another shard to node 1.
         let node_inner = unsafe {
@@ -2334,7 +2349,7 @@ mod tests {
         let (cluster, blob_details) = cluster_with_partially_stored_blobs_in_shard_0(
             &[&[0], &[1, 2, 3, 4], &[5, 6, 7, 8, 9]],
             &blobs,
-            1,
+            2,
             blob_index_store_at_shard_0,
         )
         .await?;

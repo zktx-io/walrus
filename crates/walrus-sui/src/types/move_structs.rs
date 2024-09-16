@@ -302,6 +302,7 @@ pub(crate) enum EpochState {
     NextParamsSelected(chrono::DateTime<chrono::Utc>),
 }
 
+/// The committee shard assignment.
 type CommitteeShardAssignment = Vec<(ObjectID, Vec<u16>)>;
 
 /// Sui type for inner staking object
