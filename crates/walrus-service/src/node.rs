@@ -2445,12 +2445,15 @@ mod tests {
         Ok(())
     }
 
-    // TODO(#726): We want to migrate the following tests to use Sui failpoint instead of
-    // the public fail crate, since simtest anyway requires Sui failpoint. Also, these tests
-    // should be moved under walrus-simtest.
-    #[cfg(feature = "failure_injection")]
+    #[cfg(msim)]
     mod failure_injection_tests {
-        use fail::FailScenario;
+        use sui_macros::{
+            clear_fail_point,
+            register_fail_point_arg,
+            register_fail_point_if,
+            sim_test,
+        };
+        use walrus_test_utils::simtest_param_test;
 
         use super::*;
 
@@ -2472,8 +2475,8 @@ mod tests {
         // Note that currently, each sync batch contains 10 blobs. So testing various interesting
         // places to break the sync process.
         // TODO(#705): make shard sync parameters configurable.
-        async_param_test! {
-            sync_shard_start_from_progress -> TestResult: [
+        simtest_param_test! {
+            simtest_sync_shard_start_from_progress -> TestResult: [
                 primary1: (1, SliverType::Primary),
                 primary5: (5, SliverType::Primary),
                 primary10: (10, SliverType::Primary),
@@ -2488,28 +2491,19 @@ mod tests {
                 secondary23: (23, SliverType::Secondary),
             ]
         }
-        async fn sync_shard_start_from_progress(
+        async fn simtest_sync_shard_start_from_progress(
             break_index: u64,
             sliver_type: SliverType,
         ) -> TestResult {
             telemetry_subscribers::init_for_testing();
 
-            // This test requires using failpoints to simulate failures.
-            assert!(fail::has_failpoints());
-
             let (cluster, blob_details, shard_storage_dst) =
                 setup_cluster_for_shard_sync_tests().await?;
 
-            let scenario = FailScenario::setup();
-            fail::cfg(
+            register_fail_point_arg(
                 "fail_point_fetch_sliver",
-                format!(
-                    "return({},{})",
-                    sliver_type == SliverType::Primary,
-                    break_index,
-                )
-                .as_str(),
-            )?;
+                move || -> Option<(SliverType, u64)> { Some((sliver_type, break_index)) },
+            );
 
             // Starts the shard syncing process in the new shard, which will fail at the specified
             // break index.
@@ -2536,8 +2530,7 @@ mod tests {
                         < shard_storage_src.sliver_count(SliverType::Secondary)
             );
 
-            // Remove failure injection.
-            scenario.teardown();
+            clear_fail_point("fail_point_fetch_sliver");
 
             // restart the shard syncing process, to simulate a reboot.
             cluster.nodes[1]
@@ -2558,18 +2551,14 @@ mod tests {
         // Tests that there is a discrepancy between the source and destination shards in terms
         // of certified blobs. If the source doesn't return any blobs, the destination should
         // finish the sync process.
-        #[tokio::test]
-        async fn sync_shard_src_return_empty() -> TestResult {
+        #[sim_test]
+        async fn simtest_sync_shard_src_return_empty() -> TestResult {
             telemetry_subscribers::init_for_testing();
-
-            // This test requires using failpoints to simulate failures.
-            assert!(fail::has_failpoints());
 
             let (cluster, _blob_details, _shard_storage_dst) =
                 setup_cluster_for_shard_sync_tests().await?;
 
-            let scenario = FailScenario::setup();
-            fail::cfg("fail_point_sync_shard_return_empty", "return")?;
+            register_fail_point_if("fail_point_sync_shard_return_empty", || true);
 
             // Starts the shard syncing process in the new shard, which will fail at the specified
             // break index.
@@ -2582,16 +2571,13 @@ mod tests {
             // Waits for the shard sync process to stop.
             wait_until_no_sync_tasks(&cluster.nodes[1].storage_node._shard_sync_handler).await?;
 
-            // Remove failure injection.
-            scenario.teardown();
-
             Ok(())
         }
 
         // Tests crash recovery of shard transfer partially using shard recovery functionality
         // and partially using shard sync.
-        async_param_test! {
-            sync_shard_shard_recovery_restart -> TestResult: [
+        simtest_param_test! {
+            simtest_sync_shard_shard_recovery_restart -> TestResult: [
                 primary1: (1, SliverType::Primary, false),
                 primary5: (5, SliverType::Primary, false),
                 primary10: (10, SliverType::Primary, false),
@@ -2601,29 +2587,21 @@ mod tests {
                 restart_after_recovery: (10, SliverType::Secondary, true),
             ]
         }
-        async fn sync_shard_shard_recovery_restart(
+        async fn simtest_sync_shard_shard_recovery_restart(
             break_index: u64,
             sliver_type: SliverType,
             restart_after_recovery: bool,
         ) -> TestResult {
             telemetry_subscribers::init_for_testing();
 
-            // This test requires using failpoints to simulate failures.
-            assert!(fail::has_failpoints());
-
-            let scenario = FailScenario::setup();
-            if restart_after_recovery {
-                fail::cfg("fail_point_after_start_recovery", "return")?;
-            } else {
-                fail::cfg(
+            register_fail_point_if("fail_point_after_start_recovery", move || {
+                restart_after_recovery
+            });
+            if !restart_after_recovery {
+                register_fail_point_arg(
                     "fail_point_fetch_sliver",
-                    format!(
-                        "return({},{})",
-                        sliver_type == SliverType::Primary,
-                        break_index,
-                    )
-                    .as_str(),
-                )?;
+                    move || -> Option<(SliverType, u64)> { Some((sliver_type, break_index)) },
+                );
             }
 
             let skip_stored_blob_index: [usize; 12] = [3, 4, 5, 9, 10, 11, 15, 18, 19, 20, 21, 22];
@@ -2663,8 +2641,10 @@ mod tests {
                 );
             }
 
-            // Remove failure injection.
-            scenario.teardown();
+            clear_fail_point("fail_point_after_start_recovery");
+            if !restart_after_recovery {
+                clear_fail_point("fail_point_fetch_sliver");
+            }
 
             // restart the shard syncing process, to simulate a reboot.
             cluster.nodes[1]
