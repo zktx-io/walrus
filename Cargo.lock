@@ -11963,6 +11963,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "walrus-proc-macros"
+version = "0.1.0"
+dependencies = [
+ "quote 1.0.36",
+ "sui-macros",
+ "syn 2.0.75",
+]
+
+[[package]]
 name = "walrus-sdk"
 version = "0.1.0"
 dependencies = [
@@ -12053,6 +12062,7 @@ dependencies = [
  "utoipa-redoc",
  "walrus-core",
  "walrus-event",
+ "walrus-proc-macros",
  "walrus-sdk",
  "walrus-sui",
  "walrus-test-utils",
@@ -12070,6 +12080,7 @@ dependencies = [
  "tokio",
  "tracing",
  "walrus-core",
+ "walrus-proc-macros",
  "walrus-service",
  "walrus-sui",
  "walrus-test-utils",

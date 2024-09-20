@@ -115,6 +115,7 @@ walrus-test-utils = { workspace = true, optional = true }
 mockall.workspace = true
 tempfile.workspace = true
 walrus-core = { workspace = true, features = ["test-utils"] }
+walrus-proc-macros.workspace = true
 walrus-test-utils.workspace = true
 
 [lints]
