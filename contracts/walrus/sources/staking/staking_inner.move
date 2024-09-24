@@ -11,17 +11,18 @@
 // - advance_epoch - initiates the epoch change
 // - initiate epoch change - bumped in `advance_epoch`
 // - get "epoch_sync_done" event
-#[allow(unused_variable, unused_use, unused_mut_parameter)]
 module walrus::staking_inner;
 
-use std::string::String;
+use std::{
+    fixed_point32::FixedPoint32,
+    string::String,
+};
 use sui::{
     balance::{Self, Balance},
     clock::Clock,
     coin::Coin,
     object_table::{Self, ObjectTable},
-    sui::SUI,
-    vec_map::{Self, VecMap}
+    vec_map,
 };
 use wal::wal::WAL;
 use walrus::{
@@ -30,9 +31,9 @@ use walrus::{
     committee::{Self, Committee},
     epoch_parameters::{Self, EpochParams},
     events,
-    staked_wal::{Self, StakedWal},
+    staked_wal::StakedWal,
     staking_pool::{Self, StakingPool},
-    storage_node::{Self, StorageNodeCap, StorageNodeInfo},
+    storage_node::{StorageNodeCap },
     walrus_context::{Self, WalrusContext}
 };
 
@@ -60,6 +61,9 @@ const EWrongEpochState: vector<u8> = b"Current epoch state does not allow this o
 
 #[error]
 const EDuplicateSyncDone: vector<u8> = b"Node already attested that sync is done for this epoch";
+
+#[error]
+const ENoStake: vector<u8> = b"Total stake is zero for apportionment";
 
 /// The epoch state.
 public enum EpochState has store, copy, drop {
@@ -176,12 +180,13 @@ public(package) fun create_pool(
 }
 
 /// Blocks staking for the pool, marks it as "withdrawing".
+#[allow(unused_mut_parameter)]
 public(package) fun withdraw_node(self: &mut StakingInnerV1, cap: &mut StorageNodeCap) {
     let wctx = &self.new_walrus_context();
     self.pools[cap.node_id()].set_withdrawing(wctx);
 }
 
-public(package) fun collect_commission(self: &mut StakingInnerV1, cap: &StorageNodeCap): Coin<WAL> {
+public(package) fun collect_commission(_: &mut StakingInnerV1, _: &StorageNodeCap): Coin<WAL> {
     abort ENotImplemented
 }
 
@@ -356,34 +361,161 @@ public(package) fun has_pool(self: &StakingInnerV1, node_id: ID): bool {
 public(package) fun select_committee(self: &mut StakingInnerV1) {
     assert!(self.next_committee.is_none());
 
-    let shard_threshold = self.active_set.total_stake() / (self.n_shards as u64);
-    let mut shards_assigned: u16 = 0;
-
-    let mut distribution = vec_map::from_keys_values(
-        self.active_set.active_ids(),
-        self.active_set.active_ids().map_ref!(|node_id| {
-            let value = (self.active_set[node_id] / shard_threshold) as u16;
-            shards_assigned = shards_assigned + value;
-            value
-        }),
-    );
-
-    // Just distribute remaining shards to first node.
-    // TODO: change to correct apportionment algorithm.
-    if (shards_assigned < self.n_shards) {
-        let (_first_node, shards) = distribution.get_entry_by_idx_mut(0);
-        *shards = *shards + (self.n_shards - shards_assigned);
-    };
+    let active_ids = self.active_set.active_ids();
+    let values = self.apportionment();
+    let distribution = vec_map::from_keys_values(active_ids, values);
 
     // if we're dealing with the first epoch, we need to assign the shards to the
     // nodes in a sequential manner. Assuming there's at least 1 node in the set.
-    let committee = if (self.committee.size() == 0) {
-        committee::initialize(distribution)
-    } else {
-        self.committee.transition(distribution)
-    };
+    let committee =
+        if (self.committee.size() == 0) committee::initialize(distribution)
+        else self.committee.transition(distribution);
 
     self.next_committee = option::some(committee);
+}
+
+fun apportionment(self: &StakingInnerV1): vector<u16> {
+    let active_ids = self.active_set.active_ids();
+    let stake = active_ids.map_ref!(|node_id| self.active_set[node_id]);
+    // TODO better ranking
+    let ranking = {
+        // TODO use std::vector::tabulate
+        let mut v = vector[];
+        stake.length().do!(|i| v.push_back(i));
+        v
+    };
+    let (_price, shards) = dhondt(ranking, self.n_shards, stake);
+    shards
+}
+
+// Implementation of the D'Hondt method (aka Jefferson method) for apportionment.
+// TODO: currently because of Fixedpoint32, there is a "low" limit on the `total_stake`.
+// Assuming 1000 shards (and ignoring the number of nodes), the limit for the total stake is
+// 4,000,000,000,000 (4e12).
+fun dhondt(
+    // A ranking of the nodes by index in the `stake` vector. The lower the index, the higher the
+    // rank. So the first index in this vector is the node that has the highest precedence for
+    // additional shards.
+    ranking: vector<u64>,
+    n_shards: u16,
+    stake: vector<u64>,
+): (FixedPoint32, vector<u16>) {
+    use std::fixed_point32::{
+        divide_u64 as u64_div,
+        create_from_rational as from_rational,
+        create_from_raw_value as from_raw,
+        get_raw_value as to_raw,
+    };
+
+    let total_stake = stake.fold!(0, |acc, x| acc + x);
+    let n_nodes = stake.length();
+    let n_shards = n_shards as u64;
+    assert!(total_stake > 0, ENoStake);
+
+    // initial price guess following Pukelsheim
+    let mut price = from_rational(total_stake, n_shards + (n_nodes / 2));
+    if (n_nodes == 0) return (price, vector[]);
+    let mut shards = stake.map_ref!(|s| u64_div(*s, price));
+    let mut n_shards_distributed = shards.fold!(0, |acc, x| acc + x);
+    // loop until all shards are distributed
+    while (n_shards_distributed != n_shards) {
+        n_shards_distributed = if (n_shards_distributed < n_shards) {
+                // We decrease the price slightly such that some nodes get an additional shard.
+                price = from_raw(0);
+                let mut at_threshold = vector[];
+                let mut i = 0;
+                stake.zip_do_ref!(&shards, |s, m| {
+                    let threshold_price = from_rational(*s, *m + 1);
+                    if (threshold_price.to_raw() > price.to_raw()) {
+                        price = threshold_price;
+                        at_threshold = vector[i];
+                    } else if (threshold_price == price) {
+                        at_threshold.push_back(i);
+                    };
+                    i = i + 1;
+                });
+
+                let adjusted_distribution = n_shards_distributed + at_threshold.length();
+                if (adjusted_distribution <= n_shards) {
+                    // We give one additional shard to all nodes with the same threshold price.
+                    at_threshold.do!(|n| *&mut shards[n] = shards[n] + 1);
+                    adjusted_distribution
+                } else {
+                    // If there are more nodes with the same threshold price than additional shards
+                    // to distribute, we only give an additional shard to a subset according to
+                    // their rank so that `n_shards_distributed == n_shards`.
+                    let mut to_give = n_shards - n_shards_distributed;
+                    // Iterate over the ranking, giving shards from the nodes with the highest
+                    // rank first.
+                    ranking.length().do!(|i| {
+                        if (to_give == 0) return;
+                        let idx = &ranking[i];
+                        if (at_threshold.contains(idx)) {
+                            *&mut shards[*idx] = shards[*idx] + 1;
+                            to_give = to_give - 1;
+                        }
+                    });
+                    n_shards
+                }
+            } else {
+                // We increase the price slightly such that some nodes get one fewer shard.
+                price = from_raw(0xFFFF_FFFF_FFFF_FFFF); // TODO: use std::u64::max_value!()
+                let mut at_threshold = vector[];
+                let mut i = 0;
+                stake.zip_do_ref!(&shards, |s, m| {
+                    let m = *m;
+                    if (m != 0) {
+                        let threshold_price = from_rational(*s, m);
+                        if (threshold_price.to_raw() < price.to_raw()) {
+                            price = threshold_price;
+                            at_threshold = vector[i];
+                        } else if (threshold_price == price) {
+                            at_threshold.push_back(i);
+                        }
+                    };
+                    i = i + 1;
+                });
+                // `at_threshold.length() <= n_shards_distributed` due to the check `m != 0` above.
+                let adjusted_distribution = n_shards_distributed - at_threshold.length();
+                if (adjusted_distribution >= n_shards) {
+                    // We increase the price slightly above the threshold such that all nodes at
+                    // the threshold lose one shard.
+                    // price += 1 / 4000000000
+                    price = price.add(from_raw(1));
+                    at_threshold.do!(|n| *&mut shards[n] = shards[n] - 1);
+                    adjusted_distribution
+                } else {
+                    // If there are more nodes with the same threshold price than shards to take
+                    // away, we only remove a shard from a subset according to their rank so that
+                    // `n_shards_distributed == n_shards`. In this case, the price remains at the
+                    // threshold.
+                    let mut to_take = n_shards_distributed - n_shards;
+                    let n = ranking.length();
+                    n.do!(|i| {
+                        if (to_take == 0) return;
+                        let idx = &ranking[n - 1 - i];
+                        if (at_threshold.contains(idx)) {
+                            *&mut shards[*idx] = shards[*idx] - 1;
+                            to_take = to_take - 1;
+                        }
+                    });
+                    n_shards
+                }
+            }
+    };
+    (price, shards.map!(|s| s as u16))
+}
+
+use fun fp_add as FixedPoint32.add;
+fun fp_add(a: FixedPoint32, b: FixedPoint32): FixedPoint32 {
+    use std::fixed_point32::{
+        create_from_raw_value as from_raw,
+        get_raw_value as to_raw,
+    };
+    let sum = (a.to_raw() as u128) + (b.to_raw() as u128);
+    // TODO use std::u64::max_value!()
+    assert!(sum <= 0xFFFF_FFFF_FFFF_FFFF);
+    from_raw(sum as u64)
 }
 
 /// Initiates the epoch change if the current time allows.
@@ -511,4 +643,19 @@ public(package) fun borrow(self: &StakingInnerV1, node_id: ID): &StakingPool {
 /// Get mutable reference to the pool with the given `ID`.
 public(package) fun borrow_mut(self: &mut StakingInnerV1, node_id: ID): &mut StakingPool {
     &mut self.pools[node_id]
+}
+
+#[test_only]
+public(package) fun pub_dhondt(
+    n_shards: u16,
+    stake: vector<u64>,
+): (FixedPoint32, vector<u16>) {
+    // TODO better ranking
+    let ranking = {
+        // TODO use std::vector::tabulate
+        let mut v = vector[];
+        stake.length().do!(|i| v.push_back(i));
+        v
+    };
+    dhondt(ranking, n_shards, stake)
 }

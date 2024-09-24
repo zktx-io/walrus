@@ -5,6 +5,7 @@ module walrus::staking_inner_tests;
 
 use sui::{balance, clock, test_utils::destroy};
 use walrus::{staking_inner, storage_node, test_utils as test};
+use std::unit_test::assert_eq;
 
 const EPOCH_DURATION: u64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -177,4 +178,81 @@ fun test_epoch_sync_done_duplicate() {
     destroy(wal_bob);
     cap.destroy_cap_for_testing();
     clock.destroy_for_testing();
+}
+
+fun dhondt_case(
+    shards: u16,
+    stake: vector<u64>,
+    expected: vector<u16>,
+) {
+    use walrus::staking_inner::pub_dhondt as dhondt;
+    let (_price, allocation) = dhondt(shards, stake);
+    assert_eq!(allocation, expected);
+    assert_eq!(allocation.sum!(), shards);
+}
+
+#[test]
+fun test_dhondt_basic() {
+    // even
+    let stake = vector[25000, 25000, 25000, 25000];
+    dhondt_case(4, stake, vector[1, 1, 1, 1]);
+    dhondt_case(778, stake, vector[195, 195, 194, 194]);
+    dhondt_case(1000, stake, vector[250, 250, 250, 250]);
+    // uneven
+    let stake = vector[50000, 30000, 15000, 5000];
+    dhondt_case(4, stake, vector[3, 1, 0, 0]);
+    dhondt_case(777, stake, vector[390, 233, 116, 38]);
+    dhondt_case(1000, stake, vector[500, 300, 150, 50]);
+    // uneven+even
+    let stake = vector[50000, 50000, 30000, 15000, 15000, 5000];
+    dhondt_case(4, stake, vector[2, 1, 1, 0, 0, 0]);
+    dhondt_case(777, stake, vector[236, 236, 142, 70, 70, 23]);
+    dhondt_case(1000, stake, vector[303, 303, 182, 91, 91, 30]);
+}
+
+#[test]
+fun test_dhondt_ties() {
+    // even
+    let stake = vector[25000, 25000, 25000, 25000];
+    dhondt_case(7, stake, vector[2, 2, 2, 1]);
+    dhondt_case(6, stake, vector[2, 2, 1, 1]);
+    // small uneven stake
+    let stake = vector[200, 200, 200, 100];
+    dhondt_case(7, stake, vector[2, 2, 2, 1]);
+    let stake = vector[200, 200, 200, 100, 100, 100];
+    dhondt_case(9, stake, vector[2, 2, 2, 1, 1, 1]);
+    // tie with many solutions
+    let stake = vector[780_000, 650_000, 520_000, 390_000, 260_000];
+    dhondt_case(18, stake, vector[6, 5, 4, 2, 1]);
+}
+
+#[test]
+fun test_dhondt_edge_case() {
+    // no shards
+    let stake = vector[100, 90, 80];
+    dhondt_case(0, stake, vector[0, 0, 0]);
+    // low stake
+    let stake = vector[1, 0, 0];
+    dhondt_case(5, stake, vector[5, 0, 0]);
+    // nearly identical stake
+    let s = 1_000_000;
+    let stake = vector[s, s - 1];
+    dhondt_case(3, stake, vector[2, 1]);
+    // large stake
+    let stake = vector[1_000_000_000_000, 900_000_000_000, 100_000_000_000];
+    dhondt_case(500, stake, vector[250, 225, 25]);
+}
+
+#[test, expected_failure(abort_code = walrus::staking_inner::ENoStake)]
+fun test_dhondt_no_stake() {
+    let stake = vector[0, 0, 0];
+    dhondt_case(0, stake, vector[0, 0, 0]);
+}
+
+use fun sum as vector.sum;
+macro fun sum<$T>($v: vector<$T>): $T {
+    let v = $v;
+    let mut acc = (0: $T);
+    v.do!(|e| acc = acc + e);
+    acc
 }
