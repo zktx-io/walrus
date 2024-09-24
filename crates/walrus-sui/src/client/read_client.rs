@@ -7,6 +7,7 @@ use std::{
     collections::BTreeSet,
     fmt::{self, Debug},
     future::Future,
+    num::NonZeroU16,
     time::Duration,
 };
 
@@ -27,12 +28,13 @@ use sui_types::{
 use tokio::sync::{mpsc, OnceCell};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tracing::{instrument, Instrument};
-use walrus_core::ensure;
+use walrus_core::{ensure, Epoch};
 
 use super::{SuiClientError, SuiClientResult};
 use crate::{
     types::{
         move_structs::{
+            EpochState,
             StakingObjectForDeserialization,
             StakingPool,
             SystemObjectForDeserialization,
@@ -54,6 +56,15 @@ use crate::{
 
 const EVENT_MODULE: &str = "events";
 const MULTI_GET_OBJ_LIMIT: usize = 50;
+
+/// The current, previous, and next committee, and the current epoch state.
+#[derive(Debug)]
+pub struct CommitteesAndState {
+    pub current: Committee,
+    pub previous: Committee,
+    pub next: Option<Committee>,
+    pub epoch_state: EpochState,
+}
 
 /// Trait to read system state information and events from chain.
 pub trait ReadClient: Send + Sync {
@@ -84,6 +95,26 @@ pub trait ReadClient: Send + Sync {
 
     /// Returns the current committee.
     fn current_committee(&self) -> impl Future<Output = SuiClientResult<Committee>> + Send;
+
+    /// Returns the previous committee.
+    // INV: current_committee.epoch == previous_committee.epoch + 1
+    fn previous_committee(&self) -> impl Future<Output = SuiClientResult<Committee>> + Send;
+
+    /// Returns the committee that will become active in the next epoch.
+    ///
+    /// This committee is `None` until known.
+    // INV: upcoming_committee.epoch == current_committee.epoch + 1
+    fn next_committee(&self) -> impl Future<Output = SuiClientResult<Option<Committee>>> + Send;
+
+    /// Returns the current epoch state.
+    fn epoch_state(&self) -> impl Future<Output = SuiClientResult<EpochState>> + Send;
+
+    /// Returns the current, previous, and next committee, along with the current epoch state.
+    ///
+    /// The order of the returned tuple is `(current, previous, Option<next>, epoch_state)`.
+    fn get_committees_and_state(
+        &self,
+    ) -> impl Future<Output = SuiClientResult<CommitteesAndState>> + Send;
 }
 
 /// Client implementation for interacting with the Walrus smart contracts.
@@ -301,6 +332,76 @@ impl SuiReadClient {
         let inner = get_sui_object(&self.sui_client, dynamic_field_info.object_id).await?;
         Ok(StakingObject { id, version, inner })
     }
+
+    async fn shard_assignment_to_committee(
+        &self,
+        epoch: Epoch,
+        n_shards: NonZeroU16,
+        shard_assignment: &[(ObjectID, Vec<u16>)],
+    ) -> SuiClientResult<Committee> {
+        let mut node_object_responses = vec![];
+        for obj_id_batch in shard_assignment.chunks(MULTI_GET_OBJ_LIMIT) {
+            node_object_responses.extend(
+                self.sui_client
+                    .read_api()
+                    .multi_get_object_with_options(
+                        obj_id_batch
+                            .iter()
+                            .map(|(obj_id, _shards)| *obj_id)
+                            .collect(),
+                        SuiObjectDataOptions::new().with_type().with_bcs(),
+                    )
+                    .await?,
+            );
+        }
+
+        let nodes = shard_assignment
+            .iter()
+            .zip(node_object_responses)
+            .map(|((obj_id, shards), obj_response)| {
+                let mut storage_node =
+                    get_sui_object_from_object_response::<StakingPool>(&obj_response)?.node_info;
+                storage_node.shard_ids = shards.iter().map(|index| index.into()).collect();
+                ensure!(
+                    *obj_id == storage_node.node_id,
+                    anyhow!("the object id of the staking pool does not match the node id")
+                );
+                Ok::<StorageNode, anyhow::Error>(storage_node)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Committee::new(nodes, epoch, n_shards).map_err(|err| SuiClientError::Internal(err.into()))
+    }
+
+    /// Queries the full note and gets the requested committee from the staking object.
+    async fn query_staking_for_committee(
+        &self,
+        which_committee: WhichCommittee,
+    ) -> SuiClientResult<Option<Committee>> {
+        let staking_object = self.get_staking_object().await?;
+        let epoch = staking_object.inner.epoch;
+        let n_shards = staking_object.inner.n_shards;
+
+        let (committee, committee_epoch) = match which_committee {
+            WhichCommittee::Current => (Some(staking_object.inner.committee), epoch),
+            WhichCommittee::Previous => (Some(staking_object.inner.previous_committee), epoch - 1),
+            WhichCommittee::Next => (staking_object.inner.next_committee, epoch + 1),
+        };
+
+        if let Some(shard_assignment) = committee {
+            Ok(Some(
+                self.shard_assignment_to_committee(committee_epoch, n_shards, &shard_assignment)
+                    .await?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+enum WhichCommittee {
+    Current,
+    Previous,
+    Next,
 }
 
 impl ReadClient for SuiReadClient {
@@ -352,44 +453,65 @@ impl ReadClient for SuiReadClient {
     }
 
     async fn current_committee(&self) -> SuiClientResult<Committee> {
-        let staking_object = self.get_staking_object().await?;
-        let shard_assignment = staking_object.inner.committee;
-        let mut node_object_responses = vec![];
-        for obj_id_batch in shard_assignment.chunks(MULTI_GET_OBJ_LIMIT) {
-            node_object_responses.extend(
-                self.sui_client
-                    .read_api()
-                    .multi_get_object_with_options(
-                        obj_id_batch
-                            .iter()
-                            .map(|(obj_id, _shards)| *obj_id)
-                            .collect(),
-                        SuiObjectDataOptions::new().with_type().with_bcs(),
-                    )
-                    .await?,
-            );
-        }
-
-        let nodes = shard_assignment
-            .iter()
-            .zip(node_object_responses)
-            .map(|((obj_id, shards), obj_response)| {
-                let mut storage_node =
-                    get_sui_object_from_object_response::<StakingPool>(&obj_response)?.node_info;
-                storage_node.shard_ids = shards.iter().map(|index| index.into()).collect();
-                ensure!(
-                    *obj_id == storage_node.node_id,
-                    anyhow!("the object id of the staking pool does not match the node id")
-                );
-                Ok::<StorageNode, anyhow::Error>(storage_node)
+        tracing::debug!("getting current committee from Sui");
+        self.query_staking_for_committee(WhichCommittee::Current)
+            .await
+            .map(|committee| {
+                committee.expect("the current committee is always defined in the staking object")
             })
-            .collect::<Result<Vec<_>>>()?;
-        Committee::new(
-            nodes,
-            staking_object.inner.epoch,
-            staking_object.inner.n_shards,
-        )
-        .map_err(|err| SuiClientError::Internal(err.into()))
+    }
+
+    async fn previous_committee(&self) -> SuiClientResult<Committee> {
+        tracing::debug!("getting previous committee from Sui");
+        self.query_staking_for_committee(WhichCommittee::Previous)
+            .await
+            .map(|committee| {
+                committee.expect("the previous committee is always defined in the staking object")
+            })
+    }
+
+    async fn next_committee(&self) -> SuiClientResult<Option<Committee>> {
+        tracing::debug!("getting next committee from Sui");
+        self.query_staking_for_committee(WhichCommittee::Next).await
+    }
+
+    async fn epoch_state(&self) -> SuiClientResult<EpochState> {
+        self.get_staking_object()
+            .await
+            .map(|staking| staking.inner.epoch_state)
+    }
+
+    async fn get_committees_and_state(&self) -> SuiClientResult<CommitteesAndState> {
+        let staking_object = self.get_staking_object().await?;
+        let epoch = staking_object.inner.epoch;
+        let n_shards = staking_object.inner.n_shards;
+
+        let current = self
+            .shard_assignment_to_committee(epoch, n_shards, &staking_object.inner.committee)
+            .await?;
+        let previous = self
+            .shard_assignment_to_committee(
+                epoch - 1,
+                n_shards,
+                &staking_object.inner.previous_committee,
+            )
+            .await?;
+        let epoch_state = staking_object.inner.epoch_state;
+        let next = if let Some(next_committee_assignment) = staking_object.inner.next_committee {
+            Some(
+                self.shard_assignment_to_committee(epoch + 1, n_shards, &next_committee_assignment)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok(CommitteesAndState {
+            current,
+            previous,
+            next,
+            epoch_state,
+        })
     }
 }
 
