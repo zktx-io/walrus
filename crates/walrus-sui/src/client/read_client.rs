@@ -58,11 +58,19 @@ const EVENT_MODULE: &str = "events";
 const MULTI_GET_OBJ_LIMIT: usize = 50;
 
 /// The current, previous, and next committee, and the current epoch state.
+///
+/// This struct is only used to pass the information on committees and state. No invariants are
+/// checked here, but possibly enforced by the crators and consumers of the struct.
 #[derive(Debug)]
 pub struct CommitteesAndState {
+    /// The current committee.
     pub current: Committee,
-    pub previous: Committee,
+    /// The previous committee.
+    // TODO(giac): change to option
+    pub previous: Option<Committee>,
+    /// The next committee.
     pub next: Option<Committee>,
+    /// The epoch state for the current epoch.
     pub epoch_state: EpochState,
 }
 
@@ -103,7 +111,7 @@ pub trait ReadClient: Send + Sync {
     /// Returns the committee that will become active in the next epoch.
     ///
     /// This committee is `None` until known.
-    // INV: upcoming_committee.epoch == current_committee.epoch + 1
+    // INV: next_committee.epoch == current_committee.epoch + 1
     fn next_committee(&self) -> impl Future<Output = SuiClientResult<Option<Committee>>> + Send;
 
     /// Returns the current epoch state.
@@ -489,13 +497,19 @@ impl ReadClient for SuiReadClient {
         let current = self
             .shard_assignment_to_committee(epoch, n_shards, &staking_object.inner.committee)
             .await?;
-        let previous = self
-            .shard_assignment_to_committee(
-                epoch - 1,
-                n_shards,
-                &staking_object.inner.previous_committee,
+        let previous = if epoch == 0 {
+            // There is no previous epoch.
+            None
+        } else {
+            Some(
+                self.shard_assignment_to_committee(
+                    epoch - 1,
+                    n_shards,
+                    &staking_object.inner.previous_committee,
+                )
+                .await?,
             )
-            .await?;
+        };
         let epoch_state = staking_object.inner.epoch_state;
         let next = if let Some(next_committee_assignment) = staking_object.inner.next_committee {
             Some(
