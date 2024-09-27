@@ -176,7 +176,7 @@ where
         starting_blob_id: BlobId,
         sliver_count: u64,
         sliver_type: SliverType,
-        shard_owner_epoch: Epoch,
+        current_epoch: Epoch,
         key_pair: &ProtocolKeyPair,
     ) -> Result<Vec<(BlobId, Sliver)>, SyncShardClientError> {
         let committee = self
@@ -184,7 +184,7 @@ where
             .committee_tracker
             .borrow()
             .committees()
-            .committee_for_epoch(shard_owner_epoch)
+            .committee_for_epoch(current_epoch - 1)
             .ok_or(SyncShardClientError::NoSyncClient)?
             .clone();
 
@@ -212,7 +212,7 @@ where
                 starting_blob_id,
                 sliver_count,
                 sliver_type,
-                shard_owner_epoch,
+                current_epoch,
                 key_pair: key_pair.clone(),
             })
             .map_ok(Response::into_value)
@@ -367,13 +367,17 @@ where
         local_identity: Option<PublicKey>,
         rng: StdRng,
     ) -> Result<Self, anyhow::Error> {
-        // TODO(jsmith): Accept committees with change in progress
-        assert!(!committee_tracker.is_change_in_progress());
-        let initial_committee = committee_tracker.committees().current_committee();
-
-        let services = create_services_from_committee(
+        let committees = committee_tracker.committees();
+        let mut services = create_services_from_committee(
             &mut service_factory,
-            initial_committee,
+            committees.current_committee(),
+            &encoding_config,
+        )
+        .await?;
+        add_members_from_committee(
+            &mut services,
+            &mut service_factory,
+            committees.current_committee(),
             &encoding_config,
         )
         .await?;
@@ -529,20 +533,19 @@ where
     ) -> Result<(), BeginCommitteeChangeError> {
         let expected_next_epoch = self.inner.committee_tracker.borrow().next_epoch();
 
-        ensure!(
-            new_epoch <= expected_next_epoch,
-            BeginCommitteeChangeError::EpochIsNotSequential {
+        if new_epoch > expected_next_epoch {
+            return Err(BeginCommitteeChangeError::EpochIsNotSequential {
                 expected: expected_next_epoch,
                 actual: new_epoch,
-            }
-        );
-        ensure!(
-            new_epoch >= expected_next_epoch,
-            BeginCommitteeChangeError::EpochIsNotGreater {
+            });
+        } else if new_epoch == expected_next_epoch - 1 {
+            return Err(BeginCommitteeChangeError::EpochIsTheSameAsCurrent);
+        } else if new_epoch < expected_next_epoch - 1 {
+            return Err(BeginCommitteeChangeError::EpochIsLess {
                 expected: expected_next_epoch,
                 actual: new_epoch,
-            }
-        );
+            });
+        }
         debug_assert_eq!(new_epoch, expected_next_epoch);
 
         let latest = self

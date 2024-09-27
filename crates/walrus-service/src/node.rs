@@ -3,17 +3,18 @@
 
 //! Walrus storage node.
 
-use std::{future::Future, num::NonZeroU16, sync::Arc};
+use std::{future::Future, num::NonZeroU16, pin::Pin, sync::Arc};
 
 use anyhow::{anyhow, bail, Context};
+use committee::{BeginCommitteeChangeError, EndCommitteeChangeError};
 use fastcrypto::traits::KeyPair;
-use futures::{StreamExt, TryFutureExt};
+use futures::{Stream, StreamExt, TryFutureExt};
 use futures_util::stream;
 use prometheus::Registry;
 use serde::Serialize;
 use shard_sync::ShardSyncHandler;
-use sui_types::{digests::TransactionDigest, event::EventID};
-use tokio::{select, time::Instant};
+use sui_types::{base_types::ObjectID, digests::TransactionDigest, event::EventID};
+use tokio::{select, sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{field, Instrument};
 use typed_store::{rocks::MetricConf, DBMetrics, TypedStoreError};
@@ -43,7 +44,7 @@ use walrus_core::{
     SliverPairIndex,
     SliverType,
 };
-use walrus_event::event_processor::EventProcessor;
+use walrus_event::{event_processor::EventProcessor, IndexedStreamElement};
 use walrus_sdk::api::{BlobStatus, ServiceHealthInfo, StoredOnNodeStatus};
 use walrus_sui::{
     client::SuiReadClient,
@@ -52,8 +53,11 @@ use walrus_sui::{
         BlobDeleted,
         BlobEvent,
         ContractEvent,
+        EpochChangeDone,
         EpochChangeEvent,
+        EpochChangeStart,
         InvalidBlobId,
+        GENESIS_EPOCH,
     },
 };
 
@@ -97,7 +101,10 @@ mod storage;
 pub use storage::{DatabaseConfig, Storage};
 use walrus_event::{EventStreamCursor, EventStreamElement};
 
-use crate::node::system_events::{EventManager, SuiSystemEventProvider};
+use crate::{
+    common::{active_committees::ActiveCommittees, utils::ShardDiff},
+    node::system_events::{EventManager, SuiSystemEventProvider},
+};
 
 /// Trait for all functionality offered by a storage node.
 pub trait ServiceState {
@@ -350,12 +357,11 @@ async fn create_read_client(sui_config: &SuiConfig) -> Result<SuiReadClient, any
 pub struct StorageNode {
     inner: Arc<StorageNodeInner>,
     blob_sync_handler: BlobSyncHandler,
-    _shard_sync_handler: ShardSyncHandler,
+    shard_sync_handler: ShardSyncHandler,
 }
 
 /// The internal state of a Walrus storage node.
 #[derive(Debug)]
-
 pub struct StorageNodeInner {
     protocol_key_pair: ProtocolKeyPair,
     storage: Storage,
@@ -365,6 +371,8 @@ pub struct StorageNodeInner {
     committee_service: Arc<dyn CommitteeService>,
     start_time: Instant,
     metrics: NodeMetricSet,
+    node_object_id: ObjectID,
+    current_epoch: watch::Sender<Epoch>,
 }
 
 impl StorageNode {
@@ -378,31 +386,24 @@ impl StorageNode {
         pre_created_storage: Option<Storage>, // For testing purposes. TODO(#703): remove.
     ) -> Result<Self, anyhow::Error> {
         let start_time = Instant::now();
+        let encoding_config = committee_service.encoding_config().clone();
 
-        let db_config = config.db_config.clone().unwrap_or_default();
-        let mut storage = if let Some(storage) = pre_created_storage {
+        let storage = if let Some(storage) = pre_created_storage {
             storage
         } else {
             Storage::open(
                 config.storage_path.as_path(),
-                db_config,
+                config.db_config.clone().unwrap_or_default(),
                 MetricConf::new("storage"),
             )?
         };
 
-        let encoding_config = committee_service.encoding_config().clone();
-
-        let committee = committee_service.committee();
-        let managed_shards = committee.shards_for_node_public_key(key_pair.as_ref().public());
-        if managed_shards.is_empty() {
-            tracing::info!(epoch = committee.epoch, "node does not manage any shards");
-        }
-
-        for shard in managed_shards {
-            storage
-                .create_storage_for_shard(*shard)
-                .with_context(|| format!("unable to initialize storage for shard {}", shard))?;
-        }
+        // TODO(jsmith): This should be fetched from the wallet (#862).
+        let active_committee = committee_service.active_committees();
+        let Some(node_id) = node_id_for_public_key(&active_committee, key_pair.as_ref().public())
+        else {
+            bail!("node is not in the committee");
+        };
 
         let inner = Arc::new(StorageNodeInner {
             protocol_key_pair: key_pair,
@@ -410,9 +411,11 @@ impl StorageNode {
             event_manager,
             encoding_config,
             contract_service: contract_service.into(),
+            current_epoch: watch::Sender::new(committee_service.get_epoch()),
             committee_service: committee_service.into(),
             metrics: NodeMetricSet::new(registry),
             start_time,
+            node_object_id: node_id,
         });
 
         inner.init_gauges()?;
@@ -430,7 +433,7 @@ impl StorageNode {
         Ok(StorageNode {
             inner,
             blob_sync_handler,
-            _shard_sync_handler: shard_sync_handler,
+            shard_sync_handler,
         })
     }
 
@@ -454,18 +457,46 @@ impl StorageNode {
     }
 
     /// Returns the shards currently owned by the storage node.
-    pub fn shards(&self) -> impl ExactSizeIterator<Item = ShardIndex> + '_ {
+    pub fn shards(&self) -> Vec<ShardIndex> {
         self.inner.storage.shards()
     }
 
-    async fn process_events(&self) -> anyhow::Result<()> {
+    /// Wait for the storage node to be in at least the provided epoch.
+    ///
+    /// Returns the epoch to which the storage node arrived, which may be later than the requested
+    /// epoch.
+    pub async fn wait_for_epoch(&self, epoch: Epoch) -> Epoch {
+        let mut receiver = self.inner.current_epoch.subscribe();
+        let epoch_ref = receiver
+            .wait_for(|current_epoch| *current_epoch >= epoch)
+            .await
+            .expect("current_epoch channel cannot be dropped while holding a ref to self");
+        *epoch_ref
+    }
+
+    /// Continues the event stream from the last committed event.
+    async fn continue_event_stream(
+        &self,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = IndexedStreamElement> + Send + Sync + '_>>> {
         let storage = &self.inner.storage;
         let from_event_id = storage.get_event_cursor()?.map(|(_, cursor)| cursor);
         let from_element_index = self.get_last_committed_event_index()?;
         let event_cursor = EventStreamCursor::new(from_event_id, from_element_index);
-        let event_stream = Box::into_pin(self.inner.event_manager.events(event_cursor).await?);
+
+        Ok(Box::into_pin(
+            self.inner.event_manager.events(event_cursor).await?,
+        ))
+    }
+
+    async fn process_events(&self) -> anyhow::Result<()> {
+        let storage = &self.inner.storage;
+        let event_stream = self.continue_event_stream().await?;
+
+        let from_element_index = self.get_last_committed_event_index()?;
         let next_index: usize = from_element_index.try_into().expect("64-bit architecture");
         let index_stream = stream::iter(next_index..);
+        let mut maybe_epoch_at_start = Some(self.inner.committee_service.get_epoch());
+
         let mut indexed_element_stream = index_stream.zip(event_stream);
         // Important: Events must be handled consecutively and in order to prevent (intermittent)
         // invariant violations and interference between different events. See, for example,
@@ -489,6 +520,26 @@ impl StorageNode {
                 "walrus.blob_id" = ?stream_element.element.blob_id(),
                 "error.type" = field::Empty,
             );
+
+            if let Some(epoch_at_start) = maybe_epoch_at_start {
+                if let EventStreamElement::ContractEvent(ref event) = stream_element.element {
+                    tracing::debug!("checking the first contract event if we're severaly lagging");
+                    // Clear the starting epoch, so that we never make this check again.
+                    maybe_epoch_at_start = None;
+
+                    // if event.event_epoch() < starting_epoch - 1
+                    if event.event_epoch() + 1 < epoch_at_start {
+                        let error = anyhow!(
+                            "the current epoch ({}) is too far ahead of the event epoch: {}",
+                            epoch_at_start,
+                            event.event_epoch(),
+                        );
+                        tracing::error!(%error);
+                        return Err(error);
+                    }
+                }
+            }
+
             async move {
                 let _timer_guard = &self
                     .inner
@@ -503,31 +554,35 @@ impl StorageNode {
                     EventStreamElement::ContractEvent(ContractEvent::BlobEvent(
                         BlobEvent::Registered(event),
                     )) => {
+                        tracing::debug!("BlobRegistered event received: {:?}", event);
                         self.inner
                             .mark_event_completed(element_index, &event.event_id)?;
                     }
                     EventStreamElement::ContractEvent(ContractEvent::BlobEvent(
                         BlobEvent::Certified(event),
                     )) => {
+                        tracing::debug!("BlobCertified event received: {:?}", event);
                         self.process_blob_certified_event(element_index, event)
                             .await?;
                     }
                     EventStreamElement::ContractEvent(ContractEvent::BlobEvent(
                         BlobEvent::Deleted(event),
                     )) => {
+                        tracing::debug!("BlobDeleted event received: {:?}", event);
                         self.process_blob_deleted_event(element_index, event)
                             .await?;
                     }
                     EventStreamElement::ContractEvent(ContractEvent::BlobEvent(
                         BlobEvent::InvalidBlobID(event),
                     )) => {
+                        tracing::debug!("BlobInvalid event received: {:?}", event);
                         self.process_blob_invalid_event(element_index, event)
                             .await?;
                     }
                     EventStreamElement::ContractEvent(ContractEvent::EpochChangeEvent(
                         EpochChangeEvent::EpochParametersSelected(event),
                     )) => {
-                        tracing::info!("EpochParametersSelected event received: {:?}", event,);
+                        tracing::info!("EpochParametersSelected event received: {:?}", event);
                         self.inner
                             .mark_event_completed(element_index, &event.event_id)?;
                     }
@@ -535,6 +590,7 @@ impl StorageNode {
                         EpochChangeEvent::EpochChangeStart(event),
                     )) => {
                         tracing::info!("EpochChangeStart event received: {:?}", event);
+                        self.process_epoch_change_start_event(&event).await?;
                         self.inner
                             .mark_event_completed(element_index, &event.event_id)?;
                     }
@@ -542,6 +598,7 @@ impl StorageNode {
                         EpochChangeEvent::EpochChangeDone(event),
                     )) => {
                         tracing::info!("EpochChangeDone event received: {:?}", event);
+                        self.process_epoch_change_done_event(&event).await?;
                         self.inner
                             .mark_event_completed(element_index, &event.event_id)?;
                     }
@@ -663,6 +720,143 @@ impl StorageNode {
         }
         Ok(())
     }
+
+    #[tracing::instrument(skip_all)]
+    async fn process_epoch_change_start_event(
+        &self,
+        event: &EpochChangeStart,
+    ) -> anyhow::Result<()> {
+        if !self.begin_committee_change(event.epoch).await? {
+            return Ok(());
+        }
+
+        let public_key = self.inner.public_key();
+        let storage = &self.inner.storage;
+        let committees = self.inner.committee_service.active_committees();
+        let shard_diff = ShardDiff::diff_previous(&committees, public_key);
+
+        for shard_id in &shard_diff.lost {
+            let Some(shard_storage) = storage.shard_storage(*shard_id) else {
+                tracing::debug!("skipping lost shard during epoch change as it is not stored");
+                continue;
+            };
+            // TODO: remove shard at the next EpochChangeStart event.
+            //       eventually, we can remove the shard upon receiving ShardsReceived events.
+            tracing::debug!(walrus.shard_index = %shard_id, "locking shard for epoch change");
+            shard_storage
+                .lock_shard_for_epoch_change()
+                .context("failed to lock shard")?;
+        }
+
+        if shard_diff.gained.is_empty() {
+            tracing::debug!("no shards gained, so signalling that epoch sync is done");
+            self.inner
+                .contract_service
+                .epoch_sync_done(self.inner.node_object_id)
+                .await;
+        } else {
+            self.inner
+                .storage
+                .create_storage_for_shards(&shard_diff.gained)?;
+
+            // There shouldn't be an epoch change event for the genesis epoch.
+            assert!(event.epoch != GENESIS_EPOCH);
+            for shard in &shard_diff.gained {
+                self.shard_sync_handler.start_new_shard_sync(*shard).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Initiates a committee transition to a new epoch.
+    ///
+    /// Returns `true` if epoch change event has started or was sufficiently recent such
+    /// that it should be handled.
+    #[tracing::instrument(skip_all)]
+    async fn begin_committee_change(
+        &self,
+        epoch: Epoch,
+    ) -> Result<bool, BeginCommitteeChangeError> {
+        match self
+            .inner
+            .committee_service
+            .begin_committee_change(epoch)
+            .await
+        {
+            Ok(()) => {
+                tracing::debug!(
+                    walrus.epoch = epoch,
+                    "successfully started a transition to a new epoch"
+                );
+                self.inner.current_epoch.send_replace(epoch);
+                Ok(true)
+            }
+            Err(BeginCommitteeChangeError::EpochIsTheSameAsCurrent) => {
+                tracing::debug!(
+                    walrus.epoch = epoch,
+                    "epoch change event was for the epoch we are currently in, not skipping"
+                );
+                Ok(true)
+            }
+            Err(BeginCommitteeChangeError::ChangeAlreadyInProgress)
+            | Err(BeginCommitteeChangeError::EpochIsLess { .. }) => {
+                // We are likely processing a backlog of events. Since the committee service has a
+                // more recent committee or has already had the current committee marked as
+                // transitioning, our shards have also already been configured for the more
+                // recent committee and there is actual nothing to do.
+                tracing::debug!(
+                    walrus.epoch = epoch,
+                    "skipping epoch change start event for an older epoch"
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                tracing::error!(?error, "failed to initiate a transition to the new epoch");
+                Err(error)
+            }
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn process_epoch_change_done_event(&self, event: &EpochChangeDone) -> anyhow::Result<()> {
+        match self
+            .inner
+            .committee_service
+            .end_committee_change(event.epoch)
+        {
+            Ok(()) => tracing::debug!(
+                walrus.epoch = event.epoch,
+                "successfully ended the transition to the new epoch"
+            ),
+            // This likely means that the committee was fetched (for example on startup) and we
+            // are not processing the event that would have notified us that the epoch was
+            // changing.
+            Err(EndCommitteeChangeError::EpochChangeAlreadyDone) => tracing::debug!(
+                walrus.epoch = event.epoch,
+                "the committee had already transitioned to the new epoch"
+            ),
+            Err(EndCommitteeChangeError::ProvidedEpochIsInThePast { .. }) => {
+                // We are ending a change to an epoch that we have already advanced beyond. This is
+                // likely due to processing a backlog of events and can be ignored.
+                tracing::debug!(
+                    walrus.epoch = event.epoch,
+                    "skipping epoch change event that is in the past"
+                );
+                return Ok(());
+            }
+            Err(error @ EndCommitteeChangeError::ProvidedEpochIsInTheFuture { .. }) => {
+                tracing::error!(
+                    ?error,
+                    "our committee service is lagging behind the events being processed which \
+                    should not happen"
+                );
+                return Err(error.into());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl StorageNodeInner {
@@ -685,7 +879,7 @@ impl StorageNodeInner {
         &self,
         sliver_pair_index: SliverPairIndex,
         blob_id: &BlobId,
-    ) -> Result<&Arc<ShardStorage>, ShardNotAssigned> {
+    ) -> Result<Arc<ShardStorage>, ShardNotAssigned> {
         let shard_index =
             sliver_pair_index.to_shard_index(self.encoding_config.n_shards(), blob_id);
         self.storage
@@ -1098,6 +1292,27 @@ where
     Ok(signed)
 }
 
+fn node_id_for_public_key(
+    committees: &ActiveCommittees,
+    public_key: &PublicKey,
+) -> Option<ObjectID> {
+    committees
+        .current_committee()
+        .node_id_for_public_key(public_key)
+        .or_else(|| {
+            committees
+                .previous_committee()
+                .as_ref()
+                .and_then(|committee| committee.node_id_for_public_key(public_key))
+        })
+        .or_else(|| {
+            committees
+                .next_committee()
+                .as_ref()
+                .and_then(|committee| committee.node_id_for_public_key(public_key))
+        })
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1114,7 +1329,10 @@ mod tests {
         test_utils::generate_config_metadata_and_valid_recovery_symbols,
     };
     use walrus_sdk::client::Client;
-    use walrus_sui::{test_utils::EventForTesting, types::BlobRegistered};
+    use walrus_sui::{
+        test_utils::{event_id_for_testing, EventForTesting},
+        types::BlobRegistered,
+    };
     use walrus_test_utils::{async_param_test, Result as TestResult, WithTempDir};
 
     use super::*;
@@ -1205,9 +1423,18 @@ mod tests {
     async fn services_slivers_for_shards_managed_according_to_committee() -> TestResult {
         let shard_for_node = ShardIndex(0);
         let node = StorageNodeHandle::builder()
-            .with_system_event_provider(vec![BlobRegistered::for_testing(BLOB_ID).into()])
+            .with_system_event_provider(vec![
+                ContractEvent::EpochChangeEvent(EpochChangeEvent::EpochChangeStart(
+                    EpochChangeStart {
+                        epoch: 1,
+                        event_id: event_id_for_testing(),
+                    },
+                )),
+                BlobRegistered::for_testing(BLOB_ID).into(),
+            ])
             .with_shard_assignment(&[shard_for_node])
             .with_node_started(true)
+            .with_rest_api_started(true)
             .build()
             .await?;
         let n_shards = node.as_ref().inner.committee_service.get_shard_count();
@@ -1605,13 +1832,14 @@ mod tests {
             TestCluster::builder()
                 .with_shard_assignment(assignment)
                 .with_system_event_providers(events.clone())
-                .with_initial_epoch(initial_epoch)
                 .build()
                 .await?
         };
 
         let config = cluster.encoding_config();
         let mut details = Vec::new();
+
+        // Add the blobs at epoch 1, the epoch at which the cluster starts.
         for blob in blobs {
             let blob_details = EncodedBlob::new(blob, config.clone());
             // Note: register and certify the blob are always using epoch 0.
@@ -1621,7 +1849,39 @@ mod tests {
             details.push(blob_details);
         }
 
+        advance_cluster_to_epoch(&cluster, &[&events], initial_epoch).await?;
+
         Ok((cluster, events, details))
+    }
+
+    async fn advance_cluster_to_epoch(
+        cluster: &TestCluster,
+        events: &[&Sender<ContractEvent>],
+        epoch: Epoch,
+    ) -> TestResult {
+        let lookup_service_handle = cluster.lookup_service_handle.clone().unwrap();
+
+        for epoch in lookup_service_handle.epoch() + 1..epoch + 1 {
+            let new_epoch = lookup_service_handle.advance_epoch();
+            assert_eq!(new_epoch, epoch);
+            for event_queue in events {
+                event_queue.send(ContractEvent::EpochChangeEvent(
+                    EpochChangeEvent::EpochChangeStart(EpochChangeStart {
+                        epoch,
+                        event_id: walrus_sui::test_utils::event_id_for_testing(),
+                    }),
+                ))?;
+                event_queue.send(ContractEvent::EpochChangeEvent(
+                    EpochChangeEvent::EpochChangeDone(EpochChangeDone {
+                        epoch,
+                        event_id: walrus_sui::test_utils::event_id_for_testing(),
+                    }),
+                ))?;
+            }
+            cluster.wait_for_nodes_to_reach_epoch(epoch).await;
+        }
+
+        Ok(())
     }
 
     /// Creates a test cluster with custom initial epoch and blobs that are partially stored
@@ -1655,7 +1915,6 @@ mod tests {
             TestCluster::builder()
                 .with_shard_assignment(assignment)
                 .with_individual_system_event_providers(&event_providers)
-                .with_initial_epoch(initial_epoch)
                 .build()
                 .await?
         };
@@ -1664,7 +1923,6 @@ mod tests {
         let mut details = Vec::new();
         for (i, blob) in blobs.iter().enumerate() {
             let blob_details = EncodedBlob::new(blob, config.clone());
-            // Note: register and certify the blob are always using epoch 0.
             node_0_events.send(BlobRegistered::for_testing(*blob_details.blob_id()).into())?;
             all_other_node_events
                 .send(BlobRegistered::for_testing(*blob_details.blob_id()).into())?;
@@ -1684,6 +1942,13 @@ mod tests {
                 .send(BlobCertified::for_testing(*blob_details.blob_id()).into())?;
             details.push(blob_details);
         }
+
+        advance_cluster_to_epoch(
+            &cluster,
+            &[&node_0_events, &all_other_node_events],
+            initial_epoch,
+        )
+        .await?;
 
         Ok((cluster, details))
     }
@@ -2153,8 +2418,8 @@ mod tests {
     // Tests SyncShardRequest with wrong epoch.
     async_param_test! {
         sync_shard_node_api_invalid_epoch -> TestResult: [
-            too_old: (10, 1, "Invalid epoch. Client epoch: 1. Server epoch: 10"),
-            too_new: (10, 11, "Invalid epoch. Client epoch: 11. Server epoch: 10"),
+            too_old: (3, 1, "Invalid epoch. Client epoch: 1. Server epoch: 3"),
+            too_new: (3, 4, "Invalid epoch. Client epoch: 4. Server epoch: 3"),
         ]
     }
     async fn sync_shard_node_api_invalid_epoch(
@@ -2162,7 +2427,7 @@ mod tests {
         requester_epoch: Epoch,
         error_message: &str,
     ) -> TestResult {
-        // Creates a cluster with initial epoch set to 10.
+        // Creates a cluster with initial epoch set to 3.
         let (cluster, _, blob_detail) =
             cluster_with_initial_epoch_and_certified_blob(&[&[0], &[1]], &[BLOB], cluster_epoch)
                 .await?;
@@ -2291,7 +2556,9 @@ mod tests {
         let node_inner = unsafe {
             &mut *(Arc::as_ptr(&cluster.nodes[1].storage_node.inner) as *mut StorageNodeInner)
         };
-        node_inner.storage.create_storage_for_shard(ShardIndex(0))?;
+        node_inner
+            .storage
+            .create_storage_for_shards(&[ShardIndex(0)])?;
         let shard_storage_dst = node_inner.storage.shard_storage(ShardIndex(0)).unwrap();
         shard_storage_dst.update_status_in_test(ShardStatus::None)?;
 
@@ -2371,7 +2638,7 @@ mod tests {
         // Starts the shard syncing process.
         cluster.nodes[1]
             .storage_node
-            ._shard_sync_handler
+            .shard_sync_handler
             .start_new_shard_sync(ShardIndex(0))
             .await?;
 
@@ -2434,17 +2701,19 @@ mod tests {
         let node_inner = unsafe {
             &mut *(Arc::as_ptr(&cluster.nodes[1].storage_node.inner) as *mut StorageNodeInner)
         };
-        node_inner.storage.create_storage_for_shard(ShardIndex(0))?;
+        node_inner
+            .storage
+            .create_storage_for_shards(&[ShardIndex(0)])?;
         let shard_storage_dst = node_inner.storage.shard_storage(ShardIndex(0)).unwrap();
         shard_storage_dst.update_status_in_test(ShardStatus::None)?;
 
         cluster.nodes[1]
             .storage_node
-            ._shard_sync_handler
+            .shard_sync_handler
             .start_new_shard_sync(ShardIndex(0))
             .await?;
-        wait_for_shard_in_active_state(shard_storage_dst).await?;
-        check_all_blobs_are_synced(&blob_details, shard_storage_dst)?;
+        wait_for_shard_in_active_state(shard_storage_dst.as_ref()).await?;
+        check_all_blobs_are_synced(&blob_details, shard_storage_dst.as_ref())?;
 
         Ok(())
     }
@@ -2454,8 +2723,6 @@ mod tests {
     // This test also tests that no missing blobs after sync completion.
     #[tokio::test]
     async fn sync_shard_partial_recovery() -> TestResult {
-        telemetry_subscribers::init_for_testing();
-
         let skip_stored_blob_index: [usize; 12] = [3, 4, 5, 9, 10, 11, 15, 18, 19, 20, 21, 22];
         let (cluster, blob_details) = setup_shard_recovery_test_cluster(|blob_index| {
             !skip_stored_blob_index.contains(&blob_index)
@@ -2481,17 +2748,19 @@ mod tests {
         let node_inner = unsafe {
             &mut *(Arc::as_ptr(&cluster.nodes[1].storage_node.inner) as *mut StorageNodeInner)
         };
-        node_inner.storage.create_storage_for_shard(ShardIndex(0))?;
+        node_inner
+            .storage
+            .create_storage_for_shards(&[ShardIndex(0)])?;
         let shard_storage_dst = node_inner.storage.shard_storage(ShardIndex(0)).unwrap();
         shard_storage_dst.update_status_in_test(ShardStatus::None)?;
 
         cluster.nodes[1]
             .storage_node
-            ._shard_sync_handler
+            .shard_sync_handler
             .start_new_shard_sync(ShardIndex(0))
             .await?;
-        wait_for_shard_in_active_state(shard_storage_dst).await?;
-        check_all_blobs_are_synced(&blob_details, shard_storage_dst)?;
+        wait_for_shard_in_active_state(shard_storage_dst.as_ref()).await?;
+        check_all_blobs_are_synced(&blob_details, shard_storage_dst.as_ref())?;
 
         Ok(())
     }
@@ -2556,12 +2825,12 @@ mod tests {
             // break index.
             cluster.nodes[1]
                 .storage_node
-                ._shard_sync_handler
+                .shard_sync_handler
                 .start_new_shard_sync(ShardIndex(0))
                 .await?;
 
             // Waits for the shard sync process to stop.
-            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node._shard_sync_handler).await?;
+            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
 
             // Check that shard sync process is not finished.
             let shard_storage_src = cluster.nodes[0]
@@ -2582,12 +2851,12 @@ mod tests {
             // restart the shard syncing process, to simulate a reboot.
             cluster.nodes[1]
                 .storage_node
-                ._shard_sync_handler
+                .shard_sync_handler
                 .restart_syncs()
                 .await?;
 
             // Waits for the shard to be synced.
-            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node._shard_sync_handler).await?;
+            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
 
             // Checks that the shard is completely migrated.
             check_all_blobs_are_synced(&blob_details, &shard_storage_dst)?;
@@ -2611,12 +2880,12 @@ mod tests {
             // break index.
             cluster.nodes[1]
                 .storage_node
-                ._shard_sync_handler
+                .shard_sync_handler
                 .start_new_shard_sync(ShardIndex(0))
                 .await?;
 
             // Waits for the shard sync process to stop.
-            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node._shard_sync_handler).await?;
+            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
 
             Ok(())
         }
@@ -2660,17 +2929,19 @@ mod tests {
             let node_inner = unsafe {
                 &mut *(Arc::as_ptr(&cluster.nodes[1].storage_node.inner) as *mut StorageNodeInner)
             };
-            node_inner.storage.create_storage_for_shard(ShardIndex(0))?;
+            node_inner
+                .storage
+                .create_storage_for_shards(&[ShardIndex(0)])?;
             let shard_storage_dst = node_inner.storage.shard_storage(ShardIndex(0)).unwrap();
             shard_storage_dst.update_status_in_test(ShardStatus::None)?;
 
             cluster.nodes[1]
                 .storage_node
-                ._shard_sync_handler
+                .shard_sync_handler
                 .start_new_shard_sync(ShardIndex(0))
                 .await?;
             // Waits for the shard sync process to stop.
-            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node._shard_sync_handler).await?;
+            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
 
             // Check that shard sync process is not finished.
             if !restart_after_recovery {
@@ -2696,14 +2967,60 @@ mod tests {
             // restart the shard syncing process, to simulate a reboot.
             cluster.nodes[1]
                 .storage_node
-                ._shard_sync_handler
+                .shard_sync_handler
                 .restart_syncs()
                 .await?;
 
-            wait_for_shard_in_active_state(shard_storage_dst).await?;
-            check_all_blobs_are_synced(&blob_details, shard_storage_dst)?;
+            wait_for_shard_in_active_state(shard_storage_dst.as_ref()).await?;
+            check_all_blobs_are_synced(&blob_details, shard_storage_dst.as_ref())?;
 
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn shard_initialization_in_epoch_one() -> TestResult {
+        let node = StorageNodeHandle::builder()
+            .with_system_event_provider(vec![ContractEvent::EpochChangeEvent(
+                EpochChangeEvent::EpochChangeStart(EpochChangeStart {
+                    epoch: 1,
+                    event_id: event_id_for_testing(),
+                }),
+            )])
+            .with_shard_assignment(&[ShardIndex(0), ShardIndex(27)])
+            .with_node_started(true)
+            .with_rest_api_started(true)
+            .build()
+            .await?;
+
+        assert_eq!(
+            node.as_ref()
+                .inner
+                .storage
+                .shard_storage(ShardIndex(0))
+                .expect("Shard storage should be created")
+                .status()
+                .unwrap(),
+            ShardStatus::Active
+        );
+
+        assert!(node
+            .as_ref()
+            .inner
+            .storage
+            .shard_storage(ShardIndex(1))
+            .is_none());
+
+        assert_eq!(
+            node.as_ref()
+                .inner
+                .storage
+                .shard_storage(ShardIndex(27))
+                .expect("Shard storage should be created")
+                .status()
+                .unwrap(),
+            ShardStatus::Active
+        );
+        Ok(())
     }
 }

@@ -367,6 +367,10 @@ impl ShardStorage {
             .map(|s| s.unwrap_or(ShardStatus::None))
     }
 
+    pub(crate) fn set_start_sync_status(&self) -> Result<(), TypedStoreError> {
+        self.shard_status.insert(&(), &ShardStatus::ActiveSync)
+    }
+
     /// Fetches the slivers with `sliver_type` for the provided blob IDs.
     pub(crate) fn fetch_slivers(
         &self,
@@ -542,6 +546,10 @@ impl ShardStorage {
             .certified_blob_info_iter_before_epoch(epoch, last_synced_blob_id);
 
         let mut next_blob_info = blob_info_iter.next().transpose()?;
+        // For transitioning from GENESIS epoch to epoch 1, since GENESIS epoch does not have
+        // any committees and should not receive any user blobs, there shouldn't be any certified
+        // blobs. In case, the shard sync should finish immediately and transition to Active state.
+        assert!(epoch != 0 && (epoch > 1 || next_blob_info.is_none()));
         while let Some((next_starting_blob_id, _)) = next_blob_info {
             tracing::debug!(
                 "syncing shard to before epoch: {}. Starting blob id: {}",
@@ -815,17 +823,17 @@ impl ShardStorage {
         self.pending_recover_slivers.remove(&(sliver_type, blob_id))
     }
 
+    /// Locks the shard for moving to another node.
+    pub(crate) fn lock_shard_for_epoch_change(&self) -> Result<(), TypedStoreError> {
+        self.shard_status.insert(&(), &ShardStatus::LockedToMove)
+    }
+
     #[cfg(test)]
     pub(crate) fn sliver_count(&self, sliver_type: SliverType) -> usize {
         match sliver_type {
             SliverType::Primary => self.primary_slivers.keys().count(),
             SliverType::Secondary => self.secondary_slivers.keys().count(),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lock_shard_for_epoch_change(&self) -> Result<(), TypedStoreError> {
-        self.shard_status.insert(&(), &ShardStatus::LockedToMove)
     }
 
     #[cfg(test)]

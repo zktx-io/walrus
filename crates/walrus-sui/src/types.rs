@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::bail;
+use sui_types::base_types::ObjectID;
 use thiserror::Error;
 
 mod events;
@@ -41,6 +42,9 @@ pub use move_structs::{
 };
 use serde::{Deserialize, Serialize};
 use walrus_core::{bft, ensure, Epoch, NetworkPublicKey, PublicKey, ShardIndex};
+
+/// The zero-th Epoch is special in that it's the genesis epoch.
+pub const GENESIS_EPOCH: Epoch = 0;
 
 /// Network address consisting of host name or IP and port.
 #[derive(Debug, PartialEq, Eq, Clone, Hash, Serialize, Deserialize)]
@@ -202,6 +206,13 @@ impl Committee {
             .iter()
             .find_map(|node| (node.public_key == *public_key).then_some(node.shard_ids.as_slice()))
             .unwrap_or_default()
+    }
+
+    /// Return the node ID for the specified public key.
+    pub fn node_id_for_public_key(&self, public_key: &PublicKey) -> Option<ObjectID> {
+        self.members
+            .iter()
+            .find_map(|node| (node.public_key == *public_key).then_some(node.node_id))
     }
 
     /// Return the total number of shards in the committee.
