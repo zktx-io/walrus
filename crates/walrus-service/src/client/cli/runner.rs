@@ -225,11 +225,7 @@ impl ClientCommandRunner {
             let encoded_size =
                 encoded_blob_length_for_n_shards(encoding_config.n_shards(), unencoded_size)
                     .expect("must be valid as the encoding succeeded");
-            let price_per_unit_size = client
-                .sui_client()
-                .read_client()
-                .storage_price_per_unit_size()
-                .await?;
+            let price_per_unit_size = client.sui_client().storage_price_per_unit_size().await?;
             let storage_cost =
                 storage_price_for_encoded_length(encoded_size, price_per_unit_size, epochs);
             DryRunOutput {
@@ -268,7 +264,7 @@ impl ClientCommandRunner {
             self.wallet_path.is_none(),
         )
         .await?;
-        let client = Client::new_read_client(config, &sui_read_client).await?;
+        let client = Client::new(config, &sui_read_client).await?;
         let file = file_or_blob_id.file.clone();
         let blob_id = file_or_blob_id.get_or_compute_blob_id(client.encoding_config())?;
 
