@@ -59,6 +59,8 @@ pub struct ClientCommunicationConfig {
     pub disable_proxy: bool,
     /// Disable the use of operating system certificates for authenticating the communication.
     pub disable_native_certs: bool,
+    /// The extra time allowed for sliver writes.
+    pub sliver_write_extra_time: SliverWriteExtraTime,
 }
 
 impl ClientCommunicationConfig {
@@ -327,5 +329,56 @@ pub(crate) mod default {
     /// Keep-alive pings are sent to idle connections.
     pub fn http2_keep_alive_while_idle() -> bool {
         true
+    }
+}
+
+/// The additional time allowed to sliver writes, to allow for more nodes to receive them.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SliverWriteExtraTime {
+    /// The multiplication factor for the time it took to store n-f sliver.
+    pub factor: f64,
+    /// The minimum extra time.
+    pub base: Duration,
+}
+
+impl SliverWriteExtraTime {
+    /// Returns the extra time for the given time.
+    ///
+    /// The extra time is computed as `store_time * factor + base`.
+    pub fn extra_time(&self, store_time: Duration) -> Duration {
+        let extra_time = Duration::from_nanos((store_time.as_nanos() as f64 * self.factor) as u64);
+        self.base + extra_time
+    }
+}
+
+impl Default for SliverWriteExtraTime {
+    fn default() -> Self {
+        Self {
+            factor: 0.5,                      // 1/2 of the time it took to store n-f slivers.
+            base: Duration::from_millis(500), // +0.5s every time.
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::{rngs::StdRng, SeedableRng};
+    use sui_types::base_types::ObjectID;
+
+    /// Serializes a default config to the example file when tests are run.
+    ///
+    /// This test ensures that the `client_config_example.yaml` is kept in sync with the config
+    /// struct in this file.
+    #[test]
+    fn test_serialize_default_config() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let config = super::Config {
+            system_object: ObjectID::random_from_rng(&mut rng),
+            staking_object: ObjectID::random_from_rng(&mut rng),
+            wallet_config: None,
+            communication_config: Default::default(),
+        };
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        std::fs::write("client_config_example.yaml", serialized).unwrap();
     }
 }
