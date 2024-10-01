@@ -11929,6 +11929,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util 0.7.12",
+ "tracing",
  "typed-store",
  "url",
  "walrus-core",
