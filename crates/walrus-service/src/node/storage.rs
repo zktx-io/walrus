@@ -4,12 +4,12 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Debug,
-    ops::Bound::{Excluded, Unbounded},
+    ops::Bound::Included,
     path::Path,
     sync::{Arc, RwLock},
 };
 
-use blob_info::merge_blob_info;
+use itertools::Itertools;
 use rocksdb::Options;
 use sui_sdk::types::event::EventID;
 use typed_store::{
@@ -27,7 +27,7 @@ use walrus_core::{
 use walrus_sui::types::BlobEvent;
 
 use self::{
-    blob_info::{BlobInfo, BlobInfoApi, BlobInfoMergeOperand},
+    blob_info::{BlobInfo, BlobInfoApi, BlobInfoMergeOperand, BlobInfoTable},
     event_cursor_table::EventCursorTable,
 };
 use super::errors::{ShardNotAssigned, SyncShardServiceError};
@@ -56,78 +56,14 @@ pub(crate) use shard::{ShardStatus, ShardStorage};
 pub struct Storage {
     database: Arc<RocksDB>,
     metadata: DBMap<BlobId, BlobMetadata>,
-    blob_info: DBMap<BlobId, BlobInfo>,
+    blob_info: BlobInfoTable,
     event_cursor: EventCursorTable,
     shards: Arc<RwLock<HashMap<ShardIndex, Arc<ShardStorage>>>>,
     config: DatabaseConfig,
 }
 
-/// A iterator over the blob info table.
-pub(crate) struct BlobInfoIter<I: ?Sized>
-where
-    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
-{
-    iter: Box<I>,
-    before_epoch: Epoch,
-    only_certified: bool,
-}
-
-impl<I: ?Sized> BlobInfoIter<I>
-where
-    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
-{
-    pub fn new(iter: Box<I>, before_epoch: Epoch, only_certified: bool) -> Self {
-        Self {
-            iter,
-            before_epoch,
-            only_certified,
-        }
-    }
-}
-
-impl<I: ?Sized> Debug for BlobInfoIter<I>
-where
-    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlobInfoIter")
-            .field("before_epoch", &self.before_epoch)
-            .field("only_certified", &self.only_certified)
-            .finish()
-    }
-}
-
-impl<I: ?Sized> Iterator for BlobInfoIter<I>
-where
-    I: Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send,
-{
-    type Item = Result<(BlobId, BlobInfo), TypedStoreError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut item = self.iter.next();
-        if !self.only_certified {
-            return item;
-        }
-
-        while let Some(Ok((_, ref blob_info))) = item {
-            if matches!(
-                blob_info.initial_certified_epoch(),
-                Some(initial_certified_epoch) if initial_certified_epoch < self.before_epoch
-            ) {
-                return item;
-            }
-            item = self.iter.next();
-        }
-        item
-    }
-}
-
-pub type BlobInfoIterator<'a> =
-    BlobInfoIter<dyn Iterator<Item = Result<(BlobId, BlobInfo), TypedStoreError>> + Send + 'a>;
-
 impl Storage {
     const METADATA_COLUMN_FAMILY_NAME: &'static str = "metadata";
-    const BLOBINFO_COLUMN_FAMILY_NAME: &'static str = "blob_info";
 
     /// Opens the storage database located at the specified path, creating the database if absent.
     pub fn open(
@@ -155,7 +91,7 @@ impl Storage {
             .collect::<Vec<_>>();
 
         let (metadata_cf_name, metadata_options) = Self::metadata_options(&db_config);
-        let (blob_info_cf_name, blob_info_options) = Self::blob_info_options(&db_config);
+        let blob_info_column_families = BlobInfoTable::options(&db_config);
         let (event_cursor_cf_name, event_cursor_options) = EventCursorTable::options(&db_config);
 
         let expected_column_families: Vec<_> = shard_column_families
@@ -163,9 +99,9 @@ impl Storage {
             .map(|(name, opts)| (name.as_str(), std::mem::take(opts)))
             .chain([
                 (metadata_cf_name, metadata_options),
-                (blob_info_cf_name, blob_info_options),
                 (event_cursor_cf_name, event_cursor_options),
             ])
+            .chain(blob_info_column_families)
             .collect::<Vec<_>>();
 
         let database = rocks::open_cf_opts(
@@ -181,12 +117,7 @@ impl Storage {
             false,
         )?;
         let event_cursor = EventCursorTable::reopen(&database)?;
-        let blob_info = DBMap::reopen(
-            &database,
-            Some(blob_info_cf_name),
-            &ReadWriteOptions::default(),
-            false,
-        )?;
+        let blob_info = BlobInfoTable::reopen(&database)?;
         let shards = Arc::new(RwLock::new(
             existing_shards_ids
                 .into_iter()
@@ -273,66 +204,48 @@ impl Storage {
         blob_id: &BlobId,
         metadata: &BlobMetadata,
     ) -> Result<(), TypedStoreError> {
-        self.metadata.insert(blob_id, metadata)?;
-        self.merge_update_blob_info(blob_id, BlobInfoMergeOperand::MarkMetadataStored(true))
+        let mut batch = self.metadata.batch();
+        batch.insert_batch(&self.metadata, [(blob_id, metadata)])?;
+        self.blob_info.merge_blob_info_batch(
+            &mut batch,
+            blob_id,
+            &BlobInfoMergeOperand::MarkMetadataStored(true),
+        )?;
+        batch.write()
     }
 
-    /// Get the blob info for `blob_id`
+    /// Returns the blob info for `blob_id`.
     #[tracing::instrument(skip_all)]
     pub fn get_blob_info(&self, blob_id: &BlobId) -> Result<Option<BlobInfo>, TypedStoreError> {
         self.blob_info.get(blob_id)
     }
 
-    /// Returns an iterator over the blob info table.
+    /// Returns the current event cursor and the next event index.
     #[tracing::instrument(skip_all)]
-    pub fn certified_blob_info_iter_before_epoch(
+    pub fn get_event_cursor_and_next_index(
         &self,
-        before_epoch: Epoch,
-        last_synced_blob_id: Option<BlobId>,
-    ) -> BlobInfoIterator {
-        BlobInfoIter::new(
-            Box::new(match last_synced_blob_id {
-                Some(starting_blob_id) => self
-                    .blob_info
-                    .safe_range_iter((Excluded(starting_blob_id), Unbounded)),
-                None => self.blob_info.safe_iter(),
-            }),
-            before_epoch,
-            true,
-        )
+    ) -> Result<Option<(EventID, u64)>, TypedStoreError> {
+        self.event_cursor.get_event_cursor_and_next_index()
     }
 
-    /// Get the event cursor for `event_type`
+    /// Updates the blob info for a blob based on the [`BlobEvent`].
+    ///
+    /// This must be called with monotonically increasing values of the `event_index`, and even
+    /// across restarts the same `event_index` must be assigned to the an event. The function in
+    /// turn ensures that the corresponding call is idempotent.
     #[tracing::instrument(skip_all)]
-    pub fn get_event_cursor(&self) -> Result<Option<(u64, EventID)>, TypedStoreError> {
-        self.event_cursor.get_event_cursor()
-    }
-
-    /// Update the blob info for a blob based on the `BlobEvent`
-    #[tracing::instrument(skip_all)]
-    pub fn update_blob_info(&self, event: &BlobEvent) -> Result<(), TypedStoreError> {
-        self.merge_update_blob_info(&event.blob_id(), event.into())?;
-        Ok(())
-    }
-
-    /// Update the blob info for `blob_id` using the specified merge `operation`.
-    fn merge_update_blob_info(
+    pub fn update_blob_info(
         &self,
-        blob_id: &BlobId,
-        operation: BlobInfoMergeOperand,
+        event_index: usize,
+        event: &BlobEvent,
     ) -> Result<(), TypedStoreError> {
-        tracing::debug!(?operation, %blob_id, "updating blob info");
-
-        let mut batch = self.blob_info.batch();
-        batch.partial_merge_batch(&self.blob_info, [(blob_id, operation.to_bytes())])?;
-        batch.write()
+        self.blob_info.update_blob_info(event_index, event)
     }
 
     /// Advances the event cursor to the most recent, sequential event observed.
     ///
-    /// The sequence-id is a sequence number of the order in which cursors were observed from the
-    /// chain, and must start from 0 with the cursor following `get_event_cursor()`
-    /// after the database is re-opened.
+    /// The `event_index` is a sequential index following the order in which cursors were observed
+    /// from the chain starting with 0 for the very first event of the package.
     ///
     /// For calls to this function such as `(0, cursor0), (2, cursor2), (1, cursor1)`, the cursor
     /// will advance to `cursor0` after the first call since it is the first in next in the
@@ -386,7 +299,7 @@ impl Storage {
         self.delete_metadata(&mut batch, blob_id, !delete_blob_info)?;
         self.delete_slivers(&mut batch, blob_id)?;
         if delete_blob_info {
-            batch.delete_batch(&self.blob_info, [blob_id])?;
+            self.blob_info.delete(&mut batch, blob_id)?;
         }
         batch.write()?;
         Ok(())
@@ -401,12 +314,10 @@ impl Storage {
     ) -> Result<(), TypedStoreError> {
         batch.delete_batch(&self.metadata, [blob_id])?;
         if update_blob_info {
-            batch.partial_merge_batch(
-                &self.blob_info,
-                [(
-                    blob_id,
-                    BlobInfoMergeOperand::MarkMetadataStored(false).to_bytes(),
-                )],
+            self.blob_info.merge_blob_info_batch(
+                batch,
+                blob_id,
+                &BlobInfoMergeOperand::MarkMetadataStored(false),
             )?;
         }
         Ok(())
@@ -473,12 +384,6 @@ impl Storage {
         )
     }
 
-    fn blob_info_options(db_config: &DatabaseConfig) -> (&'static str, Options) {
-        let mut options = db_config.blob_info.to_options();
-        options.set_merge_operator("merge blob info", merge_blob_info, |_, _, _| None);
-        (Self::BLOBINFO_COLUMN_FAMILY_NAME, options)
-    }
-
     /// Returns the shards currently present in the storage.
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn shards_present(&self) -> Vec<ShardIndex> {
@@ -504,15 +409,12 @@ impl Storage {
         // Scan certified slivers to fetch.
         let blobs_to_fetch = self
             .blob_info
-            .safe_iter_with_bounds(Some(request.starting_blob_id()), None)
-            .filter_map(|blob_info| match blob_info {
-                Ok((blob_id, blob_info)) => match blob_info.initial_certified_epoch() {
-                    Some(epoch) if epoch < current_epoch => Some(Ok(blob_id)),
-                    _ => None,
-                },
-                Err(e) => Some(Err(e)),
-            })
+            .certified_blob_info_iter_before_epoch(
+                current_epoch,
+                Included(request.starting_blob_id()),
+            )
             .take(request.sliver_count() as usize)
+            .map_ok(|(blob_id, _)| blob_id)
             .collect::<Result<Vec<_>, TypedStoreError>>()?;
 
         Ok(shard
@@ -523,6 +425,8 @@ impl Storage {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::ops::Bound::{Excluded, Unbounded};
+
     use blob_info::{
         BlobCertificationStatus,
         BlobInfoV1,
@@ -616,7 +520,7 @@ pub(crate) mod tests {
             metadata.metadata().clone(),
         );
 
-        storage.update_blob_info(&BlobCertified::for_testing(*blob_id).into())?;
+        storage.update_blob_info(0, &BlobCertified::for_testing(*blob_id).into())?;
 
         storage.put_metadata(metadata.blob_id(), metadata.metadata())?;
         let retrieved = storage.get_metadata(blob_id)?;
@@ -633,8 +537,8 @@ pub(crate) mod tests {
         let metadata = walrus_core::test_utils::verified_blob_metadata();
         let blob_id = metadata.blob_id();
 
-        storage.update_blob_info(&BlobRegistered::for_testing(*blob_id).into())?;
-        storage.update_blob_info(&BlobCertified::for_testing(*blob_id).into())?;
+        storage.update_blob_info(0, &BlobRegistered::for_testing(*blob_id).into())?;
+        storage.update_blob_info(1, &BlobCertified::for_testing(*blob_id).into())?;
 
         storage.put_metadata(metadata.blob_id(), metadata.metadata())?;
 
@@ -685,9 +589,9 @@ pub(crate) mod tests {
             None,
             None,
         );
-        storage.merge_update_blob_info(
+        storage.blob_info.merge_blob_info(
             &blob_id,
-            BlobInfoMergeOperand::new_change_for_testing(
+            &BlobInfoMergeOperand::new_change_for_testing(
                 BlobStatusChangeType::Register,
                 false,
                 1,
@@ -720,9 +624,9 @@ pub(crate) mod tests {
             };
             *event = registered_event;
 
-            storage.merge_update_blob_info(
+            storage.blob_info.merge_blob_info(
                 &blob_id,
-                BlobInfoMergeOperand::new_change_for_testing(
+                &BlobInfoMergeOperand::new_change_for_testing(
                     BlobStatusChangeType::Certify,
                     false,
                     2,
@@ -742,9 +646,9 @@ pub(crate) mod tests {
             certified_epoch,
             Some(3),
         );
-        storage.merge_update_blob_info(
+        storage.blob_info.merge_blob_info(
             &blob_id,
-            BlobInfoMergeOperand::MarkInvalid {
+            &BlobInfoMergeOperand::MarkInvalid {
                 epoch: 3,
                 status_event: event,
             },
@@ -769,9 +673,9 @@ pub(crate) mod tests {
             None,
         );
 
-        storage.merge_update_blob_info(
+        storage.blob_info.merge_blob_info(
             &blob_id,
-            BlobInfoMergeOperand::new_change_for_testing(
+            &BlobInfoMergeOperand::new_change_for_testing(
                 BlobStatusChangeType::Register,
                 false,
                 1,
@@ -790,7 +694,9 @@ pub(crate) mod tests {
         };
         *is_metadata_stored = true;
 
-        storage.merge_update_blob_info(&blob_id, BlobInfoMergeOperand::MarkMetadataStored(true))?;
+        storage
+            .blob_info
+            .merge_blob_info(&blob_id, &BlobInfoMergeOperand::MarkMetadataStored(true))?;
         assert_eq!(storage.get_blob_info(&blob_id)?, Some(state1));
 
         Ok(())
@@ -819,7 +725,9 @@ pub(crate) mod tests {
             storage.maybe_advance_event_cursor(*seq_id, cursor)?;
 
             assert_eq!(
-                storage.get_event_cursor()?.map(|(_, event_id)| event_id),
+                storage
+                    .get_event_cursor_and_next_index()?
+                    .map(|(event_id, _)| event_id),
                 Some(cursor_lookup[expected_observed])
             );
         }
@@ -833,7 +741,7 @@ pub(crate) mod tests {
         let storage = storage.as_ref();
 
         storage.maybe_advance_event_cursor(1, &event_id_for_testing())?;
-        assert_eq!(storage.get_event_cursor()?, None);
+        assert_eq!(storage.get_event_cursor_and_next_index()?, None);
 
         Ok(())
     }
@@ -1109,9 +1017,10 @@ pub(crate) mod tests {
         for blob_id in blob_ids.iter() {
             storage
                 .as_mut()
-                .merge_update_blob_info(
+                .blob_info
+                .merge_blob_info(
                     blob_id,
-                    BlobInfoMergeOperand::new_change_for_testing(
+                    &BlobInfoMergeOperand::new_change_for_testing(
                         BlobStatusChangeType::Register,
                         false,
                         0,
@@ -1122,9 +1031,10 @@ pub(crate) mod tests {
                 .expect("writing blob info should succeed");
             storage
                 .as_mut()
-                .merge_update_blob_info(
+                .blob_info
+                .merge_blob_info(
                     blob_id,
-                    BlobInfoMergeOperand::new_change_for_testing(
+                    &BlobInfoMergeOperand::new_change_for_testing(
                         BlobStatusChangeType::Certify,
                         false,
                         0,
@@ -1224,7 +1134,11 @@ pub(crate) mod tests {
     ) -> Result<Vec<BlobId>, TypedStoreError> {
         storage
             .inner
-            .certified_blob_info_iter_before_epoch(new_epoch, after_blob)
+            .blob_info
+            .certified_blob_info_iter_before_epoch(
+                new_epoch,
+                after_blob.map_or(Unbounded, Excluded),
+            )
             .map(|result| result.map(|(id, _info)| id))
             .collect::<Result<Vec<_>, _>>()
     }
@@ -1254,7 +1168,7 @@ pub(crate) mod tests {
         ]);
 
         let mut batch = blob_info.batch();
-        batch.insert_batch(&blob_info, blob_info_map.iter())?;
+        blob_info.insert_batch(&mut batch, blob_info_map.iter())?;
         batch.write()?;
 
         assert_eq!(

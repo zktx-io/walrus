@@ -477,23 +477,26 @@ impl StorageNode {
     /// Continues the event stream from the last committed event.
     async fn continue_event_stream(
         &self,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = IndexedStreamElement> + Send + Sync + '_>>> {
+    ) -> anyhow::Result<(
+        Pin<Box<dyn Stream<Item = IndexedStreamElement> + Send + Sync + '_>>,
+        usize,
+    )> {
         let storage = &self.inner.storage;
-        let from_event_id = storage.get_event_cursor()?.map(|(_, cursor)| cursor);
-        let from_element_index = self.get_last_committed_event_index()?;
-        let event_cursor = EventStreamCursor::new(from_event_id, from_element_index);
+        let (from_event_id, next_event_index) = storage
+            .get_event_cursor_and_next_index()?
+            .map_or((None, 0), |(cursor, index)| (Some(cursor), index));
+        let event_cursor = EventStreamCursor::new(from_event_id, next_event_index);
 
-        Ok(Box::into_pin(
-            self.inner.event_manager.events(event_cursor).await?,
+        Ok((
+            Box::into_pin(self.inner.event_manager.events(event_cursor).await?),
+            next_event_index.try_into().expect("64-bit architecture"),
         ))
     }
 
     async fn process_events(&self) -> anyhow::Result<()> {
-        let event_stream = self.continue_event_stream().await?;
+        let (event_stream, next_event_index) = self.continue_event_stream().await?;
 
-        let from_element_index = self.get_last_committed_event_index()?;
-        let next_index: usize = from_element_index.try_into().expect("64-bit architecture");
-        let index_stream = stream::iter(next_index..);
+        let index_stream = stream::iter(next_event_index..);
         let mut maybe_epoch_at_start = Some(self.inner.committee_service.get_epoch());
 
         let mut indexed_element_stream = index_stream.zip(event_stream);
@@ -522,7 +525,7 @@ impl StorageNode {
 
             if let Some(epoch_at_start) = maybe_epoch_at_start {
                 if let EventStreamElement::ContractEvent(ref event) = stream_element.element {
-                    tracing::debug!("checking the first contract event if we're severaly lagging");
+                    tracing::debug!("checking the first contract event if we're severely lagging");
                     // Clear the starting epoch, so that we never make this check again.
                     maybe_epoch_at_start = None;
 
@@ -587,7 +590,9 @@ impl StorageNode {
         element_index: usize,
         blob_event: BlobEvent,
     ) -> anyhow::Result<()> {
-        self.inner.storage.update_blob_info(&blob_event)?;
+        self.inner
+            .storage
+            .update_blob_info(element_index, &blob_event)?;
         match blob_event {
             BlobEvent::Registered(event) => {
                 tracing::debug!("BlobRegistered event received: {:?}", event);
@@ -652,10 +657,12 @@ impl StorageNode {
     }
 
     #[tracing::instrument(skip_all)]
-    fn get_last_committed_event_index(&self) -> anyhow::Result<u64> {
-        let storage = &self.inner.storage;
-        let index: Option<u64> = storage.get_event_cursor()?.map(|(index, _)| index);
-        Ok(index.unwrap_or(0))
+    fn next_event_index(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .inner
+            .storage
+            .get_event_cursor_and_next_index()?
+            .map_or(0, |(_, index)| index))
     }
 
     #[tracing::instrument(skip_all)]
@@ -2234,8 +2241,8 @@ mod tests {
             .storage_node
             .inner
             .storage
-            .get_event_cursor()?
-            .map(|(_, cursor)| cursor);
+            .get_event_cursor_and_next_index()?
+            .map(|(cursor, _)| cursor);
         assert_eq!(latest_cursor, Some(blob2_registered_event.event_id));
 
         Ok(())
@@ -3051,6 +3058,58 @@ mod tests {
                 .status()
                 .unwrap(),
             ShardStatus::Active
+        );
+        Ok(())
+    }
+
+    async_param_test! {
+        test_update_blob_info_is_idempotent -> TestResult: [
+            empty: (&[], &[]),
+            repeated_register_and_certify: (
+                &[],
+                &[
+                    BlobRegistered::for_testing(BLOB_ID).into(),
+                    BlobCertified::for_testing(BLOB_ID).into(),
+                ]
+            ),
+            repeated_certify: (
+                &[BlobRegistered::for_testing(BLOB_ID).into()],
+                &[BlobCertified::for_testing(BLOB_ID).into()]
+            ),
+        ]
+    }
+    async fn test_update_blob_info_is_idempotent(
+        setup_events: &[BlobEvent],
+        repeated_events: &[BlobEvent],
+    ) -> TestResult {
+        let node = StorageNodeHandle::builder()
+            .with_system_event_provider(vec![])
+            .with_shard_assignment(&[ShardIndex(0)])
+            .with_node_started(true)
+            .build()
+            .await?;
+        let count_setup_events = setup_events.len();
+        for (index, event) in setup_events
+            .iter()
+            .chain(repeated_events.iter())
+            .enumerate()
+        {
+            node.storage_node
+                .inner
+                .storage
+                .update_blob_info(index, event)?;
+        }
+        let intermediate_blob_info = node.storage_node.inner.storage.get_blob_info(&BLOB_ID)?;
+
+        for (index, event) in repeated_events.iter().enumerate() {
+            node.storage_node
+                .inner
+                .storage
+                .update_blob_info(index + count_setup_events, event)?;
+        }
+        assert_eq!(
+            intermediate_blob_info,
+            node.storage_node.inner.storage.get_blob_info(&BLOB_ID)?
         );
         Ok(())
     }

@@ -6,6 +6,7 @@
 use core::fmt::{self, Display};
 use std::{
     collections::HashSet,
+    ops::Bound::{Excluded, Unbounded},
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -42,7 +43,10 @@ use walrus_core::{
     SliverType,
 };
 
-use super::{blob_info::BlobInfo, BlobInfoIterator, DatabaseConfig};
+use super::{
+    blob_info::{BlobInfo, BlobInfoIterator},
+    DatabaseConfig,
+};
 use crate::node::{config::ShardSyncConfig, errors::SyncShardClientError, StorageNodeInner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -543,7 +547,11 @@ impl ShardStorage {
 
         let mut blob_info_iter = node
             .storage
-            .certified_blob_info_iter_before_epoch(epoch, last_synced_blob_id);
+            .blob_info
+            .certified_blob_info_iter_before_epoch(
+                epoch,
+                last_synced_blob_id.map_or(Unbounded, Excluded),
+            );
 
         let mut next_blob_info = blob_info_iter.next().transpose()?;
         // For transitioning from GENESIS epoch to epoch 1, since GENESIS epoch does not have
@@ -1296,15 +1304,18 @@ mod tests {
             )?;
         }
 
-        let sorted_blob_ids = blob_info.keys().collect::<Result<Vec<_>, _>>()?;
+        let sorted_blob_ids = blob_info.keys()?;
         blob_info.remove(&sorted_blob_ids[4])?;
         blob_info.remove(&sorted_blob_ids[7])?;
 
         let shard = storage.as_ref().shard_storage(SHARD_INDEX).unwrap();
-        let mut blob_info_iter = storage.inner.certified_blob_info_iter_before_epoch(
-            new_epoch,
-            Some(sorted_blob_ids[next_blob_info_index]),
-        );
+        let mut blob_info_iter = storage
+            .inner
+            .blob_info
+            .certified_blob_info_iter_before_epoch(
+                new_epoch,
+                Excluded(sorted_blob_ids[next_blob_info_index]),
+            );
         let next_certified_blob_to_check = shard.check_and_record_missing_blobs_in_test(
             &mut blob_info_iter,
             Some((
