@@ -13,16 +13,13 @@
 // - get "epoch_sync_done" event
 module walrus::staking_inner;
 
-use std::{
-    fixed_point32::FixedPoint32,
-    string::String,
-};
+use std::{fixed_point32::FixedPoint32, string::String};
 use sui::{
     balance::{Self, Balance},
     clock::Clock,
     coin::Coin,
     object_table::{Self, ObjectTable},
-    vec_map,
+    vec_map
 };
 use wal::wal::WAL;
 use walrus::{
@@ -33,7 +30,7 @@ use walrus::{
     events,
     staked_wal::StakedWal,
     staking_pool::{Self, StakingPool},
-    storage_node::{StorageNodeCap },
+    storage_node::StorageNodeCap,
     walrus_context::{Self, WalrusContext}
 };
 
@@ -60,10 +57,17 @@ const ENotImplemented: vector<u8> = b"Function is not implemented";
 const EWrongEpochState: vector<u8> = b"Current epoch state does not allow this operation";
 
 #[error]
+const EInvalidSyncEpoch: vector<u8> =
+    b"The epoch of the epoch sync done call does not match the current epoch";
+
+#[error]
 const EDuplicateSyncDone: vector<u8> = b"Node already attested that sync is done for this epoch";
 
 #[error]
 const ENoStake: vector<u8> = b"Total stake is zero for apportionment";
+
+#[error]
+const ENotInCommittee: vector<u8> = b"The node is not part of the current committee";
 
 /// The epoch state.
 public enum EpochState has store, copy, drop {
@@ -367,9 +371,8 @@ public(package) fun select_committee(self: &mut StakingInnerV1) {
 
     // if we're dealing with the first epoch, we need to assign the shards to the
     // nodes in a sequential manner. Assuming there's at least 1 node in the set.
-    let committee =
-        if (self.committee.size() == 0) committee::initialize(distribution)
-        else self.committee.transition(distribution);
+    let committee = if (self.committee.size() == 0) committee::initialize(distribution)
+    else self.committee.transition(distribution);
 
     self.next_committee = option::some(committee);
 }
@@ -507,11 +510,9 @@ fun dhondt(
 }
 
 use fun fp_add as FixedPoint32.add;
+
 fun fp_add(a: FixedPoint32, b: FixedPoint32): FixedPoint32 {
-    use std::fixed_point32::{
-        create_from_raw_value as from_raw,
-        get_raw_value as to_raw,
-    };
+    use std::fixed_point32::{create_from_raw_value as from_raw, get_raw_value as to_raw};
     let sum = (a.to_raw() as u128) + (b.to_raw() as u128);
     // TODO use std::u64::max_value!()
     assert!(sum <= 0xFFFF_FFFF_FFFF_FFFF);
@@ -582,14 +583,18 @@ public(package) fun advance_epoch(self: &mut StakingInnerV1, mut rewards: Balanc
 public(package) fun epoch_sync_done(
     self: &mut StakingInnerV1,
     cap: &mut StorageNodeCap,
+    epoch: u32,
     clock: &Clock,
 ) {
     // Make sure the node hasn't attested yet, and set the new epoch as the last sync done epoch.
+    assert!(epoch == self.epoch, EInvalidSyncEpoch);
     assert!(cap.last_epoch_sync_done() < self.epoch, EDuplicateSyncDone);
     cap.set_last_epoch_sync_done(self.epoch);
 
+    assert!(self.committee.inner().contains(&cap.node_id()), ENotInCommittee);
     let node_shards = self.committee.shards(&cap.node_id());
-    match (self.epoch_state) {EpochState::EpochChangeSync(weight) => {
+    match (self.epoch_state) {
+        EpochState::EpochChangeSync(weight) => {
             let weight = weight + (node_shards.length() as u16);
             if (is_quorum(weight, self.n_shards)) {
                 self.epoch_state = EpochState::EpochChangeDone(clock.timestamp_ms());
@@ -597,7 +602,9 @@ public(package) fun epoch_sync_done(
             } else {
                 self.epoch_state = EpochState::EpochChangeSync(weight);
             }
-        }, _ => {}};
+        },
+        _ => {},
+    };
     // Emit the event that the node has received all shards.
     events::emit_shards_received(self.epoch, *node_shards);
 }
@@ -646,10 +653,7 @@ public(package) fun borrow_mut(self: &mut StakingInnerV1, node_id: ID): &mut Sta
 }
 
 #[test_only]
-public(package) fun pub_dhondt(
-    n_shards: u16,
-    stake: vector<u64>,
-): (FixedPoint32, vector<u16>) {
+public(package) fun pub_dhondt(n_shards: u16, stake: vector<u64>): (FixedPoint32, vector<u16>) {
     // TODO better ranking
     let ranking = {
         // TODO use std::vector::tabulate
