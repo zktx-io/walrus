@@ -233,8 +233,7 @@ public(package) fun set_next_commission(
     cap: &StorageNodeCap,
     commission_rate: u64,
 ) {
-    let wctx = &self.new_walrus_context();
-    self.pools[cap.node_id()].set_next_commission(commission_rate, wctx);
+    self.pools[cap.node_id()].set_next_commission(commission_rate);
 }
 
 /// Sets the next storage price for the pool.
@@ -243,8 +242,7 @@ public(package) fun set_next_storage_price(
     cap: &StorageNodeCap,
     storage_price: u64,
 ) {
-    let wctx = &self.new_walrus_context();
-    self.pools[cap.node_id()].set_next_storage_price(storage_price, wctx);
+    self.pools[cap.node_id()].set_next_storage_price(storage_price);
 }
 
 /// Sets the next write price for the pool.
@@ -253,8 +251,7 @@ public(package) fun set_next_write_price(
     cap: &StorageNodeCap,
     write_price: u64,
 ) {
-    let wctx = &self.new_walrus_context();
-    self.pools[cap.node_id()].set_next_write_price(write_price, wctx);
+    self.pools[cap.node_id()].set_next_write_price(write_price);
 }
 
 /// Sets the next node capacity for the pool.
@@ -263,8 +260,7 @@ public(package) fun set_next_node_capacity(
     cap: &StorageNodeCap,
     node_capacity: u64,
 ) {
-    let wctx = &self.new_walrus_context();
-    self.pools[cap.node_id()].set_next_node_capacity(node_capacity, wctx);
+    self.pools[cap.node_id()].set_next_node_capacity(node_capacity);
 }
 
 // === Staking ===
@@ -294,11 +290,11 @@ public(package) fun stake_with_pool(
 ): StakedWal {
     let wctx = &self.new_walrus_context();
     let pool = &mut self.pools[node_id];
-    let staked_wal = pool.stake(to_stake, wctx, ctx);
+    let staked_wal = pool.stake(to_stake.into_balance(), wctx, ctx);
 
     // active set only tracks the stake for the next epoch, pool already knows
     // whether the stake was applied to E+1 or E+2.
-    self.active_set.insert_or_update(node_id, pool.stake_at_epoch(wctx.epoch() + 1));
+    self.active_set.insert_or_update(node_id, pool.wal_balance_at_epoch(wctx.epoch() + 1));
 
     staked_wal
 }
@@ -309,10 +305,10 @@ public(package) fun stake_with_pool(
 public(package) fun request_withdraw_stake(
     self: &mut StakingInnerV1,
     staked_wal: &mut StakedWal,
-    ctx: &mut TxContext,
+    _ctx: &mut TxContext,
 ) {
     let wctx = &self.new_walrus_context();
-    self.pools[staked_wal.node_id()].request_withdraw_stake(staked_wal, wctx, ctx)
+    self.pools[staked_wal.node_id()].request_withdraw_stake(staked_wal, wctx);
 }
 
 /// Perform the withdrawal of the staked WAL, returning the amount to the caller.
@@ -324,7 +320,7 @@ public(package) fun withdraw_stake(
     ctx: &mut TxContext,
 ): Coin<WAL> {
     let wctx = &self.new_walrus_context();
-    self.pools[staked_wal.node_id()].withdraw_stake(staked_wal, wctx, ctx)
+    self.pools[staked_wal.node_id()].withdraw_stake(staked_wal, wctx).into_coin(ctx)
 }
 
 /// Get the current epoch.
@@ -551,11 +547,6 @@ public(package) fun advance_epoch(self: &mut StakingInnerV1, mut rewards: Balanc
 
     let wctx = &self.new_walrus_context();
 
-    self.committee.inner().keys().do_ref!(|node| {
-        self.pools[*node].advance_epoch(wctx);
-        self.active_set.update(*node, self.pools[*node].stake_at_epoch(wctx.epoch() + 1));
-    });
-
     // Distribute the rewards.
 
     // Add any leftover rewards to the rewards to distribute.
@@ -565,12 +556,10 @@ public(package) fun advance_epoch(self: &mut StakingInnerV1, mut rewards: Balanc
     let (node_ids, shard_assignments) = (*self.previous_committee.inner()).into_keys_values();
     // TODO: check if we can combine this with the iteration over the current committee above
     // to reduce the accesses to dynamic fields.
-    node_ids.zip_do!(
-        shard_assignments,
-        |node_id, shards| self
-            .pools[node_id]
-            .add_rewards(rewards.split(rewards_per_shard * shards.length())),
-    );
+    node_ids.zip_do!(shard_assignments, |node_id, shards| {
+        self.pools[node_id].advance_epoch(rewards.split(rewards_per_shard * shards.length()), wctx);
+        self.active_set.update(node_id, self.pools[node_id].wal_balance_at_epoch(wctx.epoch() + 1));
+    });
 
     // Save any leftover rewards due to rounding.
     self.leftover_rewards.join(rewards);

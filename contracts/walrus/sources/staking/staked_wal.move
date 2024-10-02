@@ -12,13 +12,37 @@ module walrus::staked_wal;
 use sui::balance::Balance;
 use wal::wal::WAL;
 
-/// The state of the staked WAL.
+#[error]
+const ENotWithdrawing: vector<u8> =
+    b"`withdrawing_epoch` can only be accessed for staked WAL in `Withdrawing` state";
+
+#[error]
+const EMetadataMismatch: vector<u8> =
+    b"`join` operation can only be performed on staked WALs with matching metadata";
+
+#[error]
+const EInvalidAmount: vector<u8> = b"Amount is higher than the staked WAL value";
+
+#[error]
+// TODO: possibly enable this behavior in the future
+const ECantJoinWithdrawing: vector<u8> = b"Cannot join a staked WAL in the `Withdrawing` state";
+
+#[error]
+// TODO: possibly enable this behavior in the future
+const ECantSplitWithdrawing: vector<u8> = b"Cannot split a staked WAL in the `Withdrawing` state";
+
+#[error]
+const ENonZeroPrincipal: vector<u8> = b"Principal must be zero to destroy the staked WAL";
+
+/// The state of the staked WAL. It can be either `Staked` or `Withdrawing`.
+/// The `Withdrawing` state contains the epoch when the staked WAL can be
+///
 public enum StakedWalState has store, copy, drop {
     // Default state of the staked WAL - it is staked in the staking pool.
     Staked,
     // The staked WAL is in the process of withdrawing. The value inside the
     // variant is the epoch when the staked WAL can be withdrawn.
-    Withdrawing(u32),
+    Withdrawing { withdraw_epoch: u32, pool_token_amount: u64 },
 }
 
 /// Represents a staked WAL, does not store the `Balance` inside, but uses
@@ -56,15 +80,19 @@ public(package) fun mint(
 }
 
 /// Burns the staked WAL and returns the `principal`.
-public(package) fun unwrap(sw: StakedWal): Balance<WAL> {
+public(package) fun into_balance(sw: StakedWal): Balance<WAL> {
     let StakedWal { id, principal, .. } = sw;
     id.delete();
     principal
 }
 
 /// Sets the staked WAL state to `Withdrawing`
-public(package) fun set_withdrawing(sw: &mut StakedWal, withdraw_epoch: u32) {
-    sw.state = StakedWalState::Withdrawing(withdraw_epoch);
+public(package) fun set_withdrawing(
+    sw: &mut StakedWal,
+    withdraw_epoch: u32,
+    pool_token_amount: u64,
+) {
+    sw.state = StakedWalState::Withdrawing { withdraw_epoch, pool_token_amount };
 }
 
 // === Accessors ===
@@ -85,8 +113,26 @@ public fun is_staked(sw: &StakedWal): bool { sw.state == StakedWalState::Staked 
 /// Checks whether the staked WAL is in the `Withdrawing` state.
 public fun is_withdrawing(sw: &StakedWal): bool {
     match (sw.state) {
-        StakedWalState::Withdrawing(_) => true,
+        StakedWalState::Withdrawing { .. } => true,
         _ => false,
+    }
+}
+
+/// Returns the `withdraw_epoch` of the staked WAL if it is in the `Withdrawing`.
+/// Aborts otherwise.
+public fun withdraw_epoch(sw: &StakedWal): u32 {
+    match (sw.state) {
+        StakedWalState::Withdrawing { withdraw_epoch, .. } => withdraw_epoch,
+        _ => abort ENotWithdrawing,
+    }
+}
+
+/// Return the `withdraw_amount` of the staked WAL if it is in the `Withdrawing`.
+/// Aborts otherwise.
+public fun pool_token_amount(sw: &StakedWal): u64 {
+    match (sw.state) {
+        StakedWalState::Withdrawing { pool_token_amount, .. } => pool_token_amount,
+        _ => abort ENotWithdrawing,
     }
 }
 
@@ -102,9 +148,11 @@ public fun is_withdrawing(sw: &StakedWal): bool {
 /// Aborts if the `node_id` or `activation_epoch` of the staked WALs do not match.
 public fun join(sw: &mut StakedWal, other: StakedWal) {
     let StakedWal { id, state, node_id, activation_epoch, principal } = other;
-    assert!(sw.state == state);
-    assert!(sw.node_id == node_id);
-    assert!(sw.activation_epoch == activation_epoch);
+    assert!(sw.state == state, EMetadataMismatch);
+    assert!(sw.node_id == node_id, EMetadataMismatch);
+    assert!(!sw.is_withdrawing(), ECantJoinWithdrawing);
+    assert!(sw.activation_epoch == activation_epoch, EMetadataMismatch);
+
     id.delete();
 
     sw.principal.join(principal);
@@ -116,7 +164,8 @@ public fun join(sw: &mut StakedWal, other: StakedWal) {
 ///
 /// Aborts if the `amount` is greater than the `principal` of the staked WAL.
 public fun split(sw: &mut StakedWal, amount: u64, ctx: &mut TxContext): StakedWal {
-    assert!(sw.principal.value() >= amount);
+    assert!(sw.principal.value() >= amount, EInvalidAmount);
+    assert!(!sw.is_withdrawing(), ECantSplitWithdrawing);
 
     StakedWal {
         id: object::new(ctx),
@@ -130,8 +179,15 @@ public fun split(sw: &mut StakedWal, amount: u64, ctx: &mut TxContext): StakedWa
 /// Destroys the staked WAL if the `principal` is zero. Ignores the `node_id`
 /// and `activation_epoch` of the staked WAL given that it is zero.
 public fun destroy_zero(sw: StakedWal) {
-    assert!(sw.principal.value() == 0);
+    assert!(sw.principal.value() == 0, ENonZeroPrincipal);
     let StakedWal { id, principal, .. } = sw;
     principal.destroy_zero();
+    id.delete();
+}
+
+#[test_only]
+public fun destroy_for_testing(sw: StakedWal) {
+    let StakedWal { id, principal, .. } = sw;
+    principal.destroy_for_testing();
     id.delete();
 }

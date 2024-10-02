@@ -20,6 +20,31 @@ use walrus::{
     walrus_context::{Self, WalrusContext}
 };
 
+/// Debug macro for pretty printing values.
+/// The value must have a `.to_string()` method.
+public macro fun dbg<$T: drop>($note: vector<u8>, $value: $T) {
+    use std::debug::print;
+    let note = $note;
+    let value = $value;
+    print(&note.to_string());
+    print(&value)
+}
+
+/// Helper macro to assert equality of two values. Both values must be copyable
+/// and have a `.to_string()` method.
+public macro fun assert_eq<$T: copy>($left: $T, $right: $T) {
+    let left = $left;
+    let right = $right;
+    if (left != right) {
+        let mut str = b"assertion failed: ".to_string();
+        str.append(left.to_string());
+        str.append(b" != ".to_string());
+        str.append(right.to_string());
+        std::debug::print(&str);
+        assert!(false);
+    }
+}
+
 // === Coins and Context ===
 
 public fun wctx(epoch: u32, committee_selected: bool): WalrusContext {
@@ -32,6 +57,50 @@ public fun mint(amount: u64, ctx: &mut TxContext): Coin<WAL> {
 
 public fun mint_balance(amount: u64): Balance<WAL> {
     balance::create_for_testing(amount)
+}
+
+// === Context Runner ===
+
+public struct ContextRunner has drop {
+    epoch: u32,
+    ctx: TxContext,
+    committee_selected: bool,
+}
+
+/// Creates a new context runner with default values.
+public fun context_runner(): ContextRunner {
+    ContextRunner {
+        epoch: 0,
+        ctx: tx_context::dummy(),
+        committee_selected: false,
+    }
+}
+
+public fun epoch(self: &ContextRunner): u32 { self.epoch }
+public fun is_committee_selected(self: &ContextRunner): bool { self.committee_selected }
+
+/// Returns the current context and the transaction context.
+public fun current(self: &mut ContextRunner): (WalrusContext, &mut TxContext) {
+    (wctx(self.epoch, self.committee_selected), &mut self.ctx)
+}
+
+/// Selects committee
+public fun select_committee(self: &mut ContextRunner): (WalrusContext, &mut TxContext) {
+    self.committee_selected = true;
+    (wctx(self.epoch, self.committee_selected), &mut self.ctx)
+}
+
+/// Advances the epoch by one.
+public fun next_epoch(self: &mut ContextRunner): (WalrusContext, &mut TxContext) {
+    self.committee_selected = false;
+    self.epoch = self.epoch + 1;
+    (wctx(self.epoch, self.committee_selected), &mut self.ctx)
+}
+
+/// Macro to run `next_epoch` in a lambda.
+public macro fun next_epoch_tx($self: &mut ContextRunner, $f: |&WalrusContext, &mut TxContext|) {
+    let (wctx, ctx) = next_epoch($self);
+    $f(&wctx, ctx)
 }
 
 // === Pool Builder ===
