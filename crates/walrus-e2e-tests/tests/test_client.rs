@@ -164,9 +164,15 @@ async fn test_inconsistency(failed_shards: &[usize]) -> TestResult {
         SliverPairIndex::new(1).to_shard_index(NonZeroU16::new(13).unwrap(), &blob_id)
     );
     // Register blob.
-    let blob_sui_object = client
+    let (blob_sui_object, _) = client
         .as_ref()
-        .get_blob_registration(&metadata, 1, BlobPersistence::Permanent)
+        .resource_manager()
+        .get_existing_registration(
+            &metadata,
+            1,
+            BlobPersistence::Permanent,
+            StoreWhen::NotStored,
+        )
         .await?;
 
     // Wait to ensure that the storage nodes received the registration event.
@@ -258,12 +264,14 @@ async fn test_store_with_existing_blob_resource(
     let metadata = VerifiedBlobMetadataWithId::new_verified_unchecked(blob_id, metadata);
 
     // Register a new blob.
-    let original_blob_object = client
+    let (original_blob_object, _) = client
         .as_ref()
-        .get_blob_registration(
+        .resource_manager()
+        .get_existing_registration(
             &metadata,
             epochs_ahead_registered,
             BlobPersistence::Permanent,
+            StoreWhen::NotStored,
         )
         .await?;
 
@@ -442,6 +450,63 @@ async fn test_storage_nodes_delete_data_for_deleted_blobs() -> TestResult {
         read_result.unwrap_err().kind(),
         ClientErrorKind::BlobIdDoesNotExist,
     ));
+
+    Ok(())
+}
+
+/// Tests that storing the same blob multiple times with possibly different end epochs,
+/// persistence, and force-store conditions always works.
+#[ignore = "ignore E2E tests by default"]
+#[tokio::test]
+async fn test_multiple_stores_same_blob() -> TestResult {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (_sui_cluster_handle, _cluster, client) = test_cluster::default_setup().await?;
+    let client = client.as_ref();
+    let blob = walrus_test_utils::random_data(314);
+
+    // NOTE: not in a param_test, because we want to test these store operations in sequence.
+    // If the last `bool` parameter is `true`, the store operation should return a
+    // `BlobStoreResult::AlreadyCertified`. Otherwise, it should return a
+    // `BlobStoreResult::NewlyCreated`.
+    let configurations = vec![
+        (1, StoreWhen::NotStored, BlobPersistence::Deletable, false),
+        (1, StoreWhen::Always, BlobPersistence::Deletable, false),
+        (2, StoreWhen::NotStored, BlobPersistence::Deletable, false),
+        (3, StoreWhen::Always, BlobPersistence::Deletable, false),
+        (1, StoreWhen::NotStored, BlobPersistence::Permanent, false),
+        (1, StoreWhen::NotStored, BlobPersistence::Permanent, true),
+        (1, StoreWhen::Always, BlobPersistence::Permanent, false),
+        (4, StoreWhen::NotStored, BlobPersistence::Permanent, false),
+        (2, StoreWhen::NotStored, BlobPersistence::Permanent, true),
+        (2, StoreWhen::Always, BlobPersistence::Permanent, false),
+        (1, StoreWhen::NotStored, BlobPersistence::Deletable, true),
+        (5, StoreWhen::NotStored, BlobPersistence::Deletable, false),
+    ];
+
+    for (epochs, store_when, persistence, is_already_certified) in configurations {
+        let result = client
+            .reserve_and_store_blob(&blob, epochs, store_when, persistence)
+            .await?;
+
+        println!(
+            "epochs: {}, store_when: {:?}, persistence: {:?}, is_already_certified: {}",
+            epochs, store_when, persistence, is_already_certified
+        );
+        match result {
+            BlobStoreResult::NewlyCreated { .. } => {
+                assert!(!is_already_certified, "the blob should be newly stored");
+            }
+            BlobStoreResult::AlreadyCertified { .. } => {
+                assert!(is_already_certified, "the blob should be already stored");
+            }
+            _ => panic!("we either store the blob, or find it's already created"),
+        }
+    }
+
+    // At the end of all the operations above, count the number of blob objects owned by the
+    // client.
+    let blobs = client.sui_client().owned_blobs(false).await?;
+    assert_eq!(blobs.len(), 9);
 
     Ok(())
 }

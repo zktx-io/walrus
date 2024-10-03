@@ -9,18 +9,13 @@ use anyhow::anyhow;
 use communication::NodeCommunicationFactory;
 use fastcrypto::{bls12381::min_pk::BLS12381AggregateSignature, traits::AggregateAuthenticator};
 use futures::Future;
+use resource::{PriceComputation, ResourceManager, StoreOp};
+use responses::EventOrObjectId;
 use sui_types::base_types::ObjectID;
 use tokio::{sync::Semaphore, time::Duration};
 use tracing::{Instrument, Level};
 use walrus_core::{
-    encoding::{
-        encoded_blob_length_for_n_shards,
-        BlobDecoder,
-        EncodingAxis,
-        EncodingConfig,
-        SliverData,
-        SliverPair,
-    },
+    encoding::{BlobDecoder, EncodingAxis, EncodingConfig, SliverData, SliverPair},
     ensure,
     messages::{Confirmation, ConfirmationCertificate, SignedStorageConfirmation},
     metadata::VerifiedBlobMetadataWithId,
@@ -33,7 +28,6 @@ use walrus_sdk::{api::BlobStatus, error::NodeError};
 use walrus_sui::{
     client::{BlobPersistence, ContractClient, ReadClient},
     types::{Blob, BlobEvent},
-    utils::storage_price_for_encoded_length,
 };
 
 use self::{
@@ -64,6 +58,8 @@ pub use daemon::ClientDaemon;
 
 mod error;
 pub use error::{ClientError, ClientErrorKind};
+
+mod resource;
 
 mod utils;
 pub use utils::string_prefix;
@@ -101,7 +97,7 @@ pub struct Client<T> {
     config: Config,
     sui_client: T,
     committees: Arc<ActiveCommittees>,
-    storage_price_per_unit_size: u64,
+    price_computation: PriceComputation,
     communication_limits: CommunicationLimits,
     // The `Arc` is used to share the encoding config with the `communication_factory` without
     // introducing lifetimes.
@@ -122,10 +118,10 @@ impl Client<()> {
                 .map_err(ClientError::other)?,
         ));
 
-        let storage_price_per_unit_size = sui_read_client
-            .storage_price_per_unit_size()
-            .await
-            .map_err(ClientError::other)?;
+        let (storage_price, write_price) = sui_read_client
+            .storage_and_write_price_per_unit_size()
+            .await?;
+        let price_computation = PriceComputation::new(storage_price, write_price);
 
         let encoding_config = EncodingConfig::new(committees.n_shards());
         let communication_limits =
@@ -136,7 +132,7 @@ impl Client<()> {
         Ok(Self {
             sui_client: (),
             committees: committees.clone(),
-            storage_price_per_unit_size,
+            price_computation,
             encoding_config: encoding_config.clone(),
             communication_limits,
             blocklist: None,
@@ -155,7 +151,7 @@ impl Client<()> {
             config,
             sui_client: _,
             committees,
-            storage_price_per_unit_size,
+            price_computation,
             encoding_config,
             communication_limits,
             blocklist,
@@ -165,7 +161,7 @@ impl Client<()> {
             config,
             sui_client,
             committees,
-            storage_price_per_unit_size,
+            price_computation,
             encoding_config,
             communication_limits,
             blocklist,
@@ -232,6 +228,7 @@ impl<T: ContractClient> Client<T> {
         let blob_id = *metadata.blob_id();
         self.check_blob_id(&blob_id)?;
         tracing::Span::current().record("blob_id", blob_id.to_string());
+
         let pair = pairs.first().expect("the encoding produces sliver pairs");
         let symbol_size = pair.primary.symbols.symbol_size().get();
         tracing::debug!(
@@ -242,59 +239,34 @@ impl<T: ContractClient> Client<T> {
         );
 
         // Return early if the blob is already certified or marked as invalid.
-        if !store_when.is_store_always() {
+        // For deletable blobs, we need to check the ones that are owned by the current wallet
+        // later, as there may be multiple already certified that we do not own.
+        if !store_when.is_store_always() && !persistence.is_deletable() {
             // Use short timeout as this is only an optimization.
             const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-
-            match self
+            let blob_status = self
                 .get_verified_blob_status(
                     metadata.blob_id(),
                     self.sui_client.read_client(),
                     STATUS_TIMEOUT,
                 )
-                .await?
+                .await?;
+            if let Some(result) =
+                self.blob_status_to_store_result(blob_id, epochs_ahead, blob_status)
             {
-                BlobStatus::Permanent {
-                    end_epoch,
-                    is_certified: true,
-                    status_event,
-                    ..
-                } => {
-                    if end_epoch >= self.committees.write_committee().epoch + epochs_ahead {
-                        tracing::debug!(end_epoch, "blob is already certified");
-                        return Ok(BlobStoreResult::AlreadyCertified {
-                            blob_id,
-                            event: status_event,
-                            end_epoch,
-                        });
-                    } else {
-                        tracing::debug!(
-                        end_epoch,
-                        "blob is already certified but its lifetime is too short; creating new one"
-                    );
-                    }
-                }
-                BlobStatus::Invalid { event } => {
-                    tracing::debug!("blob is marked as invalid");
-                    return Ok(BlobStoreResult::MarkedInvalid { blob_id, event });
-                }
-                status => {
-                    // We intentionally don't check for "registered" blobs here: even if the blob is
-                    // already registered, we cannot certify it without access to the corresponding
-                    // Sui object. The check to see if we own the registered-but-not-certified Blob
-                    // object is done in `reserve_and_register_blob`.
-                    tracing::debug!(
-                        ?status,
-                        "no corresponding permanent certified `Blob` object exists"
-                    );
-                }
+                return Ok(result);
             }
-        }
+        };
 
-        // Get an appropriate registered blob object.
-        let mut blob = self
-            .get_blob_registration(&metadata, epochs_ahead, persistence)
+        let (mut blob, store_operation) = self
+            .resource_manager()
+            .get_blob_registration(&metadata, epochs_ahead, persistence, store_when)
             .await?;
+
+        let resource_operation = match store_operation {
+            StoreOp::NoOp(result) => return Ok(result),
+            StoreOp::RegisterNew(op) => op,
+        };
 
         // We do not need to wait explicitly as we anyway retry all requests to storage nodes.
         let certificate = self
@@ -304,113 +276,66 @@ impl<T: ContractClient> Client<T> {
             .certify_blob(blob.clone(), &certificate)
             .await
             .map_err(|e| ClientError::from(ClientErrorKind::CertificationFailed(e)))?;
-
-        // TODO(mlegner): Make sure this works if the epoch changes. (#753)
         blob.certified_epoch = Some(self.committees.write_committee().epoch);
+        let cost = self.price_computation.operation_cost(&resource_operation);
 
-        let encoded_size =
-            encoded_blob_length_for_n_shards(self.encoding_config.n_shards(), blob.size)
-                .expect("must be valid as the store succeeded");
-        // TODO(mlegner): Fix prices. (#820)
-        let cost = storage_price_for_encoded_length(
-            encoded_size,
-            self.storage_price_per_unit_size,
-            epochs_ahead,
-        );
         Ok(BlobStoreResult::NewlyCreated {
             blob_object: blob,
-            encoded_size,
+            resource_operation,
             cost,
-            deletable: persistence.is_deletable(),
         })
     }
 
-    /// Returns a [`Blob`] registration object for the specified metadata and number of epochs.
-    ///
-    /// Tries to reuse existing blob registrations or storage resources if possible.
-    /// Specifically:
-    /// - First, it checks if the blob is registered and returns the corresponding [`Blob`];
-    /// - otherwise, it checks if there is an appropriate storage resource (with sufficient space
-    ///   and for a sufficient duration) that can be used to register the blob; or
-    /// - if the above fails, it purchases a new storage resource and registers the blob.
-    #[tracing::instrument(skip_all, err(level = Level::DEBUG))]
-    pub async fn get_blob_registration(
+    /// Checks if blob of the given status is already in a state for which we can return.
+    fn blob_status_to_store_result(
         &self,
-        metadata: &VerifiedBlobMetadataWithId,
+        blob_id: BlobId,
         epochs_ahead: EpochCount,
-        persistence: BlobPersistence,
-    ) -> ClientResult<Blob> {
-        let blob = if let Some(blob) = self
-            .is_blob_registered_in_wallet(metadata.blob_id(), epochs_ahead, persistence)
-            .await?
-        {
-            tracing::debug!(
-                end_epoch=%blob.storage.end_epoch,
-                "blob is already registered and valid; using the existing registration"
-            );
-            blob
-        } else if let Some(storage_resource) = self
-            .sui_client
-            .owned_storage_for_size_and_epoch(
-                metadata.metadata().encoded_size().ok_or_else(|| {
-                    ClientError::other(ClientErrorKind::Other(
-                        anyhow!(
-                            "the provided metadata is invalid: could not compute the encoded size"
-                        )
-                        .into(),
-                    ))
-                })?,
-                epochs_ahead + self.committees.write_committee().epoch,
-            )
-            .await?
-        {
-            tracing::debug!(
-                storage_object=%storage_resource.id,
-                "using an existing storage resource to register the blob"
-            );
-            self.sui_client
-                .register_blob(
-                    &storage_resource,
-                    *metadata.blob_id(),
-                    metadata.metadata().compute_root_hash().bytes(),
-                    metadata.metadata().unencoded_length,
-                    metadata.metadata().encoding_type,
-                    persistence,
-                )
-                .await?
-        } else {
-            tracing::debug!(
-                "the blob is not already registered or its lifetime is too short; creating new one"
-            );
-            self.sui_client
-                .reserve_and_register_blob(epochs_ahead, metadata, persistence)
-                .await?
-        };
-        Ok(blob)
+        blob_status: BlobStatus,
+    ) -> Option<BlobStoreResult> {
+        match blob_status {
+            BlobStatus::Permanent {
+                end_epoch,
+                is_certified: true,
+                status_event,
+                ..
+            } => {
+                if end_epoch >= self.committees.write_committee().epoch + epochs_ahead {
+                    tracing::debug!(end_epoch, "blob is already certified");
+                    Some(BlobStoreResult::AlreadyCertified {
+                        blob_id,
+                        event_or_object: EventOrObjectId::Event(status_event),
+                        end_epoch,
+                    })
+                } else {
+                    tracing::debug!(
+                        end_epoch,
+                        "blob is already certified but its lifetime is too short"
+                    );
+                    None
+                }
+            }
+            BlobStatus::Invalid { event } => {
+                tracing::debug!("blob is marked as invalid");
+                Some(BlobStoreResult::MarkedInvalid { blob_id, event })
+            }
+            status => {
+                // We intentionally don't check for "registered" blobs here: even if the blob is
+                // already registered, we cannot certify it without access to the corresponding
+                // Sui object. The check to see if we own the registered-but-not-certified Blob
+                // object is done in `reserve_and_register_blob`.
+                tracing::debug!(
+                    ?status,
+                    "no corresponding permanent certified `Blob` object exists"
+                );
+                None
+            }
+        }
     }
 
-    /// Checks if the blob is registered by the active wallet for a sufficient duration.
-    ///
-    /// To compute if the blob is registered for a sufficient duration, it uses the epoch of the
-    /// current `write_committee`. This is because registration needs to be valid compared to a new
-    /// registration that would be made now to write a new blob.
-    async fn is_blob_registered_in_wallet(
-        &self,
-        blob_id: &BlobId,
-        epochs_ahead: EpochCount,
-        persistence: BlobPersistence,
-    ) -> ClientResult<Option<Blob>> {
-        Ok(self
-            .sui_client
-            .owned_blobs(false)
-            .await?
-            .into_iter()
-            .find(|blob| {
-                blob.blob_id == *blob_id
-                    && blob.storage.end_epoch
-                        >= self.committees.write_committee().epoch + epochs_ahead
-                    && blob.deletable == persistence.is_deletable()
-            }))
+    /// Creates a resource manager for the client.
+    pub fn resource_manager(&self) -> ResourceManager<T> {
+        ResourceManager::new(&self.sui_client, self.committees.write_committee().epoch)
     }
 
     // Blob deletion

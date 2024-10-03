@@ -4,6 +4,7 @@
 //! Structures of client results returned by the daemon or through the JSON API.
 
 use std::{
+    fmt::Display,
     num::NonZeroU16,
     path::{Path, PathBuf},
 };
@@ -32,10 +33,36 @@ use walrus_sdk::api::BlobStatus;
 use walrus_sui::{
     client::ReadClient,
     types::{Blob, Committee, NetworkAddress, StorageNode},
-    utils::{storage_price_for_encoded_length, storage_units_from_size, BYTES_PER_UNIT_SIZE},
+    utils::{price_for_encoded_length, storage_units_from_size, BYTES_PER_UNIT_SIZE},
 };
 
-use super::cli::{BlobIdDecimal, HumanReadableBytes, HumanReadableMist};
+use super::{
+    cli::{BlobIdDecimal, HumanReadableBytes},
+    resource::RegisterBlobOp,
+};
+use crate::client::cli::{format_event_id, HumanReadableGeorgie};
+
+/// Either an event ID or an object ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EventOrObjectId {
+    /// The variant representing an event ID.
+    Event(EventID),
+    /// The variant representing an object ID.
+    Object(ObjectID),
+}
+
+impl Display for EventOrObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventOrObjectId::Event(event_id) => {
+                write!(f, "Certification event ID: {}", format_event_id(event_id))
+            }
+            EventOrObjectId::Object(object_id) => {
+                write!(f, "Owned Blob registration object ID: {}", object_id)
+            }
+        }
+    }
+}
 
 /// Result when attempting to store a blob.
 #[serde_as]
@@ -48,8 +75,11 @@ pub enum BlobStoreResult {
         /// The blob ID.
         #[serde_as(as = "DisplayFromStr")]
         blob_id: BlobId,
-        /// The event where the blob was certified.
-        event: EventID,
+        /// The event where the blob was certified, or the object ID of the registered blob.
+        ///
+        /// The object ID of the registered blob is used in place of the event ID when the blob is
+        /// deletable, already certified, and owned by the client.
+        event_or_object: EventOrObjectId,
         /// The epoch until which the blob is stored (exclusive).
         #[schema(value_type = u64)]
         end_epoch: Epoch,
@@ -59,12 +89,10 @@ pub enum BlobStoreResult {
     NewlyCreated {
         /// The Sui blob object that holds the newly created blob.
         blob_object: Blob,
-        /// The encoded size, including metadata.
-        encoded_size: u64,
+        /// The operation that created the blob.
+        resource_operation: RegisterBlobOp,
         /// The storage cost, excluding gas.
         cost: u64,
-        /// Whether the blob is deletable.
-        deletable: bool,
     },
     /// The blob is known to Walrus but was marked as invalid.
     ///
@@ -244,7 +272,7 @@ impl ExampleBlobInfo {
         price_per_unit_size: u64,
     ) -> Option<Self> {
         let encoded_size = encoded_blob_length_for_n_shards(n_shards, unencoded_size)?;
-        let price = storage_price_for_encoded_length(encoded_size, price_per_unit_size, 1);
+        let price = price_for_encoded_length(encoded_size, price_per_unit_size, 1);
         Some(Self {
             unencoded_size,
             encoded_size,
@@ -257,7 +285,7 @@ impl ExampleBlobInfo {
             "{} unencoded ({} encoded): {} per epoch",
             HumanReadableBytes(self.unencoded_size),
             HumanReadableBytes(self.encoded_size),
-            HumanReadableMist(self.price)
+            HumanReadableGeorgie::from(self.price)
         )
     }
 }

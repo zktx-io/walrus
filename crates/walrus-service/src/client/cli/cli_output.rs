@@ -19,8 +19,9 @@ use crate::client::{
         success,
         thousands_separator,
         HumanReadableBytes,
-        HumanReadableMist,
+        HumanReadableGeorgie,
     },
+    resource::RegisterBlobOp,
     responses::{
         BlobIdConversionOutput,
         BlobIdOutput,
@@ -57,38 +58,50 @@ impl CliOutput for BlobStoreResult {
         match &self {
             Self::AlreadyCertified {
                 blob_id,
-                event,
+                event_or_object,
                 end_epoch,
             } => {
                 println!(
                     "{} Blob was previously certified within Walrus for a sufficient period.\n\
-                    Blob ID: {}\nCertification event ID: {}\nEnd epoch (exclusive): {}",
+                    Blob ID: {}\n{event_or_object}\nEnd epoch (exclusive): {}",
                     success(),
                     blob_id,
-                    format_event_id(event),
                     end_epoch,
                 )
             }
             Self::NewlyCreated {
                 blob_object,
-                encoded_size,
+                resource_operation,
                 cost,
-                deletable,
             } => {
+                let operation_str = match resource_operation {
+                    RegisterBlobOp::RegisterFromScratch { .. } => {
+                        "(storage was purchased, and a new blob object was registered)"
+                    }
+                    RegisterBlobOp::ReuseStorage { .. } => {
+                        "(storage was reused, and a new blob object was registered)"
+                    }
+                    RegisterBlobOp::ReuseRegistration { .. } => "(the registration was reused)",
+                };
                 println!(
                     "{} {} blob stored successfully.\n\
                     Blob ID: {}\n\
+                    Sui object ID: {}\n\
                     Unencoded size: {}\n\
                     Encoded size (including metadata): {}\n\
-                    Sui object ID: {}\n\
-                    Cost (excluding gas): {}",
+                    Cost (excluding gas): {} {}",
                     success(),
-                    if *deletable { "Deletable" } else { "Permanent" },
+                    if blob_object.deletable {
+                        "Deletable"
+                    } else {
+                        "Permanent"
+                    },
                     blob_object.blob_id,
                     HumanReadableBytes(blob_object.size),
-                    HumanReadableBytes(*encoded_size),
+                    HumanReadableBytes(resource_operation.encoded_length()),
                     blob_object.id,
-                    HumanReadableMist(*cost),
+                    HumanReadableGeorgie::from(*cost),
+                    operation_str,
                 )
             }
             Self::MarkedInvalid { blob_id, event } => {
@@ -141,7 +154,7 @@ impl CliOutput for DryRunOutput {
             self.blob_id,
             HumanReadableBytes(self.unencoded_size),
             HumanReadableBytes(self.encoded_size),
-            HumanReadableMist(self.storage_cost),
+            HumanReadableGeorgie::from(self.storage_cost),
         )
     }
 }
@@ -263,10 +276,10 @@ impl CliOutput for InfoOutput {
             hr_storage_unit = HumanReadableBytes(*unit_size),
             max_blob_size_sep = thousands_separator(*max_blob_size),
             price_heading = "Approximate storage prices per epoch".bold().green(),
-            hr_price_per_unit_size = HumanReadableMist(*price_per_unit_size),
-            metadata_price = HumanReadableMist(*metadata_price),
+            hr_price_per_unit_size = HumanReadableGeorgie::from(*price_per_unit_size),
+            metadata_price = HumanReadableGeorgie::from(*metadata_price),
             marginal_size = HumanReadableBytes(*marginal_size),
-            marginal_price = HumanReadableMist(*marginal_price),
+            marginal_price = HumanReadableGeorgie::from(*marginal_price),
             price_examples_heading = "Total price for example blob sizes".bold().green(),
             example_blob_output = example_blobs
                 .iter()
