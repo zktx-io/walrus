@@ -19,6 +19,7 @@ use sui::{
     clock::Clock,
     coin::Coin,
     object_table::{Self, ObjectTable},
+    priority_queue::{Self, PriorityQueue},
     vec_map
 };
 use wal::wal::WAL;
@@ -147,13 +148,6 @@ public(package) fun new(
     }
 }
 
-// === Accessors ===
-
-/// Returns the next epoch parameters if set, otherwise aborts with an error.
-public(package) fun next_epoch_params(self: &StakingInnerV1): EpochParams {
-    *self.next_epoch_params.borrow()
-}
-
 // === Staking Pool / Storage Node ===
 
 /// Creates a new staking pool with the given `commission_rate`.
@@ -217,16 +211,66 @@ public(package) fun voting_end(self: &mut StakingInnerV1, clock: &Clock) {
 
     // Assign the next epoch committee.
     self.select_committee();
-
-    // TODO: perform the voting for the next epoch params, replace dummy.
-    // Set a dummy value.
-    self.next_epoch_params = option::some(epoch_parameters::new(1_000_000_000_000, 5, 1));
+    self.next_epoch_params = option::some(self.calculate_votes());
 
     // Set the new epoch state.
     self.epoch_state = EpochState::NextParamsSelected(last_epoch_change);
 
     // Emit event that parameters have been selected.
     events::emit_epoch_parameters_selected(self.epoch + 1);
+}
+
+/// Calculates the votes for the next epoch parameters. The function sorts the
+/// write and storage prices and picks the value that satisfies a quorum of the weight.
+public(package) fun calculate_votes(self: &StakingInnerV1): EpochParams {
+    assert!(self.next_committee.is_some());
+
+    let size = self.next_committee.borrow().size();
+    let inner = self.next_committee.borrow().inner();
+    let mut write_prices = priority_queue::new(vector[]);
+    let mut storage_prices = priority_queue::new(vector[]);
+    let mut capacity_votes = priority_queue::new(vector[]);
+
+    size.do!(|i| {
+        let (node_id, shards) = inner.get_entry_by_idx(i);
+        let pool = &self.pools[*node_id];
+        let weight = shards.length();
+        write_prices.insert(pool.write_price(), weight);
+        storage_prices.insert(pool.storage_price(), weight);
+        // The vote for capacity is determined by the node capacity and number of assigned shards.
+        let capacity_vote = pool.node_capacity() / weight * (self.n_shards as u64);
+        capacity_votes.insert(capacity_vote, weight);
+    });
+
+    epoch_parameters::new(
+        quorum_above(&mut capacity_votes, self.n_shards),
+        quorum_below(&mut storage_prices, self.n_shards),
+        quorum_below(&mut write_prices, self.n_shards),
+    )
+}
+
+/// Take the highest value, s.t. a quorum (2f + 1) voted for a value larger or equal to this.
+fun quorum_above(vote_queue: &mut PriorityQueue<u64>, n_shards: u16): u64 {
+    let threshold_weight = (n_shards - (n_shards - 1) / 3) as u64;
+    take_threshold_value(vote_queue, threshold_weight)
+}
+
+/// Take the lowest value, s.t. a quorum  (2f + 1) voted for a value lower or equal to this.
+fun quorum_below(vote_queue: &mut PriorityQueue<u64>, n_shards: u16): u64 {
+    let threshold_weight = ((n_shards - 1) / 3 + 1) as u64;
+    take_threshold_value(vote_queue, threshold_weight)
+}
+
+fun take_threshold_value(vote_queue: &mut PriorityQueue<u64>, threshold_weight: u64): u64 {
+    let mut sum_weight = 0;
+    // The loop will always succeed if `threshold_weight` is smaller than the total weight.
+    loop {
+        let (value, weight) = vote_queue.pop_max();
+        sum_weight = sum_weight + weight;
+        if (sum_weight >= threshold_weight) {
+            return value
+        };
+    }
 }
 
 // === Voting ===
@@ -325,36 +369,6 @@ public(package) fun withdraw_stake(
 ): Coin<WAL> {
     let wctx = &self.new_walrus_context();
     self.pools[staked_wal.node_id()].withdraw_stake(staked_wal, wctx).into_coin(ctx)
-}
-
-/// Get the current epoch.
-public(package) fun epoch(self: &StakingInnerV1): u32 {
-    self.epoch
-}
-
-/// Get the current committee.
-public(package) fun committee(self: &StakingInnerV1): &Committee {
-    &self.committee
-}
-
-/// Get the previous committee.
-public(package) fun previous_committee(self: &StakingInnerV1): &Committee {
-    &self.previous_committee
-}
-
-/// Construct the BLS committee for the next epoch.
-public(package) fun next_bls_committee(self: &StakingInnerV1): BlsCommittee {
-    let (ids, shard_assignments) = (*self.next_committee.borrow().inner()).into_keys_values();
-    let members = ids.zip_map!(shard_assignments, |id, shards| {
-        let pk = self.pools.borrow(id).node_info().public_key();
-        bls_aggregate::new_bls_committee_member(*pk, shards.length() as u16, id)
-    });
-    bls_aggregate::new_bls_committee(self.epoch + 1, members)
-}
-
-/// Check if a node with the given `ID` exists in the staking pools.
-public(package) fun has_pool(self: &StakingInnerV1, node_id: ID): bool {
-    self.pools.contains(node_id)
 }
 
 // === System ===
@@ -608,6 +622,48 @@ public(package) fun epoch_sync_done(
     events::emit_shards_received(self.epoch, *node_shards);
 }
 
+// === Accessors ===
+
+/// Returns the Option with next committee.
+public(package) fun next_committee(self: &StakingInnerV1): &Option<Committee> {
+    &self.next_committee
+}
+
+/// Returns the next epoch parameters if set, otherwise aborts with an error.
+public(package) fun next_epoch_params(self: &StakingInnerV1): EpochParams {
+    *self.next_epoch_params.borrow()
+}
+
+/// Get the current epoch.
+public(package) fun epoch(self: &StakingInnerV1): u32 {
+    self.epoch
+}
+
+/// Get the current committee.
+public(package) fun committee(self: &StakingInnerV1): &Committee {
+    &self.committee
+}
+
+/// Get the previous committee.
+public(package) fun previous_committee(self: &StakingInnerV1): &Committee {
+    &self.previous_committee
+}
+
+/// Construct the BLS committee for the next epoch.
+public(package) fun next_bls_committee(self: &StakingInnerV1): BlsCommittee {
+    let (ids, shard_assignments) = (*self.next_committee.borrow().inner()).into_keys_values();
+    let members = ids.zip_map!(shard_assignments, |id, shards| {
+        let pk = self.pools.borrow(id).node_info().public_key();
+        bls_aggregate::new_bls_committee_member(*pk, shards.length() as u16, id)
+    });
+    bls_aggregate::new_bls_committee(self.epoch + 1, members)
+}
+
+/// Check if a node with the given `ID` exists in the staking pools.
+public(package) fun has_pool(self: &StakingInnerV1, node_id: ID): bool {
+    self.pools.contains(node_id)
+}
+
 // === Internal ===
 
 fun new_walrus_context(self: &StakingInnerV1): WalrusContext {
@@ -623,6 +679,8 @@ fun is_quorum(weight: u16, n_shards: u16): bool {
 }
 
 // ==== Tests ===
+#[test_only]
+use walrus::test_utils::assert_eq;
 
 #[test_only]
 public(package) fun is_epoch_sync_done(self: &StakingInnerV1): bool {
@@ -661,4 +719,54 @@ public(package) fun pub_dhondt(n_shards: u16, stake: vector<u64>): (FixedPoint32
         v
     };
     dhondt(ranking, n_shards, stake)
+}
+
+#[test]
+fun test_quorum_above() {
+    let mut queue = priority_queue::new(vector[]);
+    let votes = vector[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let weights = vector[5, 5, 4, 6, 3, 7, 2, 8, 1, 9];
+    votes.zip_do!(weights, |vote, weight| queue.insert(vote, weight));
+    assert_eq!(quorum_above(&mut queue, 50), 4);
+}
+
+#[test]
+fun test_quorum_above_all_above() {
+    let mut queue = priority_queue::new(vector[]);
+    let votes = vector[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let weights = vector[17, 1, 1, 1, 3, 7, 2, 8, 1, 9];
+    votes.zip_do!(weights, |vote, weight| queue.insert(vote, weight));
+    assert_eq!(quorum_above(&mut queue, 50), 1);
+}
+
+#[test]
+fun test_quorum_above_one_value() {
+    let mut queue = priority_queue::new(vector[]);
+    queue.insert(1, 50);
+    assert_eq!(quorum_above(&mut queue, 50), 1);
+}
+
+#[test]
+fun test_quorum_below() {
+    let mut queue = priority_queue::new(vector[]);
+    let votes = vector[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let weights = vector[5, 5, 4, 6, 3, 7, 4, 6, 1, 9];
+    votes.zip_do!(weights, |vote, weight| queue.insert(vote, weight));
+    assert_eq!(quorum_below(&mut queue, 50), 7);
+}
+
+#[test]
+fun test_quorum_below_all_below() {
+    let mut queue = priority_queue::new(vector[]);
+    let votes = vector[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let weights = vector[5, 5, 4, 6, 3, 7, 1, 1, 1, 17];
+    votes.zip_do!(weights, |vote, weight| queue.insert(vote, weight));
+    assert_eq!(quorum_below(&mut queue, 50), 10);
+}
+
+#[test]
+fun test_quorum_below_one_value() {
+    let mut queue = priority_queue::new(vector[]);
+    queue.insert(1, 50);
+    assert_eq!(quorum_below(&mut queue, 50), 1);
 }
