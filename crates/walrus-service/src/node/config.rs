@@ -136,8 +136,8 @@ pub struct BlobRecoveryConfig {
 impl Default for BlobRecoveryConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_blob_syncs: 10,
-            max_concurrent_sliver_syncs: 500,
+            max_concurrent_blob_syncs: 100,
+            max_concurrent_sliver_syncs: 2_000,
             committee_service_config: CommitteeServiceConfig::default(),
         }
     }
@@ -170,6 +170,10 @@ pub struct CommitteeServiceConfig {
     #[serde_as(as = "DurationSeconds<u64>")]
     #[serde(rename = "invalidity_sync_timeout_secs")]
     pub invalidity_sync_timeout: Duration,
+    /// The timeout when connecting to remote storage nodes.
+    #[serde_as(as = "DurationSeconds<u64>")]
+    #[serde(rename = "node_connect_timeout_secs")]
+    pub node_connect_timeout: Duration,
 }
 
 impl Default for CommitteeServiceConfig {
@@ -181,6 +185,7 @@ impl Default for CommitteeServiceConfig {
             sliver_request_timeout: Duration::from_secs(300),
             invalidity_sync_timeout: Duration::from_secs(300),
             max_concurrent_metadata_requests: NonZeroUsize::new(1).unwrap(),
+            node_connect_timeout: Duration::from_secs(1),
         }
     }
 }
