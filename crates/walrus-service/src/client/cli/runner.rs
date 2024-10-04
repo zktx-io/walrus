@@ -8,6 +8,7 @@ use std::{io::Write, num::NonZeroU16, path::PathBuf, time::Duration};
 use anyhow::Result;
 use prometheus::Registry;
 use sui_sdk::wallet_context::WalletContext;
+use sui_types::base_types::ObjectID;
 use walrus_core::{
     encoding::{encoded_blob_length_for_n_shards, EncodingConfig, Primary},
     BlobId,
@@ -34,7 +35,6 @@ use crate::{
             get_read_client,
             get_sui_read_client_from_rpc_node_or_wallet,
             load_configuration,
-            load_wallet_context,
             read_blob_from_file,
             success,
             BlobIdDecimal,
@@ -48,6 +48,7 @@ use crate::{
             DryRunOutput,
             InfoOutput,
             ReadOutput,
+            StakeOutput,
         },
         Client,
         ClientDaemon,
@@ -85,7 +86,7 @@ impl ClientCommandRunner {
             .as_ref()
             .ok()
             .and_then(|conf| conf.wallet_config.clone()));
-        let wallet = load_wallet_context(&wallet_path);
+        let wallet = crate::utils::load_wallet_context(&wallet_path);
 
         Self {
             wallet_path,
@@ -147,6 +148,10 @@ impl ClientCommandRunner {
             CliCommands::ListBlobs { include_expired } => self.list_blobs(include_expired).await,
 
             CliCommands::Delete { target } => self.delete(target).await,
+
+            CliCommands::Stake { node_id, amount } => {
+                self.stake_with_node_pool(node_id, amount).await
+            }
         }
     }
 
@@ -457,6 +462,12 @@ impl ClientCommandRunner {
             deleted_blobs,
         }
         .print_output(self.json)
+    }
+
+    pub(crate) async fn stake_with_node_pool(self, node_id: ObjectID, amount: u64) -> Result<()> {
+        let client = get_contract_client(self.config?, self.wallet, self.gas_budget, &None).await?;
+        let staked_wal = client.stake_with_node_pool(node_id, amount).await?;
+        StakeOutput { staked_wal }.print_output(self.json)
     }
 }
 

@@ -11,10 +11,11 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use fastcrypto::traits::KeyPair;
 use prometheus::Registry;
+use serde::Deserialize;
 use tokio::{
     runtime::{self, Runtime},
     sync::oneshot,
@@ -30,9 +31,9 @@ use walrus_service::{
         system_events::{EventManager, SuiSystemEventProvider},
         StorageNode,
     },
-    utils::{version, LoadConfig as _, MetricsAndLoggingRuntime},
+    utils::{self, version, LoadConfig as _, MetricsAndLoggingRuntime},
 };
-use walrus_sui::client::SuiReadClient;
+use walrus_sui::client::{ContractClient, SuiContractClient, SuiReadClient};
 
 const VERSION: &str = version!();
 
@@ -46,7 +47,7 @@ struct Args {
     command: Commands,
 }
 
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, Deserialize)]
 #[clap(rename_all = "kebab-case")]
 enum Commands {
     /// Run a storage node with the provided configuration.
@@ -66,6 +67,18 @@ enum Commands {
         #[clap(default_value = "protocol.key")]
         out: PathBuf,
     },
+
+    /// Register a new node with the Walrus storage network.
+    Register {
+        #[clap(short, long)]
+        #[serde(deserialize_with = "crate::utils::resolve_home_dir")]
+        /// The path to the node's configuration file.
+        config_path: PathBuf,
+        #[clap(short, long)]
+        #[serde(default)]
+        /// The name of the node.
+        name: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -78,12 +91,16 @@ fn main() -> anyhow::Result<()> {
         } => commands::run(StorageNodeConfig::load(config_path)?, cleanup_storage)?,
 
         Commands::KeyGen { out } => commands::keygen(&out)?,
+
+        Commands::Register { config_path, name } => commands::register_node(config_path, name)?,
     }
     Ok(())
 }
 
 mod commands {
     use std::io;
+
+    use anyhow::anyhow;
 
     use super::*;
 
@@ -165,6 +182,57 @@ mod commands {
 
         Ok(())
     }
+
+    #[tokio::main]
+    pub(crate) async fn register_node(
+        config_path: PathBuf,
+        name: Option<String>,
+    ) -> anyhow::Result<()> {
+        let storage_config = StorageNodeConfig::load(&config_path)?;
+        let node_name = name.or(storage_config.name.clone()).ok_or(anyhow!(
+            "Name is required to register node. Set it in the config file or provided in the \
+                commandline argument."
+        ))?;
+        let registration_params = storage_config.to_registration_params(node_name);
+
+        // Uses the Sui wallet configuration in the storage node config to register the node.
+        let contract_client = get_contract_client_from_node_config(&storage_config).await?;
+        let proof_of_possession = walrus_sui::utils::generate_proof_of_possession(
+            storage_config.protocol_key_pair(),
+            &contract_client,
+            &registration_params,
+        )
+        .await?;
+
+        let node_capability = contract_client
+            .register_candidate(&registration_params, &proof_of_possession)
+            .await?;
+
+        println!("Successfully registered storage node with capability:",);
+        println!("      Capability object ID: {}", node_capability.id);
+        println!("      Node ID: {}", node_capability.node_id);
+        Ok(())
+    }
+}
+
+/// Creates a [`SuiContractClient`] from the Sui config in the provided storage node config.
+async fn get_contract_client_from_node_config(
+    storage_config: &StorageNodeConfig,
+) -> anyhow::Result<SuiContractClient> {
+    let Some(ref node_wallet_config) = storage_config.sui else {
+        bail!("storage config does not contain Sui wallet configuration");
+    };
+
+    let node_wallet = utils::load_wallet_context(&Some(node_wallet_config.wallet_config.clone()))?;
+    let contract_client = SuiContractClient::new(
+        node_wallet,
+        node_wallet_config.system_object,
+        node_wallet_config.staking_object,
+        node_wallet_config.gas_budget,
+    )
+    .await?;
+
+    Ok(contract_client)
 }
 
 struct EventProcessorRuntime {

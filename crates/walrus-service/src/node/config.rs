@@ -30,6 +30,7 @@ use walrus_core::keys::{
     TaggedKeyPair,
 };
 use walrus_event::EventProcessorConfig;
+use walrus_sui::types::{move_structs::VotingParams, NodeRegistrationParams};
 
 use super::storage::DatabaseConfig;
 use crate::common::utils::{self, LoadConfig};
@@ -78,6 +79,14 @@ pub struct StorageNodeConfig {
     /// Configuration for running checkpoint processor
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_processor_config: Option<EventProcessorConfig>,
+    /// The commission rate of the storage node, in basis points.
+    #[serde(default)]
+    pub commission_rate: u64,
+    /// The parameters for the staking pool.
+    pub voting_params: VotingParams,
+    /// Name of the storage node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl StorageNodeConfig {
@@ -90,6 +99,33 @@ impl StorageNodeConfig {
         self.network_key_pair
             .get()
             .expect("key pair should already be loaded into memory")
+    }
+
+    /// Returns the protocol key pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key has not yet been loaded from disk.
+    pub fn protocol_key_pair(&self) -> &ProtocolKeyPair {
+        self.protocol_key_pair
+            .get()
+            .expect("key pair should already be loaded into memory")
+    }
+
+    /// Converts the configuration into a registration parameters used for node registration.
+    pub fn to_registration_params(&self, name: String) -> NodeRegistrationParams {
+        let network_key_pair = self.network_key_pair();
+        let protocol_key_pair = self.protocol_key_pair();
+        NodeRegistrationParams {
+            name,
+            network_address: self.rest_api_address.into(),
+            public_key: protocol_key_pair.public().clone(),
+            network_public_key: network_key_pair.public().clone(),
+            commission_rate: self.commission_rate,
+            storage_price: self.voting_params.storage_price,
+            write_price: self.voting_params.write_price,
+            node_capacity: self.voting_params.node_capacity,
+        }
     }
 }
 
@@ -497,9 +533,14 @@ mod tests {
     #[test]
     fn parses_config_file() -> TestResult {
         let yaml = "---\n\
+        name: node-1\n\
         storage_path: target/storage\n\
         protocol_key_pair:\n  BBlm7tRefoPuaKoVoxVtnUBBDCfy+BGPREM8B6oSkOEj\n\
-        network_key_pair:\n  As5tqQFRGrjPSvcZeKfBX98NwDuCUtZyJdzWR2bUn0oY";
+        network_key_pair:\n  As5tqQFRGrjPSvcZeKfBX98NwDuCUtZyJdzWR2bUn0oY\n\
+        voting_params:
+            storage_price: 5
+            write_price: 1
+            node_capacity: 250000000000";
 
         ProtocolKeyPair::from_str("BBlm7tRefoPuaKoVoxVtnUBBDCfy+BGPREM8B6oSkOEj")?;
 
@@ -512,6 +553,7 @@ mod tests {
     fn deserialize_partial_config() -> TestResult {
         // editorconfig-checker-disable
         let yaml = "\
+name: node-1
 storage_path: /opt/walrus/db
 db_config:
   metadata:
@@ -537,6 +579,10 @@ sui:
   gas_budget: 500000000
 blob_recovery:
   invalidity_sync_timeout_secs: 300
+voting_params:
+  storage_price: 5
+  write_price: 1
+  node_capacity: 250000000000
   ";
         // editorconfig-checker-enable
         let _: StorageNodeConfig = serde_yaml::from_str(yaml)?;

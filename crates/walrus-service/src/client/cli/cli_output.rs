@@ -32,6 +32,7 @@ use crate::client::{
         InfoDevOutput,
         InfoOutput,
         ReadOutput,
+        StakeOutput,
     },
     string_prefix,
     BlobStoreResult,
@@ -402,6 +403,13 @@ impl CliOutput for DeleteOutput {
             );
             self.deleted_blobs.print_cli_output();
         }
+    }
+}
+
+impl CliOutput for StakeOutput {
+    fn print_cli_output(&self) {
+        println!("{} Staked WAL successfully.", success());
+        println!("Staking info:\n{}", self.staked_wal);
     }
 }
 

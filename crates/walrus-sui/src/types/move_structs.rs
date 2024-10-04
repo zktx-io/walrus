@@ -3,7 +3,7 @@
 
 //! Walrus move type bindings. Replicates the move types in Rust.
 
-use std::num::NonZeroU16;
+use std::{fmt::Display, num::NonZeroU16};
 
 use fastcrypto::traits::ToFromBytes;
 use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
@@ -105,7 +105,7 @@ where
 }
 
 /// Sui type for the capability that authorizes the holder to perform certain actions.
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct StorageNodeCap {
     /// The object ID of the capability.
     pub id: ObjectID,
@@ -133,14 +133,14 @@ enum PoolState {
 }
 
 /// The parameters for the staking pool. Stored for the next epoch.
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
-struct VotingParams {
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct VotingParams {
     /// Voting: storage price for the next epoch.
-    storage_price: u64,
+    pub storage_price: u64,
     /// Voting: write price for the next epoch.
-    write_price: u64,
+    pub write_price: u64,
     /// Voting: node capacity for the next epoch.
-    node_capacity: u64,
+    pub node_capacity: u64,
 }
 
 /// Represents a single staking pool.
@@ -394,22 +394,52 @@ where
     Ok(object_id)
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
-enum StakedWalState {
+/// The state of the staked WAL.
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub enum StakedWalState {
+    /// The WAL is staked.
     Staked,
+    /// The WAL is unstaked and can be withdrawn.
     Withdrawing(Epoch, u64),
 }
 
+impl Display for StakedWalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StakedWalState::Staked => write!(f, "Staked"),
+            StakedWalState::Withdrawing(epoch, amount) => {
+                write!(f, "Withdrawing: epoch={}, amount={}", epoch, amount)
+            }
+        }
+    }
+}
+
 /// Sui type for the StakedWal object.
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct StakedWal {
-    id: ObjectID,
-    state: StakedWalState,
-    node_id: ObjectID,
-    principal: u64,
-    activation_epoch: Epoch,
+    /// The object ID of the staked WAL.
+    pub id: ObjectID,
+    /// The state of the staked WAL.
+    pub state: StakedWalState,
+    /// The node ID of the staked WAL.
+    pub node_id: ObjectID,
+    /// The principal of the staked WAL.
+    pub principal: u64,
+    /// The epoch in which the WAL was staked.
+    pub activation_epoch: Epoch,
 }
 
 impl AssociatedContractStruct for StakedWal {
     const CONTRACT_STRUCT: StructTag<'static> = contracts::staked_wal::StakedWal;
+}
+
+impl Display for StakedWal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "StakedWal:")?;
+        writeln!(f, "    object id: {},", self.id)?;
+        writeln!(f, "    state: {},", self.state)?;
+        writeln!(f, "    node_id: {},", self.node_id)?;
+        writeln!(f, "    principal: {},", self.principal)?;
+        writeln!(f, "    activation_epoch: {}", self.activation_epoch)
+    }
 }
