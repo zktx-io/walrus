@@ -622,7 +622,7 @@ pub struct StubContractService {
 impl SystemContractService for StubContractService {
     async fn invalidate_blob_id(&self, _certificate: &InvalidBlobCertificate) {}
 
-    async fn epoch_sync_done(&self, _node_id: ObjectID, _epoch: Epoch) {}
+    async fn epoch_sync_done(&self, _epoch: Epoch) {}
 
     async fn get_epoch_and_state(&self) -> Result<(Epoch, EpochState), anyhow::Error> {
         anyhow::bail!("stub service does not store the epoch or state")
@@ -1040,8 +1040,8 @@ where
         self.as_ref().inner.invalidate_blob_id(certificate).await
     }
 
-    async fn epoch_sync_done(&self, node_id: ObjectID, epoch: Epoch) {
-        self.as_ref().inner.epoch_sync_done(node_id, epoch).await
+    async fn epoch_sync_done(&self, epoch: Epoch) {
+        self.as_ref().inner.epoch_sync_done(epoch).await
     }
 
     async fn get_epoch_and_state(&self) -> Result<(Epoch, EpochState), anyhow::Error> {
