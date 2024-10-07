@@ -4,6 +4,7 @@
 //! Walrus Storage Node entry point.
 
 use std::{
+    fmt::Display,
     fs,
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -12,10 +13,13 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, ensure, Context};
 use clap::{Parser, Subcommand};
+use config::{PathOrInPlace, TlsConfig};
 use fastcrypto::traits::KeyPair;
+use fs::File;
 use prometheus::Registry;
+use sui_sdk::wallet_context::WalletContext;
 use sui_types::base_types::ObjectID;
 use tokio::{
     runtime::{self, Runtime},
@@ -23,7 +27,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use walrus_core::keys::ProtocolKeyPair;
+use walrus_core::keys::{NetworkKeyPair, ProtocolKeyPair};
 use walrus_event::{event_processor::EventProcessor, EventProcessorConfig};
 use walrus_service::{
     node::{
@@ -34,7 +38,11 @@ use walrus_service::{
     },
     utils::{self, version, LoadConfig as _, MetricsAndLoggingRuntime},
 };
-use walrus_sui::client::{ContractClient, SuiContractClient, SuiReadClient};
+use walrus_sui::{
+    client::{ContractClient, SuiContractClient, SuiReadClient},
+    types::move_structs::VotingParams,
+    utils::SuiNetwork,
+};
 
 const VERSION: &str = version!();
 
@@ -52,6 +60,36 @@ struct Args {
 #[derive(Subcommand, Debug, Clone)]
 #[clap(rename_all = "kebab-case")]
 enum Commands {
+    /// Generate Sui wallet, keys, and configuration for a Walrus node.
+    ///
+    /// This overwrites existing files in the configuration directory.
+    /// Fails if the specified directory does not exist yet.
+    Setup {
+        #[clap(short, long)]
+        /// The path to the directory in which to set up wallet and node configuration.
+        config_directory: PathBuf,
+        #[clap(long)]
+        /// The path where the Walrus database will be stored.
+        storage_path: PathBuf,
+        /// Sui network for which the config is generated.
+        ///
+        /// Available options are `devnet`, `testnet`, and `localnet`.
+        #[clap(long, default_value = "testnet")]
+        sui_network: SuiNetwork,
+        #[clap(flatten)]
+        config_args: ConfigArgs,
+    },
+
+    /// Register a new node with the Walrus storage network.
+    Register {
+        #[clap(short, long)]
+        /// The path to the node's configuration file.
+        config_path: PathBuf,
+        #[clap(short, long)]
+        /// The name of the node.
+        name: Option<String>,
+    },
+
     /// Run a storage node with the provided configuration.
     Run {
         /// Path to the Walrus node configuration file.
@@ -81,16 +119,11 @@ enum Commands {
     },
 
     /// Generate a new node configuration.
-    GenerateConfig(Box<GenerateConfigArgs>),
-
-    /// Register a new node with the Walrus storage network.
-    Register {
-        #[clap(short, long)]
-        /// The path to the node's configuration file.
-        config_path: PathBuf,
-        #[clap(short, long)]
-        /// The name of the node.
-        name: Option<String>,
+    GenerateConfig {
+        #[clap(flatten)]
+        path_args: PathArgs,
+        #[clap(flatten)]
+        config_args: ConfigArgs,
     },
 }
 
@@ -112,6 +145,19 @@ impl FromStr for KeyType {
     }
 }
 
+impl Display for KeyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                KeyType::Protocol => "protocol",
+                KeyType::Network => "network",
+            }
+        )
+    }
+}
+
 impl KeyType {
     fn default_filename(&self) -> &'static str {
         match self {
@@ -122,19 +168,7 @@ impl KeyType {
 }
 
 #[derive(Debug, Clone, clap::Args)]
-struct GenerateConfigArgs {
-    #[clap(long)]
-    /// The path where the Walrus database will be stored.
-    storage_path: PathBuf,
-    #[clap(long)]
-    /// The path to the key pair used in Walrus protocol messages.
-    protocol_key_pair_path: PathBuf,
-    #[clap(long)]
-    /// The path to the key pair used to authenticate nodes in network communication.
-    network_key_pair_path: PathBuf,
-    #[clap(long)]
-    /// HTTP URL of the Sui full-node RPC endpoint (including scheme and port).
-    sui_rpc: String,
+struct ConfigArgs {
     #[clap(long)]
     /// Object ID of the Walrus system object.
     system_object: ObjectID,
@@ -142,14 +176,17 @@ struct GenerateConfigArgs {
     /// Object ID of the Walrus staking object.
     staking_object: ObjectID,
     #[clap(long)]
-    /// Location of the node's wallet config.
-    wallet_config: PathBuf,
-    #[clap(long)]
     /// Initial storage capacity of this node in bytes.
     node_capacity: u64,
     // ***************************
     //   Optional fields below
     // ***************************
+    #[clap(long)]
+    /// HTTP URL of the Sui full-node RPC endpoint (including scheme and port) to use for event
+    /// processing.
+    ///
+    /// If not provided, the RPC node from the wallet's active environment will be used.
+    sui_rpc: Option<String>,
     #[clap(long, default_value_t = config::defaults::storage_price())]
     /// Initial vote for the storage price in FROST per KiB per epoch.
     storage_price: u64,
@@ -159,6 +196,9 @@ struct GenerateConfigArgs {
     #[clap(long, default_value_t = config::defaults::gas_budget())]
     /// Gas budget for transactions.
     gas_budget: u64,
+    #[clap(long)]
+    /// Public IP address or hostname of the storage node.
+    server_name: Option<String>,
     #[clap(long, default_value_t = config::defaults::rest_api_address())]
     /// Socket address on which the REST API listens.
     rest_api_address: SocketAddr,
@@ -171,15 +211,40 @@ struct GenerateConfigArgs {
     #[clap(long)]
     /// The name of the storage node used in the registration.
     name: Option<String>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct PathArgs {
     #[clap(short, long)]
     /// The output path for the generated configuration file.
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
+    #[clap(long)]
+    /// The path where the Walrus database will be stored.
+    storage_path: PathBuf,
+    #[clap(long)]
+    /// The path to the key pair used in Walrus protocol messages.
+    protocol_key_path: PathBuf,
+    #[clap(long)]
+    /// The path to the key pair used to authenticate nodes in network communication.
+    network_key_path: PathBuf,
+    #[clap(long)]
+    /// Location of the node's wallet config.
+    wallet_config: PathBuf,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.command {
+        Commands::Setup {
+            config_directory,
+            storage_path,
+            sui_network,
+            config_args,
+        } => commands::setup(config_directory, storage_path, sui_network, config_args)?,
+
+        Commands::Register { config_path, name } => commands::register_node(config_path, name)?,
+
         Commands::Run {
             config_path,
             cleanup_storage,
@@ -196,21 +261,17 @@ fn main() -> anyhow::Result<()> {
             force,
         )?,
 
-        Commands::GenerateConfig(args) => commands::generate_config(*args)?,
-
-        Commands::Register { config_path, name } => commands::register_node(config_path, name)?,
+        Commands::GenerateConfig {
+            path_args,
+            config_args,
+        } => commands::generate_config(path_args, config_args)?,
     }
     Ok(())
 }
 
 mod commands {
-    use std::io;
 
-    use anyhow::anyhow;
-    use config::PathOrInPlace;
-    use fs::File;
-    use walrus_core::keys::NetworkKeyPair;
-    use walrus_sui::types::move_structs::VotingParams;
+    use std::time::Duration;
 
     use super::*;
 
@@ -285,6 +346,10 @@ mod commands {
     }
 
     pub(super) fn keygen(path: &Path, key_type: KeyType, force: bool) -> anyhow::Result<()> {
+        println!(
+            "Generating {key_type} key pair and writing it to '{}'",
+            path.display()
+        );
         let mut file = if force {
             File::create(path)
         } else {
@@ -347,29 +412,49 @@ mod commands {
     }
 
     pub(crate) fn generate_config(
-        GenerateConfigArgs {
+        PathArgs {
+            config_path,
             storage_path,
-            protocol_key_pair_path,
-            network_key_pair_path,
+            protocol_key_path,
+            network_key_path,
+            wallet_config,
+        }: PathArgs,
+        ConfigArgs {
             sui_rpc,
             system_object,
             staking_object,
-            wallet_config,
             storage_price,
             write_price,
             node_capacity,
             gas_budget,
+            server_name,
             rest_api_address,
             metrics_address,
             commission_rate,
             name,
-            config_path,
-        }: GenerateConfigArgs,
+        }: ConfigArgs,
     ) -> anyhow::Result<()> {
+        let sui_rpc = if let Some(rpc) = sui_rpc {
+            rpc
+        } else {
+            tracing::debug!(
+                "getting Sui RPC URL from wallet at '{}'",
+                wallet_config.display()
+            );
+            let wallet_context = WalletContext::new(&wallet_config, None, None)
+                .context("Reading Sui wallet failed")?;
+            wallet_context
+                .config
+                .get_active_env()
+                .context("Unable to get the wallet's active environment")?
+                .rpc
+                .clone()
+        };
+
         let config = StorageNodeConfig {
             storage_path,
-            protocol_key_pair: PathOrInPlace::from_path(protocol_key_pair_path),
-            network_key_pair: PathOrInPlace::from_path(network_key_pair_path),
+            protocol_key_pair: PathOrInPlace::from_path(protocol_key_path),
+            network_key_pair: PathOrInPlace::from_path(network_key_path),
             sui: Some(SuiConfig {
                 rpc: sui_rpc,
                 system_object,
@@ -387,23 +472,79 @@ mod commands {
             metrics_address,
             name,
             commission_rate,
+            tls: TlsConfig {
+                disable_tls: false,
+                pem_files: None,
+                server_name,
+            },
             ..Default::default()
         };
 
-        // Generates config file.
+        // Generate and write config file.
         let yaml_config =
             serde_yaml::to_string(&config).context("Failed to serialize configuration to YAML")?;
-        if let Some(config_path) = config_path {
-            fs::write(&config_path, yaml_config)
-                .context("Failed to write the generated configuration to a file")?;
-            println!(
-                "Storage node configuration written to '{}'",
-                config_path.display()
-            );
-        } else {
-            println!("{}", yaml_config);
-        }
+        fs::write(&config_path, yaml_config)
+            .context("Failed to write the generated configuration to a file")?;
+        println!(
+            "Storage node configuration written to '{}'",
+            config_path.display()
+        );
         Ok(())
+    }
+
+    #[tokio::main]
+    pub(crate) async fn setup(
+        config_directory: PathBuf,
+        storage_path: PathBuf,
+        sui_network: SuiNetwork,
+        config_args: ConfigArgs,
+    ) -> anyhow::Result<()> {
+        let config_path = config_directory.join("walrus-node.yaml");
+        let protocol_key_path = config_directory.join("protocol.key");
+        let network_key_path = config_directory.join("network.key");
+        let wallet_config = config_directory.join("sui_config.yaml");
+        ensure!(
+            config_directory.is_dir(),
+            "The directory '{}' does not exist.",
+            config_directory.display()
+        );
+
+        keygen(&protocol_key_path, KeyType::Protocol, true)?;
+        keygen(&network_key_path, KeyType::Network, true)?;
+
+        println!(
+            "Generating Sui wallet for {} at '{}'",
+            sui_network.r#type(),
+            wallet_config.display()
+        );
+        let mut wallet = walrus_sui::utils::create_wallet(&wallet_config, sui_network.env(), None)?;
+
+        println!("Attempting to get SUI from faucet...");
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            walrus_sui::utils::request_sui_from_faucet(
+                wallet.active_address()?,
+                &sui_network,
+                &wallet.get_client().await?,
+            ),
+        )
+        .await
+        {
+            Err(_) => println!("Reached timeout while waiting to get SUI from the faucet"),
+            Ok(Err(e)) => println!("An error occurred when trying to get SUI from the faucet: {e}"),
+            Ok(Ok(_)) => (),
+        }
+
+        generate_config(
+            PathArgs {
+                config_path,
+                storage_path,
+                protocol_key_path,
+                network_key_path,
+                wallet_config,
+            },
+            config_args,
+        )
     }
 }
 
