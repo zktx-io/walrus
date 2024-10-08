@@ -215,6 +215,8 @@ impl<T: ContractClient> Client<T> {
         store_when: StoreWhen,
         persistence: BlobPersistence,
     ) -> ClientResult<BlobStoreResult> {
+        let encode_start_timer = Instant::now();
+
         let (pairs, metadata) = self
             .encoding_config
             .get_blob_encoder(blob)
@@ -224,13 +226,16 @@ impl<T: ContractClient> Client<T> {
         self.check_blob_id(&blob_id)?;
         tracing::Span::current().record("blob_id", blob_id.to_string());
 
+        let encode_duration = encode_start_timer.elapsed();
+
         let pair = pairs.first().expect("the encoding produces sliver pairs");
         let symbol_size = pair.primary.symbols.symbol_size().get();
         tracing::debug!(
             symbol_size=%symbol_size,
             primary_sliver_size=%pair.primary.symbols.len() * usize::from(symbol_size),
             secondary_sliver_size=%pair.secondary.symbols.len() * usize::from(symbol_size),
-            "computed blob pairs and metadata"
+            duration = %humantime::Duration::from(encode_duration),
+            "computed sliver pairs and metadata"
         );
 
         let blob_status = self
@@ -259,13 +264,23 @@ impl<T: ContractClient> Client<T> {
                 // However, during epoch change we may need to store the slivers again, as the
                 // current committee may not have synced them yet.
                 self.get_certificate_standalone(&blob_id, certified_epoch)
-                    .await
+                    .await?
             }
             _ => {
-                self.send_blob_data_and_get_certificate(&metadata, &pairs)
-                    .await
+                let certify_start_timer = Instant::now();
+                let result = self
+                    .send_blob_data_and_get_certificate(&metadata, &pairs)
+                    .await?;
+                let certify_duration = certify_start_timer.elapsed();
+                let blob_size = blob.size;
+                tracing::info!(
+                    duration =  %humantime::Duration::from(certify_duration),
+                    blob_size = blob_size,
+                    "finished sending blob data and collected certificate"
+                );
+                result
             }
-        }?;
+        };
 
         self.sui_client
             .certify_blob(blob.clone(), &certificate)
