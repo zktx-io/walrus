@@ -56,7 +56,7 @@ pub(super) async fn get_blob<T: ReadClient + Send + Sync>(
     Path(BlobIdString(blob_id)): Path<BlobIdString>,
 ) -> Response {
     tracing::debug!("starting to read blob");
-    match client.read_blob::<Primary>(&blob_id).await {
+    match client.read_blob_retry_epoch::<Primary>(&blob_id).await {
         Ok(blob) => {
             tracing::debug!("successfully retrieved blob");
             let mut response = (StatusCode::OK, blob).into_response();
@@ -128,7 +128,7 @@ pub(super) async fn put_blob<T: ContractClient>(
 ) -> Response {
     tracing::debug!("starting to store received blob");
     let mut response = match client
-        .reserve_and_store_blob(
+        .reserve_and_store_blob_retry_epoch(
             &blob[..],
             epochs,
             StoreWhen::always(force),
