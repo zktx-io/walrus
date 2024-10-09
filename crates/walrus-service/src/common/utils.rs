@@ -11,6 +11,7 @@ use std::{
     num::Saturating,
     path::{Path, PathBuf},
     pin::Pin,
+    str::FromStr,
     sync::Arc,
     task::{ready, Context, Poll},
     time::Duration,
@@ -528,8 +529,61 @@ pub fn load_wallet_context(path: &Option<PathBuf>) -> Result<WalletContext> {
     WalletContext::new(&path, None, None)
 }
 
+/// Provides approximate parsing of human-friendly byte values.
+///
+/// Values are calculated as floating points and the resulting number of bytes is rounded down.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct ByteCount(pub u64);
+
+impl ByteCount {
+    /// Returns the number of bytes as a `u64`.
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+impl FromStr for ByteCount {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let original = s;
+        let s = s.strip_suffix("B").unwrap_or(s);
+
+        let suffixes = [
+            ("K", 1e3),
+            ("M", 1e6),
+            ("G", 1e9),
+            ("T", 1e12),
+            ("P", 1e15),
+            ("Ki", (1u64 << 10) as f64),
+            ("Mi", (1u64 << 20) as f64),
+            ("Gi", (1u64 << 30) as f64),
+            ("Ti", (1u64 << 40) as f64),
+            ("Pi", (1u64 << 50) as f64),
+        ];
+
+        let error_context = || format!("invalid byte-count string: {original:?}");
+        if let Some((value_str, scale)) = suffixes
+            .into_iter()
+            .find_map(|(suffix, scale)| Some((s.strip_suffix(suffix)?, scale)))
+        {
+            f64::from_str(value_str.trim())
+                .map(|value| ByteCount((value * scale).floor() as u64))
+                .with_context(error_context)
+        } else {
+            // Otherwise, assume unittless.
+            // Bytes cannot have fractional components
+            u64::from_str(s.trim())
+                .map(ByteCount)
+                .with_context(error_context)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    use walrus_test_utils::param_test;
 
     use super::*;
 
@@ -579,5 +633,55 @@ mod tests {
             }
             assert_eq!(retries, actual);
         }
+    }
+
+    mod byte_count {
+        use super::*;
+
+        param_test! {
+            parse: [
+                byte: ("1240B", 1240),
+                byte_with_space: ("72 B", 72),
+                unitless: ("7240", 7240),
+                zero: ("0", 0),
+            ]
+        }
+        fn parse(input: &str, expected: u64) {
+            assert_eq!(ByteCount::from_str(input).unwrap(), ByteCount(expected));
+        }
+
+        macro_rules! test_parse_various {
+            ($case_name:ident, $suffix:literal, $scale:expr) => {
+                mod $case_name {
+                    use super::*;
+
+                    param_test! {
+                        parse: [
+                            int: (concat!("420", $suffix), 420 * ($scale) as u64),
+                            int_b_suffix: (concat!("420", $suffix, "B"), 420 * ($scale) as u64),
+                            float: (concat!("1.97", $suffix), (1.97 * ($scale) as f64) as u64),
+                            float_b_suffix: (
+                                concat!("1.97", $suffix, "B"), (1.97 * ($scale) as f64) as u64
+                            ),
+                            with_space: (concat!("72", " ", $suffix), 72 * ($scale) as u64),
+                            with_space_b_suffix: (
+                                concat!("4.2", " ", $suffix, "B"), (4.2 * ($scale) as f64) as u64
+                            ),
+                        ]
+                    }
+                }
+            };
+        }
+
+        test_parse_various!(kilo, "K", 1000);
+        test_parse_various!(kibi, "Ki", 1024);
+        test_parse_various!(mega, "M", 1e6);
+        test_parse_various!(mebi, "Mi", 1024 * 1024);
+        test_parse_various!(giga, "G", 1e9);
+        test_parse_various!(gibi, "Gi", 1024 * 1024 * 1024);
+        test_parse_various!(tera, "T", 1e12);
+        test_parse_various!(tebi, "Ti", 1024 * 1024 * 1024 * 1024u64);
+        test_parse_various!(peta, "P", 1e15);
+        test_parse_various!(pebi, "Pi", 1024 * 1024 * 1024 * 1024 * 1024u64);
     }
 }
