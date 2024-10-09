@@ -19,7 +19,6 @@ use futures_util::stream;
 use prometheus::Registry;
 use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 use serde::Serialize;
-use shard_sync::ShardSyncHandler;
 use sui_types::{digests::TransactionDigest, event::EventID};
 use tokio::{select, sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -52,7 +51,15 @@ use walrus_core::{
     SliverType,
 };
 use walrus_event::{event_processor::EventProcessor, IndexedStreamElement};
-use walrus_sdk::api::{BlobStatus, ServiceHealthInfo, StoredOnNodeStatus};
+use walrus_sdk::api::{
+    BlobStatus,
+    ServiceHealthInfo,
+    ShardHealthInfo,
+    ShardStatus as ApiShardStatus,
+    ShardStatusDetail,
+    ShardStatusSummary,
+    StoredOnNodeStatus,
+};
 use walrus_sui::{
     client::SuiReadClient,
     types::{
@@ -75,9 +82,9 @@ use self::{
     contract_service::{SuiSystemContractService, SystemContractService},
     errors::IndexOutOfRange,
     metrics::{NodeMetricSet, TelemetryLabel as _, STATUS_PENDING, STATUS_PERSISTED},
-    storage::{blob_info::BlobInfoApi as _, EventProgress, ShardStorage},
+    shard_sync::ShardSyncHandler,
+    storage::{blob_info::BlobInfoApi as _, EventProgress, ShardStatus, ShardStorage},
 };
-
 pub mod committee;
 pub mod config;
 pub mod contract_service;
@@ -188,7 +195,7 @@ pub trait ServiceState {
     fn n_shards(&self) -> NonZeroU16;
 
     /// Returns the node health information of this ServiceState.
-    fn health_info(&self) -> ServiceHealthInfo;
+    fn health_info(&self, detailed: bool) -> ServiceHealthInfo;
 
     /// Returns whether the sliver is stored in the shard.
     fn sliver_status<A: EncodingAxis>(
@@ -397,6 +404,7 @@ impl StorageNode {
                 MetricConf::new("storage"),
             )?
         };
+        tracing::info!("successfully opened the node database");
 
         let contract_service: Arc<dyn SystemContractService> = Arc::from(contract_service);
         let inner = Arc::new(StorageNodeInner {
@@ -821,8 +829,8 @@ impl StorageNode {
                 .await;
         } else {
             self.inner
-                .storage
-                .create_storage_for_shards(&shard_diff.gained)?;
+                .create_storage_for_shards_in_background(shard_diff.gained.clone())
+                .await?;
 
             // There shouldn't be an epoch change event for the genesis epoch.
             assert!(event.epoch != GENESIS_EPOCH);
@@ -991,6 +999,100 @@ impl StorageNodeInner {
     fn public_key(&self) -> &PublicKey {
         self.protocol_key_pair.as_ref().public()
     }
+
+    fn shard_health_status(
+        &self,
+        detailed: bool,
+    ) -> (ShardStatusSummary, Option<ShardStatusDetail>) {
+        // NOTE: It is possible that the committee or shards change between this and the next call.
+        // As this is for admin consumption, this is not considered a problem.
+        let mut shard_statuses = self.storage.try_list_shard_status().unwrap_or_default();
+        let committee = self.committee_service.committee();
+        let owned_shards = committee.shards_for_node_public_key(self.public_key());
+        let mut summary = ShardStatusSummary::default();
+
+        let mut detail = detailed.then(|| {
+            let mut detail = ShardStatusDetail::default();
+            detail.owned.reserve_exact(owned_shards.len());
+            detail
+        });
+
+        // Record the status for the owned shards.
+        for &shard in owned_shards {
+            // Consume statuses, so that we are left with shards that are not owned.
+            let status = shard_statuses
+                .remove(&shard)
+                .flatten()
+                .map_or(ApiShardStatus::Unknown, api_status_from_shard_status);
+
+            increment_shard_summary(&mut summary, status, true);
+            if let Some(ref mut detail) = detail {
+                detail.owned.push(ShardHealthInfo { shard, status });
+            }
+        }
+
+        // Record the status for the unowned shards.
+        for (shard, status) in shard_statuses {
+            let status = status.map_or(ApiShardStatus::Unknown, api_status_from_shard_status);
+            increment_shard_summary(&mut summary, status, false);
+            if let Some(ref mut detail) = detail {
+                detail.other.push(ShardHealthInfo { shard, status });
+            }
+        }
+
+        // Sort the result by the shard index.
+        if let Some(ref mut detail) = detail {
+            detail.owned.sort_by_key(|info| info.shard);
+            detail.other.sort_by_key(|info| info.shard);
+        }
+
+        (summary, detail)
+    }
+
+    async fn create_storage_for_shards_in_background(
+        self: &Arc<Self>,
+        new_shards: Vec<ShardIndex>,
+    ) -> Result<(), anyhow::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.storage.create_storage_for_shards(&new_shards))
+            .in_current_span()
+            .await??;
+        Ok(())
+    }
+}
+
+fn api_status_from_shard_status(status: ShardStatus) -> ApiShardStatus {
+    match status {
+        ShardStatus::None => ApiShardStatus::Unknown,
+        ShardStatus::Active => ApiShardStatus::Ready,
+        ShardStatus::ActiveSync => ApiShardStatus::InTransfer,
+        ShardStatus::ActiveRecover => ApiShardStatus::InRecovery,
+        ShardStatus::LockedToMove => ApiShardStatus::ReadOnly,
+    }
+}
+
+fn increment_shard_summary(
+    summary: &mut ShardStatusSummary,
+    status: ApiShardStatus,
+    is_owned: bool,
+) {
+    if !is_owned {
+        if ApiShardStatus::ReadOnly == status {
+            summary.read_only += 1;
+        }
+        return;
+    }
+
+    debug_assert!(is_owned);
+    summary.owned += 1;
+    match status {
+        ApiShardStatus::Unknown => summary.unknown += 1,
+        ApiShardStatus::Ready => summary.ready += 1,
+        ApiShardStatus::InTransfer => summary.in_transfer += 1,
+        ApiShardStatus::InRecovery => summary.in_recovery += 1,
+        // We do not expect owned shards to be read-only.
+        _ => (),
+    }
 }
 
 impl ServiceState for StorageNode {
@@ -1075,8 +1177,8 @@ impl ServiceState for StorageNode {
         self.inner.n_shards()
     }
 
-    fn health_info(&self) -> ServiceHealthInfo {
-        self.inner.health_info()
+    fn health_info(&self, detailed: bool) -> ServiceHealthInfo {
+        self.inner.health_info(detailed)
     }
 
     fn sliver_status<A: EncodingAxis>(
@@ -1289,11 +1391,14 @@ impl ServiceState for StorageNodeInner {
         self.encoding_config.n_shards()
     }
 
-    fn health_info(&self) -> ServiceHealthInfo {
+    fn health_info(&self, detailed: bool) -> ServiceHealthInfo {
+        let (shard_summary, shard_detail) = self.shard_health_status(detailed);
         ServiceHealthInfo {
             uptime: self.start_time.elapsed(),
             epoch: self.current_epoch(),
             public_key: self.public_key().clone(),
+            shard_detail,
+            shard_summary,
         }
     }
 
@@ -3040,6 +3145,8 @@ mod tests {
             .with_rest_api_started(true)
             .build()
             .await?;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(
             node.as_ref()

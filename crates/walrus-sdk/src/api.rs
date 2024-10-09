@@ -8,7 +8,7 @@ use std::cmp::{Ordering, Reverse};
 use serde::{Deserialize, Serialize};
 use sui_types::event::EventID;
 use tokio::time::Duration;
-use walrus_core::{Epoch, PublicKey};
+use walrus_core::{Epoch, PublicKey, ShardIndex};
 
 use crate::error::ServiceError;
 
@@ -207,6 +207,7 @@ pub enum StoredOnNodeStatus {
 
 /// Represents information about the health of the storage node service.
 #[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceHealthInfo {
     /// The uptime of the service.
     #[schema(value_type = Object)]
@@ -217,4 +218,74 @@ pub struct ServiceHealthInfo {
     /// The public key of the storage node.
     #[schema(value_type = [u8], format = "Base58")]
     pub public_key: PublicKey,
+    /// The overall status of the shards.
+    pub shard_summary: ShardStatusSummary,
+    /// The status of the shards for which the node is responsible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_detail: Option<ShardStatusDetail>,
+}
+
+/// Summary of the shard statuses.
+///
+/// Summarises the number of nodes for which this node is responsible, as well as those that are
+/// being transferred to another storage node.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardStatusSummary {
+    /// The number of shards, for which this node is responsible.
+    ///
+    /// Their statuses are summarized in `unknown`, `ready`, `in_transfer`, and `in_recovery`.
+    pub owned: usize,
+    /// The number of owned shards in an unknown state.
+    pub unknown: usize,
+    /// The number of owned shards that are up-to-date for the epoch.
+    pub ready: usize,
+    /// The number of owned shards that are being transferred to the node.
+    pub in_transfer: usize,
+    /// The number of owned shards that are being recovered.
+    pub in_recovery: usize,
+    /// The number of shards, no longer owned by the node, that are read only,
+    /// i.e., only serving reads from this node.
+    pub read_only: usize,
+}
+
+/// Detail statuses of individual shards.
+///
+/// Provides the status of each shard for which the node is responsible. Additionally, will provide
+/// the status of shards which the node is not responsible for in the current epoch, but
+/// nonetheless currently stores. These will not appear in the [`ShardStatusSummary`].
+#[derive(Debug, Default, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardStatusDetail {
+    /// Statuses of the shards for which the node is responsible in this epoch.
+    pub owned: Vec<ShardHealthInfo>,
+    /// Statuses of other shards the node currently stores.
+    pub other: Vec<ShardHealthInfo>,
+}
+
+/// A shard with its status.
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardHealthInfo {
+    /// The identifier of the shard in the walrus system.
+    #[schema(value_type = u16)]
+    pub shard: ShardIndex,
+    /// The status of the shard, None if unavailable.
+    pub status: ShardStatus,
+}
+
+/// The current state of a shard on the storage node.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ShardStatus {
+    /// The status of the shard is indeterminate.
+    Unknown,
+    /// The shard is ready and up-to-date.
+    Ready,
+    /// The shard is being transferred to this storage node.
+    InTransfer,
+    /// The shard is being recovered.
+    InRecovery,
+    /// The shard is currently not accepting any more writes.
+    ReadOnly,
 }
