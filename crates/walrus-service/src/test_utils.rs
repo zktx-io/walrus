@@ -179,6 +179,7 @@ pub struct StorageNodeHandleBuilder {
     run_rest_api: bool,
     run_node: bool,
     test_config: Option<StorageNodeTestConfig>,
+    initial_epoch: Option<Epoch>,
 }
 
 impl StorageNodeHandleBuilder {
@@ -269,6 +270,14 @@ impl StorageNodeHandleBuilder {
         self
     }
 
+    /// Specify the initial epoch for the node.
+    ///
+    /// If specified, the committee service will be created with the provided epoch.
+    pub fn with_initial_epoch(mut self, epoch: Option<Epoch>) -> Self {
+        self.initial_epoch = epoch;
+        self
+    }
+
     /// Creates the configured [`StorageNodeHandle`].
     pub async fn build(self) -> anyhow::Result<StorageNodeHandle> {
         // Identify the storage being used, as it allows us to extract the shards
@@ -300,7 +309,7 @@ impl StorageNodeHandleBuilder {
             let committee = committee_from_members(
                 // Remove the possible None in the members list
                 committee_members.into_iter().flatten().collect(),
-                None,
+                self.initial_epoch,
             );
             Box::new(StubCommitteeService {
                 encoding: EncodingConfig::new(committee.n_shards()).into(),
@@ -413,6 +422,7 @@ impl Default for StorageNodeHandleBuilder {
             run_node: Default::default(),
             contract_service: None,
             test_config: None,
+            initial_epoch: None,
         }
     }
 }
