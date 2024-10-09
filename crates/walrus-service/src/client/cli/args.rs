@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 use sui_types::base_types::ObjectID;
 use walrus_core::{encoding::EncodingConfig, BlobId, EpochCount};
+use walrus_sui::utils::SuiNetwork;
 
 use super::{parse_blob_id, read_blob_from_file, BlobIdDecimal, HumanReadableBytes};
 
@@ -270,6 +271,21 @@ pub enum CliCommands {
         /// The amount of FROST (smallest unit of WAL token) to stake with the storage node.
         amount: u64,
     },
+    /// Generates a new Sui wallet.
+    GenerateSuiWallet {
+        /// The path where the wallet configuration will be stored.
+        path: PathBuf,
+        /// Sui network for which the wallet is generated.
+        ///
+        /// Available options are `devnet`, `testnet`, and `localnet`.
+        #[clap(long, default_value_t = default::sui_network())]
+        #[serde(default = "default::sui_network")]
+        sui_network: SuiNetwork,
+        /// Timeout for the faucet call.
+        #[clap(short, long, value_parser = humantime::parse_duration, default_value = "1min")]
+        #[serde(default = "default::faucet_timeout")]
+        faucet_timeout: Duration,
+    },
     /// Exchange SUI for WAL through the configured exchange.
     GetWal {
         #[clap(long)]
@@ -517,6 +533,7 @@ mod default {
     use std::{net::SocketAddr, time::Duration};
 
     use walrus_core::EpochCount;
+    use walrus_sui::utils::SuiNetwork;
 
     pub(crate) fn gas_budget() -> u64 {
         500_000_000
@@ -552,6 +569,14 @@ mod default {
 
     pub(crate) fn exchange_amount_mist() -> u64 {
         500_000_000 // 0.5 SUI
+    }
+
+    pub(crate) fn sui_network() -> SuiNetwork {
+        SuiNetwork::Testnet
+    }
+
+    pub(crate) fn faucet_timeout() -> Duration {
+        Duration::from_secs(60)
     }
 }
 

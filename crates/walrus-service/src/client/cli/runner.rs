@@ -56,7 +56,7 @@ use crate::{
         Config,
         StoreWhen,
     },
-    utils::MetricsAndLoggingRuntime,
+    utils::{generate_sui_wallet, MetricsAndLoggingRuntime},
 };
 
 /// A helper struct to run commands for the Walrus client.
@@ -152,6 +152,15 @@ impl ClientCommandRunner {
 
             CliCommands::Stake { node_id, amount } => {
                 self.stake_with_node_pool(node_id, amount).await
+            }
+
+            CliCommands::GenerateSuiWallet {
+                path,
+                sui_network,
+                faucet_timeout,
+            } => {
+                generate_sui_wallet(sui_network, &path, faucet_timeout).await?;
+                Ok(())
             }
 
             CliCommands::GetWal {

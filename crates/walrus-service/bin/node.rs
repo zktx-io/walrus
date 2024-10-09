@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use config::{PathOrInPlace, TlsConfig};
 use fastcrypto::traits::KeyPair;
 use fs::File;
+use humantime::Duration;
 use prometheus::Registry;
 use sui_sdk::wallet_context::WalletContext;
 use sui_types::base_types::ObjectID;
@@ -76,6 +77,9 @@ enum Commands {
         /// Available options are `devnet`, `testnet`, and `localnet`.
         #[clap(long, default_value = "testnet")]
         sui_network: SuiNetwork,
+        /// Timeout for the faucet call.
+        #[clap(long, default_value = "1min")]
+        faucet_timeout: Duration,
         #[clap(flatten)]
         config_args: ConfigArgs,
     },
@@ -250,8 +254,15 @@ fn main() -> anyhow::Result<()> {
             config_directory,
             storage_path,
             sui_network,
+            faucet_timeout,
             config_args,
-        } => commands::setup(config_directory, storage_path, sui_network, config_args)?,
+        } => commands::setup(
+            config_directory,
+            storage_path,
+            sui_network,
+            faucet_timeout.into(),
+            config_args,
+        )?,
 
         Commands::Register {
             config_path,
@@ -526,6 +537,7 @@ mod commands {
         config_directory: PathBuf,
         storage_path: PathBuf,
         sui_network: SuiNetwork,
+        faucet_timeout: Duration,
         config_args: ConfigArgs,
     ) -> anyhow::Result<()> {
         let config_path = config_directory.join("walrus-node.yaml");
@@ -541,30 +553,7 @@ mod commands {
         keygen(&protocol_key_path, KeyType::Protocol, true)?;
         keygen(&network_key_path, KeyType::Network, true)?;
 
-        println!(
-            "Generating Sui wallet for {} at '{}'",
-            sui_network.r#type(),
-            wallet_config.display()
-        );
-        let mut wallet = walrus_sui::utils::create_wallet(&wallet_config, sui_network.env(), None)?;
-        let wallet_address = wallet.active_address()?;
-        println!("Generated a new Sui wallet; address: {wallet_address}");
-
-        println!("Attempting to get SUI from faucet...");
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            walrus_sui::utils::request_sui_from_faucet(
-                wallet_address,
-                &sui_network,
-                &wallet.get_client().await?,
-            ),
-        )
-        .await
-        {
-            Err(_) => println!("Reached timeout while waiting to get SUI from the faucet"),
-            Ok(Err(e)) => println!("An error occurred when trying to get SUI from the faucet: {e}"),
-            Ok(Ok(_)) => (),
-        }
+        utils::generate_sui_wallet(sui_network, &wallet_config, faucet_timeout).await?;
 
         generate_config(
             PathArgs {
