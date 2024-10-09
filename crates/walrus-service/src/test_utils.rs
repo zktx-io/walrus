@@ -1176,7 +1176,8 @@ pub mod test_cluster {
         // Specify an empty assignment to ensure that storage nodes are not created with invalid
         // shard assignments.
         let node_weights = [1u16, 2, 3, 3, 4];
-        let n_shards = node_weights.iter().sum();
+        let n_shards = NonZeroU16::new(node_weights.iter().sum())
+            .expect("sum of non-zero weights is not zero");
         let cluster_builder =
             TestCluster::builder().with_shard_assignment(&vec![[]; node_weights.len()]);
 
@@ -1196,11 +1197,9 @@ pub mod test_cluster {
         let system_ctx = create_and_init_system_for_test(
             &mut wallet.inner,
             n_shards,
-            0,
-            epoch_duration
-                .as_millis()
-                .try_into()
-                .expect("duration is within u64 millis"),
+            Duration::from_secs(0),
+            epoch_duration,
+            None,
         )
         .await?;
 
