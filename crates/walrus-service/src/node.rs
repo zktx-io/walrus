@@ -1550,7 +1550,7 @@ mod tests {
     use walrus_test_utils::{async_param_test, Result as TestResult, WithTempDir};
 
     use super::*;
-    use crate::test_utils::{StorageNodeHandle, TestCluster};
+    use crate::test_utils::{StorageNodeHandle, StorageNodeHandleTrait, TestCluster};
 
     const TIMEOUT: Duration = Duration::from_secs(1);
     const OTHER_BLOB_ID: BlobId = BlobId([247; 32]);
@@ -2023,30 +2023,30 @@ mod tests {
         let nodes_and_shards: Vec<_> = cluster
             .nodes
             .iter()
-            .flat_map(|node| std::iter::repeat(node).zip(node.storage_node.shards()))
+            .flat_map(|node| std::iter::repeat(node).zip(node.storage_node().shards()))
             .collect();
 
         let mut metadata_stored = vec![];
 
         for (node, shard) in nodes_and_shards {
-            if !metadata_stored.contains(&&node.public_key)
+            if !metadata_stored.contains(&node.public_key())
                 && (store_at_shard(&shard, SliverType::Primary)
                     || store_at_shard(&shard, SliverType::Secondary))
             {
-                node.client.store_metadata(&blob.metadata).await?;
-                metadata_stored.push(&node.public_key);
+                node.client().store_metadata(&blob.metadata).await?;
+                metadata_stored.push(node.public_key());
             }
 
             let sliver_pair = blob.assigned_sliver_pair(shard);
 
             if store_at_shard(&shard, SliverType::Primary) {
-                node.client
+                node.client()
                     .store_sliver(blob.blob_id(), sliver_pair.index(), &sliver_pair.primary)
                     .await?;
             }
 
             if store_at_shard(&shard, SliverType::Secondary) {
-                node.client
+                node.client()
                     .store_sliver(blob.blob_id(), sliver_pair.index(), &sliver_pair.secondary)
                     .await?;
             }
@@ -2074,7 +2074,7 @@ mod tests {
         let cluster = {
             // Lock to avoid race conditions.
             let _lock = global_test_lock().lock().await;
-            TestCluster::builder()
+            TestCluster::<StorageNodeHandle>::builder()
                 .with_shard_assignment(assignment)
                 .with_system_event_providers(events.clone())
                 .build()
@@ -2101,7 +2101,7 @@ mod tests {
         let cluster = {
             // Lock to avoid race conditions.
             let _lock = global_test_lock().lock().await;
-            TestCluster::builder()
+            TestCluster::<StorageNodeHandle>::builder()
                 .with_shard_assignment(assignment)
                 .with_system_event_providers(events.clone())
                 .build()
@@ -2184,7 +2184,7 @@ mod tests {
         let cluster = {
             // Lock to avoid race conditions.
             let _lock = global_test_lock().lock().await;
-            TestCluster::builder()
+            TestCluster::<StorageNodeHandle>::builder()
                 .with_shard_assignment(assignment)
                 .with_individual_system_event_providers(&event_providers)
                 .build()

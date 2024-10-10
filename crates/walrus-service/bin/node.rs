@@ -619,6 +619,7 @@ impl EventProcessorRuntime {
             None => Ok(None),
         }
     }
+
     fn start(
         sui_config: SuiConfig,
         event_processor_config: Option<EventProcessorConfig>,
