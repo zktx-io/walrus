@@ -9,6 +9,8 @@ use anyhow::anyhow;
 use communication::NodeCommunicationFactory;
 use fastcrypto::{bls12381::min_pk::BLS12381AggregateSignature, traits::AggregateAuthenticator};
 use futures::Future;
+use metrics::ClientMetricSet;
+use prometheus::Registry;
 use resource::{PriceComputation, ResourceManager, StoreOp};
 use sui_types::base_types::ObjectID;
 use tokio::{
@@ -62,6 +64,8 @@ mod resource;
 mod utils;
 pub use utils::string_prefix;
 
+mod metrics;
+
 type ClientResult<T> = Result<T, ClientError>;
 
 /// Represents how the store operation should be carried out by the client.
@@ -102,6 +106,7 @@ pub struct Client<T> {
     encoding_config: Arc<EncodingConfig>,
     blocklist: Option<Blocklist>,
     communication_factory: NodeCommunicationFactory,
+    metrics: Option<ClientMetricSet>,
 }
 
 impl Client<()> {
@@ -141,6 +146,7 @@ impl Client<()> {
                 encoding_config,
             ),
             config,
+            metrics: None,
         })
     }
 
@@ -155,6 +161,7 @@ impl Client<()> {
             communication_limits,
             blocklist,
             communication_factory: node_client_factory,
+            metrics,
         } = self;
         Client::<C> {
             config,
@@ -165,7 +172,26 @@ impl Client<()> {
             communication_limits,
             blocklist,
             communication_factory: node_client_factory,
+            metrics,
         }
+    }
+}
+impl<T> Client<T> {
+    /// Sets the metric registry used by the client.
+    pub fn set_metric_registry(&mut self, registry: &Registry) {
+        let metrics = ClientMetricSet::new(registry);
+
+        // Since the metrics have just been set, update them with the stored committee if possible.
+        // We use try_read as this is called during the 'construction' phase and it's unlikely that
+        // there is a write-lock necessitating the `.await`. Even if this fails, the daemon will
+        // eventually refresh the committee and log the state.
+        if let Ok(committees_guard) = self.committees.try_read() {
+            metrics.current_epoch.set(committees_guard.epoch());
+            metrics
+                .current_epoch_state
+                .set_from_committees(&committees_guard);
+        }
+        self.metrics = Some(metrics);
     }
 }
 
@@ -257,7 +283,20 @@ impl<T: ReadClient> Client<T> {
                 .await
                 .map_err(ClientError::other)?,
         );
-        *self.committees.write().await = new_committees;
+
+        // Acquire the guard across updating the metric.
+        let mut committee_guard = self.committees.write().await;
+
+        // Update the metrics to reflect the new committee.
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.current_epoch.set(new_committees.epoch());
+            metrics
+                .current_epoch_state
+                .set_from_committees(&new_committees);
+        }
+
+        *committee_guard = new_committees;
+
         Ok(())
     }
 }
