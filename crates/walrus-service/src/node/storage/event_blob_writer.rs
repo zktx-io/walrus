@@ -187,10 +187,23 @@ impl EventBlobWriter {
         file.write_u32::<BigEndian>(magic_bytes)?;
         file.write_u32::<BigEndian>(blob_format_version)?;
         drop(file);
-        file = OpenOptions::new()
-            .append(true)
-            .read(true)
-            .open(next_file_path)?;
+
+        // File::set_len requires write, not append access rights on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(next_file_path)?;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(next_file_path)?;
+        }
+
         file.seek(SeekFrom::Start(EventBlob::HEADER_SIZE as u64))?;
         Ok(file)
     }
@@ -310,7 +323,7 @@ impl EventBlobWriter {
         file.seek(SeekFrom::Start(0))?;
         let mut file_content = Vec::new();
         file.read_to_end(&mut file_content)?;
-        let mut tmp_file = File::create("/tmp/event_blob")?;
+        let mut tmp_file = File::create(self.root_dir_path.join("event_blob"))?;
         tmp_file.write_all(&file_content)?;
         tmp_file.flush()?;
         Ok(())
@@ -377,10 +390,7 @@ impl EventBlobWriter {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
+    use std::{fs, path::PathBuf};
 
     use walrus_core::{BlobId, ShardIndex};
     use walrus_event::{EventStreamElement, IndexedStreamElement};
@@ -403,9 +413,10 @@ mod tests {
             .build()
             .await?;
         let mut blob_writer =
-            EventBlobWriter::new_for_testing(dir, 100, node.storage_node.inner.clone())?;
-        if Path::new("/tmp/event_blob").exists() {
-            fs::remove_file("/tmp/event_blob")?;
+            EventBlobWriter::new_for_testing(dir.clone(), 100, node.storage_node.inner.clone())?;
+        let event_blob_file_path = dir.join("event_blob");
+        if event_blob_file_path.exists() {
+            fs::remove_file(event_blob_file_path.clone())?;
         }
         let mut counter = 0;
         // Write events into the blob
@@ -426,7 +437,7 @@ mod tests {
             counter += 1;
         }
         // Read back the events from the blob
-        let file = std::fs::File::open("/tmp/event_blob")?;
+        let file = std::fs::File::open(event_blob_file_path)?;
         let event_blob = crate::node::storage::event_blob::EventBlob::new(file)?;
         assert_eq!(event_blob.start_checkpoint_sequence_number(), 0);
         assert_eq!(event_blob.end_checkpoint_sequence_number(), 99);
