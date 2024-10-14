@@ -44,7 +44,6 @@ use walrus_core::{
 };
 use walrus_event::{
     event_processor::EventProcessor,
-    EventProcessorConfig,
     EventSequenceNumber,
     EventStreamCursor,
     IndexedStreamElement,
@@ -78,7 +77,7 @@ use crate::{
             EndCommitteeChangeError,
             NodeCommitteeService,
         },
-        config::StorageNodeConfig,
+        config::{EventProviderConfig, StorageNodeConfig},
         contract_service::SystemContractService,
         errors::SyncShardClientError,
         server::{UserServer, UserServerConfig},
@@ -349,8 +348,14 @@ impl SimStorageNodeHandle {
         // Starts the event processor thread if the node is configured to use the checkpoint
         // based event processor.
         let sui_read_client = sui_config.new_read_client().await?;
-        let event_provider: Box<dyn EventManager> =
-            if let Some(event_processor_config) = config.clone().event_processor_config {
+        let event_provider: Box<dyn EventManager> = match &config.event_provider_config {
+            EventProviderConfig::CheckpointBasedEventProcessor(event_processor_config) => {
+                let event_processor_config = event_processor_config.clone().unwrap_or_else(|| {
+                    walrus_event::EventProcessorConfig::new_with_default_pruning_interval(
+                        sui_config.rpc.clone(),
+                    )
+                });
+
                 Box::new(
                     EventProcessor::new(
                         &event_processor_config,
@@ -362,12 +367,14 @@ impl SimStorageNodeHandle {
                     )
                     .await?,
                 )
-            } else {
+            }
+            EventProviderConfig::LegacyEventProvider => {
                 Box::new(crate::node::system_events::SuiSystemEventProvider::new(
                     sui_read_client.clone(),
                     Duration::from_millis(100),
                 ))
-            };
+            }
+        };
 
         // Starts the event processor thread if it is configured, otherwise it produces a JoinHandle
         // that never returns.
@@ -1705,9 +1712,9 @@ pub mod test_cluster {
             .await
             .with_system_contract_services(&node_contract_services);
 
-        // event processor config
-        let event_processor_config = create_event_processor_config(sui_cluster.clone())?;
-
+        let event_processor_config = EventProcessorConfig::new_with_default_pruning_interval(
+            sui_cluster.cluster().fullnode_handle.rpc_url.clone(),
+        );
         let cluster_builder = setup_event_processors(
             &event_processor_config,
             sui_read_client.clone(),
@@ -1757,7 +1764,7 @@ pub mod test_cluster {
         if rng.gen_bool(0.5) {
             let mut event_processors = vec![];
             for _ in test_cluster_builder.storage_node_test_configs().iter() {
-                let event_processor = walrus_event::event_processor::EventProcessor::new(
+                let event_processor = EventProcessor::new(
                     event_processor_config,
                     event_processor_config.rest_url.clone(),
                     sui_read_client.get_system_package_id(),
@@ -1804,21 +1811,6 @@ pub mod test_cluster {
     }
 }
 
-fn create_event_processor_config(
-    sui_cluster: Arc<TestClusterHandle>,
-) -> anyhow::Result<EventProcessorConfig> {
-    // FullNode rest url
-    let rest_url = sui_cluster.cluster().fullnode_handle.rpc_url.clone();
-
-    // Event processor config
-    let event_processor_config = EventProcessorConfig {
-        rest_url,
-        pruning_interval: 3600,
-    };
-
-    Ok(event_processor_config)
-}
-
 /// Creates a new [`StorageNodeConfig`] object for testing.
 pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
     let temp_dir = TempDir::new().expect("able to create a temporary directory");
@@ -1836,7 +1828,7 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
             tls: Default::default(),
             rest_graceful_shutdown_period_secs: Some(Some(0)),
             shard_sync_config: Default::default(),
-            event_processor_config: None,
+            event_provider_config: EventProviderConfig::LegacyEventProvider,
             commission_rate: 0,
             voting_params: VotingParams {
                 storage_price: 5,

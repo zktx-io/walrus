@@ -136,10 +136,9 @@ struct GenerateDryRunConfigsArgs {
     /// sending another request.
     #[clap(long)]
     faucet_cooldown: Option<Duration>,
-    /// Enable checkpoint based event processor
-    /// [default: false]
+    /// Use the legacy event processor instead of the standard checkpoint-based event processor.
     #[clap(long, action)]
-    enable_checkpoint_event_processor: bool,
+    use_legacy_event_provider: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -237,7 +236,7 @@ mod commands {
             listening_ips,
             set_db_path,
             faucet_cooldown,
-            enable_checkpoint_event_processor,
+            use_legacy_event_provider,
         }: GenerateDryRunConfigsArgs,
     ) -> anyhow::Result<()> {
         tracing_subscriber::fmt::init();
@@ -289,7 +288,7 @@ mod commands {
             set_db_path.as_deref(),
             faucet_cooldown.map(|duration| duration.into()),
             &mut admin_wallet,
-            enable_checkpoint_event_processor,
+            use_legacy_event_provider,
         )
         .await?;
         for (i, storage_node_config) in storage_node_configs.into_iter().enumerate() {
