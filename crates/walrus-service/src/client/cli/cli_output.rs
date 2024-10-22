@@ -8,7 +8,7 @@ use colored::Colorize;
 use indoc::printdoc;
 use prettytable::{format, row, Table};
 use serde::Serialize;
-use walrus_core::BlobId;
+use walrus_core::{BlobId, ShardIndex};
 use walrus_sdk::api::{BlobStatus, DeletableCounts};
 use walrus_sui::types::Blob;
 
@@ -342,7 +342,7 @@ impl CliOutput for InfoOutput {
 
         let mut table = Table::new();
         table.set_format(default_table_format());
-        table.set_titles(row![b->"Idx", b->"# Shards", b->"Pk prefix", b->"Address"]);
+        table.set_titles(row![b->"Idx", b->"# Shards", b->"Pk prefix", b->"Address", b->"Shards"]);
         for (i, node) in storage_nodes.iter().enumerate() {
             let n_owned = node.n_shards;
             let n_owned_percent = (n_owned as f64) / (n_shards.get() as f64) * 100.0;
@@ -351,9 +351,36 @@ impl CliOutput for InfoOutput {
                 format!("{} ({:.2}%)", n_owned, n_owned_percent),
                 string_prefix(&node.public_key),
                 node.network_address,
+                DisplayShardList(&node.shard_ids),
             ]);
         }
         table.printstd();
+    }
+}
+
+struct DisplayShardList<'a>(&'a [ShardIndex]);
+
+impl std::fmt::Display for DisplayShardList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shard_ids = &self.0;
+        if shard_ids.is_empty() {
+            write!(f, "none")
+        } else {
+            let mut counter = 0;
+            for (i, shard_id) in shard_ids.iter().enumerate() {
+                if i > 0 && counter != 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", usize::from(*shard_id))?;
+                counter += 1;
+                // Insert a newline after every 10 shard IDs for better readability
+                if counter == 10 {
+                    writeln!(f)?;
+                    counter = 0;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
