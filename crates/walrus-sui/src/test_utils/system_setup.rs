@@ -30,7 +30,7 @@ use super::{default_protocol_keypair, DEFAULT_GAS_BUDGET};
 use crate::{
     client::{ContractClient, ReadClient, SuiClientError, SuiContractClient},
     system_setup::{self, InitSystemParams},
-    types::NodeRegistrationParams,
+    types::{NodeRegistrationParams, StorageNodeCap},
 };
 
 const DEFAULT_MAX_EPOCHS_AHEAD: EpochCount = 104;
@@ -86,6 +86,7 @@ pub async fn publish_with_default_system(
         &[storage_node_params],
         &[protocol_keypair],
         &[&contract_client],
+        1_000_000_000_000,
         &[1_000_000_000],
     )
     .await?;
@@ -184,8 +185,9 @@ pub async fn register_committee_and_stake(
     node_params: &[NodeRegistrationParams],
     node_bls_keys: &[ProtocolKeyPair],
     contract_clients: &[&SuiContractClient],
+    wal_to_mint: u64,
     amounts_to_stake: &[u64],
-) -> Result<()> {
+) -> Result<Vec<StorageNodeCap>> {
     let receiver_addrs: Vec<_> = contract_clients
         .iter()
         .map(|client| client.address())
@@ -196,15 +198,18 @@ pub async fn register_committee_and_stake(
         system_context.package_id,
         system_context.treasury_cap,
         &receiver_addrs,
-        *amounts_to_stake
-            .iter()
-            .max()
-            .ok_or_else(|| anyhow!("no staking amounts provided"))?,
+        wal_to_mint.max(
+            *amounts_to_stake
+                .iter()
+                .max()
+                .expect("stake amount must be set"),
+        ),
     )
     .await?;
 
     // Initialize client
 
+    let mut node_capabilities = Vec::new();
     for (((storage_node_params, bls_sk), contract_client), amount_to_stake) in node_params
         .iter()
         .zip(node_bls_keys)
@@ -222,11 +227,14 @@ pub async fn register_committee_and_stake(
             .await?;
 
         // stake with storage nodes
-        let _staked_wal = contract_client
-            .stake_with_pool(*amount_to_stake, node_cap.node_id)
-            .await?;
+        if *amount_to_stake > 0 {
+            let _staked_wal = contract_client
+                .stake_with_pool(*amount_to_stake, node_cap.node_id)
+                .await?;
+        }
+        node_capabilities.push(node_cap);
     }
-    Ok(())
+    Ok(node_capabilities)
 }
 
 /// Calls `voting_end`, immediately followed by `initiate_epoch_change`.

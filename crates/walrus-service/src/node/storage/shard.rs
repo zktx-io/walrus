@@ -304,7 +304,7 @@ impl ShardStorage {
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            base_column_family_name(id) + "/primary-slivers",
+            primary_slivers_column_family_name(id),
             db_config.shard().to_options(),
         )
     }
@@ -316,7 +316,7 @@ impl ShardStorage {
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            base_column_family_name(id) + "/secondary-slivers",
+            secondary_slivers_column_family_name(id),
             db_config.shard().to_options(),
         )
     }
@@ -328,7 +328,7 @@ impl ShardStorage {
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            base_column_family_name(id) + "/status",
+            shard_status_column_family_name(id),
             db_config.shard_status().to_options(),
         )
     }
@@ -340,7 +340,7 @@ impl ShardStorage {
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            base_column_family_name(id) + "/sync-progress",
+            shard_sync_progress_column_family_name(id),
             db_config.shard_sync_progress().to_options(),
         )
     }
@@ -352,7 +352,7 @@ impl ShardStorage {
         db_config: &DatabaseConfig,
     ) -> (String, Options) {
         (
-            base_column_family_name(id) + "/pending-recover-slivers",
+            pending_recover_slivers_column_family_name(id),
             db_config.pending_recover_slivers().to_options(),
         )
     }
@@ -863,6 +863,26 @@ impl ShardStorage {
         self.pending_recover_slivers.remove(&(sliver_type, blob_id))
     }
 
+    pub fn delete_shard(&self) -> Result<(), TypedStoreError> {
+        let rocksdb = self.primary_slivers.rocksdb.clone();
+        rocksdb
+            .drop_cf(&shard_status_column_family_name(self.id()))
+            .map_err(typed_store_err_from_rocks_err)?;
+        rocksdb
+            .drop_cf(&shard_sync_progress_column_family_name(self.id()))
+            .map_err(typed_store_err_from_rocks_err)?;
+        rocksdb
+            .drop_cf(&pending_recover_slivers_column_family_name(self.id()))
+            .map_err(typed_store_err_from_rocks_err)?;
+        rocksdb
+            .drop_cf(&primary_slivers_column_family_name(self.id()))
+            .map_err(typed_store_err_from_rocks_err)?;
+        rocksdb
+            .drop_cf(&secondary_slivers_column_family_name(self.id()))
+            .map_err(typed_store_err_from_rocks_err)?;
+        Ok(())
+    }
+
     /// Locks the shard for moving to another node.
     pub(crate) fn lock_shard_for_epoch_change(&self) -> Result<(), TypedStoreError> {
         self.shard_status.insert(&(), &ShardStatus::LockedToMove)
@@ -932,6 +952,31 @@ fn id_from_column_family_name(name: &str) -> Option<(ShardIndex, SliverType)> {
 #[inline]
 fn base_column_family_name(id: ShardIndex) -> String {
     format!("shard-{}", id.0)
+}
+
+#[inline]
+pub fn primary_slivers_column_family_name(id: ShardIndex) -> String {
+    base_column_family_name(id) + "/primary-slivers"
+}
+
+#[inline]
+pub fn secondary_slivers_column_family_name(id: ShardIndex) -> String {
+    base_column_family_name(id) + "/secondary-slivers"
+}
+
+#[inline]
+pub fn shard_status_column_family_name(id: ShardIndex) -> String {
+    base_column_family_name(id) + "/status"
+}
+
+#[inline]
+pub fn shard_sync_progress_column_family_name(id: ShardIndex) -> String {
+    base_column_family_name(id) + "/sync-progress"
+}
+
+#[inline]
+pub fn pending_recover_slivers_column_family_name(id: ShardIndex) -> String {
+    base_column_family_name(id) + "/pending-recover-slivers"
 }
 
 #[cfg(msim)]
