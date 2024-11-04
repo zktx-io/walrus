@@ -366,7 +366,7 @@ pub(super) struct NodeCommitteeServiceInner<T> {
     pub services: SyncMutex<HashMap<PublicKey, T>>,
     /// Timeouts and other configuration for requests.
     pub config: CommitteeServiceConfig,
-    /// System wide encoding parameters
+    /// System wide encoding parameters.
     pub encoding_config: Arc<EncodingConfig>,
     /// Shared randomness.
     pub rng: SyncMutex<StdRng>,
@@ -374,7 +374,7 @@ pub(super) struct NodeCommitteeServiceInner<T> {
     local_identity: Option<PublicKey>,
     /// Function used to construct new services.
     service_factory: TokioMutex<Box<dyn NodeServiceFactory<Service = T>>>,
-    /// Exported metrics
+    /// Exported metrics.
     metrics: Option<CommitteeServiceMetricSet>,
 }
 
@@ -446,6 +446,14 @@ where
 
         metrics.current_epoch.set(committees.epoch());
         metrics.current_epoch_state.set_from_committees(committees);
+
+        if let Some(local_identity) = self.local_identity.as_ref() {
+            metrics.shards_owned.set(
+                committees
+                    .current_committee()
+                    .n_shards_for_node_public_key(local_identity),
+            );
+        }
     }
 }
 
