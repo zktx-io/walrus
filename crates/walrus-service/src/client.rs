@@ -76,6 +76,12 @@ type ClientResult<T> = Result<T, ClientError>;
 /// Represents how the store operation should be carried out by the client.
 #[derive(Debug, Clone, Copy)]
 pub enum StoreWhen {
+    /// Store the blob if not stored, but do not check the resources in the current wallet.
+    ///
+    /// With this command, the client does not check for usable registrations or
+    /// storage space. This is useful when using the publisher, to avoid wasting multiple round
+    /// trips to the fullnode.
+    NotStoredIgnoreResources,
     /// Store the blob always, without checking the status.
     Always,
     /// Check the status of the blob before storing it, and store it only if it is not already.
@@ -85,7 +91,12 @@ pub enum StoreWhen {
 impl StoreWhen {
     /// Returns `true` if the operation is [`Self::Always`].
     pub fn is_store_always(&self) -> bool {
-        matches!(self, StoreWhen::Always)
+        matches!(self, Self::Always)
+    }
+
+    /// Returns `true` if the operation is [`Self::NotStoredIgnoreResources`].
+    pub fn is_ignore_resources(&self) -> bool {
+        matches!(self, Self::NotStoredIgnoreResources)
     }
 
     /// Returns [`Self`] based on the value of a `force` flag.
@@ -377,12 +388,12 @@ impl<T: ContractClient> Client<T> {
 
         let pair = pairs.first().expect("the encoding produces sliver pairs");
         let symbol_size = pair.primary.symbols.symbol_size().get();
-        tracing::debug!(
+        tracing::info!(
             symbol_size=%symbol_size,
             primary_sliver_size=%pair.primary.symbols.len() * usize::from(symbol_size),
             secondary_sliver_size=%pair.secondary.symbols.len() * usize::from(symbol_size),
-            duration = %humantime::Duration::from(encode_duration),
-            "computed sliver pairs and metadata"
+            duration = ?encode_duration,
+            "encoded sliver pairs and metadata"
         );
 
         Ok((pairs, metadata))
@@ -400,15 +411,25 @@ impl<T: ContractClient> Client<T> {
         self.check_blob_id(&blob_id)?;
         tracing::Span::current().record("blob_id", blob_id.to_string());
 
+        let status_start_timer = Instant::now();
         let blob_status = self
             .get_blob_status_with_retries(&blob_id, &self.sui_client)
             .await?;
+        tracing::info!(
+            duration = ?status_start_timer.elapsed(),
+            "retrieved blob status"
+        );
 
+        let store_op_timer = Instant::now();
         let store_operation = self
             .resource_manager()
             .await
             .store_operation_for_blob(metadata, epochs_ahead, persistence, store_when, blob_status)
             .await?;
+        tracing::info!(
+            duration = ?store_op_timer.elapsed(),
+            "blob resource obtained"
+        );
 
         let (mut blob_object, resource_operation) = match store_operation {
             StoreOp::NoOp(result) => return Ok(result),
@@ -442,7 +463,7 @@ impl<T: ContractClient> Client<T> {
                     let certify_duration = certify_start_timer.elapsed();
                     let blob_size = blob_object.size;
                     tracing::info!(
-                        duration =  %humantime::Duration::from(certify_duration),
+                        duration =  ?certify_duration,
                         blob_size = blob_size,
                         "finished sending blob data and collected certificate"
                     );
@@ -454,10 +475,15 @@ impl<T: ContractClient> Client<T> {
             (certificate, write_committee_epoch)
         };
 
+        let sui_cert_timer = Instant::now();
         self.sui_client
             .certify_blob(blob_object.clone(), &certificate)
             .await
             .map_err(|e| ClientError::from(ClientErrorKind::CertificationFailed(e)))?;
+        tracing::info!(
+            duration = ?sui_cert_timer.elapsed(),
+            "certified blob on Sui"
+        );
         blob_object.certified_epoch = Some(write_committee_epoch);
         let cost = self.price_computation.operation_cost(&resource_operation);
 
