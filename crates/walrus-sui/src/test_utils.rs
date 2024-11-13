@@ -92,10 +92,47 @@ pub fn get_default_invalid_certificate(blob_id: BlobId, epoch: Epoch) -> Invalid
     InvalidBlobCertificate::new(vec![0], invalid_blob_id_msg, signature)
 }
 
+/// Represents a test cluster running within this process or as a separate process.
+pub enum LocalOrExternalTestCluster {
+    /// A test cluster running within this process.
+    Local {
+        /// The local test cluster.
+        cluster: TestCluster,
+    },
+    /// A test running in another process.
+    External {
+        /// The RPC URL of the external test cluster.
+        rpc_url: String,
+    },
+}
+impl Debug for LocalOrExternalTestCluster {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local { .. } => f.debug_struct("Local").finish(),
+            Self::External { rpc_url } => f
+                .debug_struct("External")
+                .field("rpc_url", rpc_url)
+                .finish(),
+        }
+    }
+}
+
+impl LocalOrExternalTestCluster {
+    /// Returns the URL of the RPC node.
+    pub fn rpc_url(&self) -> String {
+        match self {
+            LocalOrExternalTestCluster::Local { cluster } => {
+                cluster.fullnode_handle.rpc_url.clone()
+            }
+            LocalOrExternalTestCluster::External { rpc_url, .. } => rpc_url.clone(),
+        }
+    }
+}
+
 /// Handle for the global Sui test cluster.
 pub struct TestClusterHandle {
     wallet_path: Mutex<PathBuf>,
-    cluster: TestCluster,
+    cluster: LocalOrExternalTestCluster,
 
     #[cfg(msim)]
     node_handle: NodeHandle,
@@ -111,6 +148,12 @@ impl TestClusterHandle {
     // Creates a test Sui cluster using tokio runtime.
     #[cfg(not(msim))]
     fn new(runtime: &Runtime) -> Self {
+        Self::from_env().unwrap_or_else(|| Self::new_on_runtime(runtime))
+    }
+
+    // Creates a test Sui cluster using tokio runtime.
+    #[cfg(not(msim))]
+    fn new_on_runtime(runtime: &Runtime) -> Self {
         tracing::debug!("building global Sui test cluster");
         let (tx, rx) = mpsc::channel();
         runtime.spawn(async move {
@@ -122,8 +165,29 @@ impl TestClusterHandle {
         let (cluster, wallet_path) = rx.recv().expect("should receive test_cluster");
         Self {
             wallet_path: Mutex::new(wallet_path),
-            cluster,
+            cluster: LocalOrExternalTestCluster::Local { cluster },
         }
+    }
+
+    /// Attempts to construct a handle to an externally running sui cluster.
+    ///
+    /// If the environment variable `SUI_TEST_CONFIG_DIR` is defined, then the wallet and network
+    /// configuration information taken from the the associated Sui files in the specified
+    /// directory.
+    ///
+    /// Returns None if the environment variable is not set.
+    #[cfg(not(msim))]
+    fn from_env() -> Option<Self> {
+        let config_path = std::env::var("SUI_TEST_CONFIG_DIR").ok()?;
+        tracing::debug!("using external sui test cluster");
+        let wallet_path = std::path::Path::new(&config_path)
+            .join("client.yaml")
+            .into();
+        let rpc_url = "http://127.0.0.1:9000".into();
+        Some(Self {
+            cluster: LocalOrExternalTestCluster::External { rpc_url },
+            wallet_path,
+        })
     }
 
     // Creates a test Sui cluster using deterministic MSIM runtime.
@@ -150,7 +214,7 @@ impl TestClusterHandle {
         };
         Self {
             wallet_path: Mutex::new(wallet_path),
-            cluster,
+            cluster: LocalOrExternalTestCluster::Local { cluster },
             node_handle,
         }
     }
@@ -161,8 +225,23 @@ impl TestClusterHandle {
     }
 
     /// Returns the test cluster reference.
-    pub fn cluster(&self) -> &TestCluster {
+    #[cfg(not(msim))]
+    pub fn cluster(&self) -> &LocalOrExternalTestCluster {
         &self.cluster
+    }
+
+    /// Returns the local test cluster reference for simtests.
+    #[cfg(msim)]
+    pub fn cluster(&self) -> &TestCluster {
+        let LocalOrExternalTestCluster::Local { ref cluster } = self.cluster else {
+            unreachable!("always use a local test cluster in simtests")
+        };
+        cluster
+    }
+
+    /// Returns the URL of the RPC node.
+    pub fn rpc_url(&self) -> String {
+        self.cluster.rpc_url()
     }
 
     /// Returns the simulator node handle for the Sui test cluster.
@@ -266,10 +345,52 @@ pub mod using_msim {
     }
 }
 
-/// Returns a wallet on the global Sui test cluster as well as a handle to the cluster.
+/// Creates `n_wallets` wallets and funds them with the cluster's initial wallet.
 ///
-/// Initializes the test cluster if it doesn't exist yet. The cluster handle (or at least one
-/// copy if the function is called multiple times) must be kept alive while the wallet is active.
+/// Funds all the wallets with a single transaction, so as to avoid contention on the cluster's
+/// wallet.
+///
+/// See [`new_wallet_on_sui_test_cluster`] for a similar method that funds a single wallet at a
+/// time.
+pub async fn create_and_fund_wallets_on_cluster(
+    sui_cluster: Arc<TestClusterHandle>,
+    n_wallets: usize,
+) -> anyhow::Result<WithTempDir<Vec<WalletContext>>> {
+    let path_guard = sui_cluster.wallet_path.lock().await;
+    // Load the cluster's wallet from file instead of using the wallet stored in the cluster.
+    // This prevents tasks from being spawned in the current runtime that are expected by
+    // the wallet to continue running.
+    let mut cluster_wallet = WalletContext::new(&path_guard, None, None)?;
+    let wallets_dir = tempfile::tempdir().expect("temporary directory creation must succeed");
+
+    let mut wallets: Vec<_> = std::iter::repeat_with(|| {
+        create_wallet(
+            &wallets_dir.path().join("wallet_config.yaml"),
+            cluster_wallet.config.get_active_env()?.to_owned(),
+            None,
+        )
+    })
+    .take(n_wallets)
+    .collect::<Result<_, _>>()?;
+
+    let recipients = wallets
+        .iter_mut()
+        .map(|wallet| {
+            wallet
+                .active_address()
+                .expect("newly created wallet has an active address")
+        })
+        .collect();
+
+    fund_addresses(&mut cluster_wallet, recipients).await?;
+
+    Ok(WithTempDir {
+        inner: wallets,
+        temp_dir: wallets_dir,
+    })
+}
+
+/// Returns a new wallet on the global Sui test cluster.
 pub async fn new_wallet_on_sui_test_cluster(
     sui_cluster: Arc<TestClusterHandle>,
 ) -> anyhow::Result<WithTempDir<WalletContext>> {
@@ -304,7 +425,8 @@ pub async fn wallet_for_testing(
         funding_wallet.config.get_active_env()?.to_owned(),
         None,
     )?;
-    fund_address(funding_wallet, wallet.active_address()?).await?;
+
+    fund_addresses(funding_wallet, vec![wallet.active_address()?]).await?;
 
     Ok(WithTempDir {
         inner: wallet,
@@ -312,10 +434,10 @@ pub async fn wallet_for_testing(
     })
 }
 
-/// Funds `recipient` with two gas objects with 10 Sui each.
-async fn fund_address(
+/// Funds the `recipients` with gas objects with `DEFAULT_FUNDING_PER_COIN` Sui each.
+async fn fund_addresses(
     funding_wallet: &mut WalletContext,
-    recipient: SuiAddress,
+    recipients: Vec<SuiAddress>,
 ) -> anyhow::Result<()> {
     let sender = funding_wallet.active_address()?;
 
@@ -327,10 +449,8 @@ async fn fund_address(
 
     let mut ptb = ProgrammableTransactionBuilder::new();
 
-    ptb.pay_sui(
-        vec![recipient, recipient],
-        vec![DEFAULT_FUNDING_PER_COIN, DEFAULT_FUNDING_PER_COIN],
-    )?;
+    let amounts = vec![DEFAULT_FUNDING_PER_COIN; recipients.len()];
+    ptb.pay_sui(recipients, amounts)?;
 
     sign_and_send_ptb(
         sender,

@@ -7,7 +7,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["test-utils"]
+default = []
 test-utils = [
   "dep:tempfile",
   "dep:test-cluster",
@@ -20,6 +20,7 @@ anyhow.workspace = true
 bcs.workspace = true
 chrono.workspace = true
 fastcrypto.workspace = true
+futures.workspace = true
 move-core-types.workspace = true
 rand.workspace = true
 regex = "1.11.1"

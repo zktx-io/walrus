@@ -13,8 +13,7 @@ use std::{
     num::NonZeroU16,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
-    thread,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -23,11 +22,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use prometheus::Registry;
 use sui_types::base_types::ObjectID;
 use tempfile::TempDir;
-use tokio::{
-    runtime::{Builder, Runtime},
-    task::JoinHandle,
-    time::Duration,
-};
+use tokio::{task::JoinHandle, time::Duration};
 use tokio_stream::{wrappers::BroadcastStream, Stream};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -337,7 +332,6 @@ impl SimStorageNodeHandle {
 
     /// Builds and runs a storage node with the provided configuration. Returns the handles to the
     /// REST API, the node, and the event processor.
-    #[cfg(msim)]
     async fn build_and_run_node(
         config: StorageNodeConfig,
         cancel_token: CancellationToken,
@@ -832,7 +826,6 @@ impl StorageNodeHandleBuilder {
             rest_api_address: storage_node_config.rest_api_address,
             metrics_address: storage_node_config.metrics_address,
             cancel_token,
-            #[cfg(msim)]
             node_id: handle.id(),
             storage_node_capability: self.storage_node_capability,
         })
@@ -934,13 +927,16 @@ fn spawn_event_processor(
 }
 
 /// Returns a runtime that can be used to spawn tasks.
-fn get_runtime() -> MutexGuard<'static, Runtime> {
-    static CLUSTER: OnceLock<std::sync::Mutex<Runtime>> = OnceLock::new();
+#[cfg(not(msim))]
+fn get_runtime() -> std::sync::MutexGuard<'static, tokio::runtime::Runtime> {
+    use std::sync::OnceLock;
+
+    static CLUSTER: OnceLock<std::sync::Mutex<tokio::runtime::Runtime>> = OnceLock::new();
     CLUSTER
         .get_or_init(|| {
             std::sync::Mutex::new(
-                thread::spawn(move || {
-                    Builder::new_multi_thread()
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()
                         .expect("should be able to build runtime")
@@ -1724,6 +1720,7 @@ pub(crate) fn test_committee_with_epoch(weights: &[u16], epoch: Epoch) -> Commit
 pub mod test_cluster {
     use std::sync::OnceLock;
 
+    use futures::{stream, TryStreamExt};
     use tokio::sync::Mutex;
     use walrus_sui::{
         client::{SuiContractClient, SuiReadClient},
@@ -1828,20 +1825,34 @@ pub mod test_cluster {
         )
         .await?;
 
-        let mut contract_clients = vec![];
-        let mut node_wallet_dirs = vec![];
-        for _ in members.iter() {
-            let client = test_utils::new_wallet_on_sui_test_cluster(sui_cluster.clone())
-                .await?
-                .and_then_async(|wallet| system_ctx.new_contract_client(wallet, DEFAULT_GAS_BUDGET))
-                .await?;
-            node_wallet_dirs.push(client.temp_dir.path().to_owned());
-            contract_clients.push(client);
-        }
-        let contract_clients_refs = contract_clients
-            .iter()
-            .map(|client| &client.inner)
-            .collect::<Vec<_>>();
+        let WithTempDir {
+            inner: wallets,
+            // The on-file representation of the wallets are dropped at the end of scope.
+            temp_dir,
+        } = test_utils::create_and_fund_wallets_on_cluster(sui_cluster.clone(), members.len())
+            .await?;
+
+        let temp_dir_path = temp_dir.path().to_path_buf();
+
+        // In simtest, storage nodes load sui wallet config from the `tmp_dir`. We need to keep the
+        // directory alive throughout the test.
+        #[cfg(msim)]
+        Box::leak(Box::new(temp_dir));
+
+        let contract_clients = stream::iter(wallets)
+            .then(|wallet| {
+                SuiContractClient::new(
+                    wallet,
+                    system_ctx.system_object,
+                    system_ctx.staking_object,
+                    DEFAULT_GAS_BUDGET,
+                )
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+        let node_wallet_dirs = vec![temp_dir_path; contract_clients.len()];
+
+        let contract_clients_refs = contract_clients.iter().collect::<Vec<_>>();
 
         let amounts_to_stake = node_weights
             .iter()
@@ -1860,18 +1871,10 @@ pub mod test_cluster {
 
         end_epoch_zero(contract_clients_refs.first().unwrap()).await?;
 
-        let (node_contract_services, _wallet_dirs): (Vec<_>, Vec<_>) = contract_clients
+        let node_contract_services = contract_clients
             .into_iter()
-            .map(|client| (client.inner, client.temp_dir))
-            .map(|(client, tmp_dir)| {
-                (
-                    SuiSystemContractService::new(client),
-                    // In simtest, storage nodes load sui wallet config from the `tmp_dir`. We need
-                    // to keep the directory alive throughout the test.
-                    Box::leak(Box::new(tmp_dir)),
-                )
-            })
-            .unzip();
+            .map(SuiSystemContractService::new)
+            .collect::<Vec<_>>();
 
         // Build the walrus cluster
         let sui_read_client = SuiReadClient::new(
@@ -1895,9 +1898,8 @@ pub mod test_cluster {
             .await
             .with_system_contract_services(&node_contract_services);
 
-        let event_processor_config = EventProcessorConfig::new_with_default_pruning_interval(
-            sui_cluster.cluster().fullnode_handle.rpc_url.clone(),
-        );
+        let event_processor_config =
+            EventProcessorConfig::new_with_default_pruning_interval(sui_cluster.rpc_url().clone());
         let cluster_builder = if use_legacy_event_processor {
             setup_legacy_event_processors(
                 &event_processor_config,

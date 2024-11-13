@@ -3,10 +3,17 @@
 
 //! Utilities to publish the walrus contracts and deploy a system object for testing.
 
-use std::{collections::BTreeSet, num::NonZeroU16, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeSet,
+    num::NonZeroU16,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
-use sui_move_build::BuildConfig;
+use sui_move_build::{BuildConfig, CompiledPackage};
 use sui_sdk::{
     rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse},
     types::{
@@ -56,24 +63,44 @@ fn get_pkg_id_from_tx_response(tx_response: &SuiTransactionBlockResponse) -> Res
         .ok_or_else(|| anyhow!("no immutable object was created"))
 }
 
+fn compile_package(package_path: &Path, for_test: bool) -> Arc<CompiledPackage> {
+    if for_test && !cfg!(msim) {
+        tracing::debug!("attempting to reuse compiled move packages");
+        static COMPILED_PACKAGE: OnceLock<Arc<CompiledPackage>> = OnceLock::new();
+        COMPILED_PACKAGE
+            .get_or_init(|| {
+                tracing::debug!("must first build move packages from source");
+                BuildConfig::new_for_testing()
+                    .build(package_path)
+                    .expect("Building package failed")
+                    .into()
+            })
+            .clone()
+    } else {
+        tracing::debug!("compiling move packages from source");
+        let build_config = if cfg!(msim) {
+            BuildConfig::new_for_testing()
+        } else {
+            BuildConfig::default()
+        };
+        let compiled_package = build_config
+            .build(package_path)
+            .expect("Building package failed");
+        Arc::new(compiled_package)
+    }
+}
+
 #[instrument(err, skip(wallet, gas_budget))]
 pub(crate) async fn publish_package(
     wallet: &mut WalletContext,
     package_path: PathBuf,
     gas_budget: u64,
+    for_test: bool,
 ) -> Result<SuiTransactionBlockResponse> {
     let sender = wallet.active_address()?;
     let sui = wallet.get_client().await?;
 
-    let build_config = if cfg!(any(test, feature = "test-utils")) {
-        BuildConfig::new_for_testing()
-    } else {
-        BuildConfig::default()
-    };
-
-    let compiled_package = build_config
-        .build(&package_path)
-        .expect("Building package failed");
+    let compiled_package = compile_package(&package_path, for_test);
     let compiled_modules = compiled_package.get_package_bytes(true);
 
     let dep_ids: Vec<ObjectID> = compiled_package
@@ -112,9 +139,11 @@ pub async fn publish_coin_and_system_package(
     wallet: &mut WalletContext,
     walrus_contract_path: PathBuf,
     gas_budget: u64,
+    for_test: bool,
 ) -> Result<(ObjectID, ObjectID, ObjectID)> {
     // Publish `walrus` package with unpublished dependencies.
-    let transaction_response = publish_package(wallet, walrus_contract_path, gas_budget).await?;
+    let transaction_response =
+        publish_package(wallet, walrus_contract_path, gas_budget, for_test).await?;
 
     let walrus_pkg_id = get_pkg_id_from_tx_response(&transaction_response)?;
 
