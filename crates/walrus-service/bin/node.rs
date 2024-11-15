@@ -43,7 +43,15 @@ use walrus_service::{
         system_events::{EventManager, SuiSystemEventProvider},
         StorageNode,
     },
-    utils::{self, version, ByteCount, LoadConfig as _, MetricsAndLoggingRuntime},
+    utils::{
+        self,
+        version,
+        ByteCount,
+        EnableMetricsPush,
+        LoadConfig as _,
+        MetricPushRuntime,
+        MetricsAndLoggingRuntime,
+    },
 };
 use walrus_sui::{
     client::{ContractClient, SuiContractClient},
@@ -357,8 +365,11 @@ mod commands {
             walrus.node.public_key = %config.protocol_key_pair.load()?.as_ref().public(),
             "walrus protocol public key",
         );
+        // Load the network_key_pair so that it can be passed to the
+        // MetricPushRuntime.
+        let network_key_pair = config.network_key_pair.load()?;
         tracing::info!(
-            walrus.node.network_key = %config.network_key_pair.load()?.as_ref().public(),
+            walrus.node.network_key = %network_key_pair.as_ref().public(),
             "walrus network key",
         );
         tracing::info!(
@@ -391,6 +402,23 @@ mod commands {
             cancel_token.child_token(),
         )?;
 
+        let metrics_push_registry_clone = metrics_runtime.registry.clone();
+        let metrics_push_runtime = match config.metrics_push.take() {
+            Some(config) => {
+                let network_key_pair = network_key_pair.0.clone();
+                let mp_config = EnableMetricsPush {
+                    cancel: cancel_token.child_token(),
+                    network_key_pair,
+                    config,
+                };
+                Some(MetricPushRuntime::start(
+                    metrics_push_registry_clone,
+                    mp_config,
+                )?)
+            }
+            None => None,
+        };
+
         let node_runtime = StorageNodeRuntime::start(
             &config,
             metrics_runtime.registry.clone(),
@@ -402,6 +430,7 @@ mod commands {
         monitor_runtimes(
             node_runtime,
             event_processor_runtime,
+            metrics_push_runtime,
             exit_listener,
             cancel_token,
         )?;
@@ -413,6 +442,7 @@ mod commands {
     fn monitor_runtimes(
         mut node_runtime: StorageNodeRuntime,
         mut event_processor_runtime: EventProcessorRuntime,
+        metrics_push_runtime: Option<MetricPushRuntime>,
         exit_listener: oneshot::Receiver<()>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
@@ -422,6 +452,9 @@ mod commands {
                 let mut set = JoinSet::new();
                 set.spawn_blocking(move || node_runtime.join());
                 set.spawn_blocking(move || event_processor_runtime.join());
+                if let Some(mut metrics_push_runtime) = metrics_push_runtime {
+                    set.spawn_blocking(move || metrics_push_runtime.join());
+                }
                 tokio::select! {
                     _ = wait_until_terminated(exit_listener) => {
                         tracing::info!("Received termination signal, shutting down...");
@@ -446,6 +479,7 @@ mod commands {
     fn monitor_runtimes(
         mut node_runtime: StorageNodeRuntime,
         mut event_processor_runtime: EventProcessorRuntime,
+        metrics_push_runtime: Option<MetricPushRuntime>,
         exit_listener: oneshot::Receiver<()>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
@@ -459,6 +493,10 @@ mod commands {
         // Wait for the node runtime to complete, may take a moment as
         // the REST-API waits for open connections to close before exiting.
         node_runtime.join()?;
+        if let Some(mut metrics_push_runtime) = metrics_push_runtime {
+            // Wait for metrics to flush
+            metrics_push_runtime.join()?;
+        }
         Ok(())
     }
 
