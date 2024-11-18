@@ -198,6 +198,9 @@ pub(crate) struct StakingPool {
     pool_token_balance: u64,
     /// Pending withdrawals from the pool token balance indexed by epoch.
     pending_pool_token_withdraw: Vec<(Epoch, u64)>,
+    #[cfg(feature = "mainnet-contracts")]
+    /// Pending early withdrawals for which we cannot calculate the pool tokens.
+    pending_early_withdrawals: Vec<(Epoch, u64)>,
     /// The commission rate for the pool.
     commission_rate: u64,
     /// Exchange rates table ID.
@@ -453,16 +456,33 @@ where
 pub enum StakedWalState {
     /// The WAL is staked.
     Staked,
+    #[cfg(not(feature = "mainnet-contracts"))]
     /// The WAL is unstaked and can be withdrawn.
     Withdrawing(Epoch, u64),
+    #[cfg(feature = "mainnet-contracts")]
+    /// The WAL is unstaked and can be withdrawn.
+    Withdrawing(Epoch, Option<u64>),
 }
 
 impl Display for StakedWalState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StakedWalState::Staked => write!(f, "Staked"),
+            #[cfg(not(feature = "mainnet-contracts"))]
             StakedWalState::Withdrawing(epoch, amount) => {
                 write!(f, "Withdrawing: epoch={}, amount={}", epoch, amount)
+            }
+            #[cfg(feature = "mainnet-contracts")]
+            StakedWalState::Withdrawing(epoch, Some(amount)) => {
+                write!(
+                    f,
+                    "Withdrawing: epoch={}, pool token amount={:?}",
+                    epoch, amount
+                )
+            }
+            #[cfg(feature = "mainnet-contracts")]
+            StakedWalState::Withdrawing(epoch, None) => {
+                write!(f, "Withdrawing: epoch={}, pool token amount=Unknown", epoch)
             }
         }
     }
