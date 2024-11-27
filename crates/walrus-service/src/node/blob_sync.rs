@@ -13,10 +13,8 @@ use futures::{
     stream::{self, FuturesUnordered},
     FutureExt as _,
     StreamExt,
-    TryFutureExt,
 };
 use mysten_metrics::{GaugeGuard, GaugeGuardFutureExt};
-use sui_types::event::EventID;
 use tokio::{
     select,
     sync::{Notify, Semaphore},
@@ -39,6 +37,7 @@ use super::{
     contract_service::SystemContractService,
     metrics::{self, NodeMetricSet, STATUS_IN_PROGRESS, STATUS_QUEUED},
     storage::Storage,
+    system_events::{CompletableHandle, EventHandle},
     StorageNodeInner,
 };
 use crate::common::utils::FutureHelpers as _;
@@ -47,13 +46,6 @@ use crate::common::utils::FutureHelpers as _;
 struct Permits {
     blob: Arc<Semaphore>,
     sliver: Arc<Semaphore>,
-}
-
-#[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct EventInfo {
-    pub event_index: usize,
-    pub event_id: EventID,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +111,7 @@ impl BlobSyncHandler {
                 // Now await the handles
                 for (blob_id, handle) in handles {
                     match handle.await {
-                        Ok(Ok(_)) => {
+                        Ok(_) => {
                             // Normal completion. This should not happen.
                             // The blob sync handler should have removed the handle after the sync
                             // finished. So technically the sync handle should not be in the map.
@@ -127,14 +119,6 @@ impl BlobSyncHandler {
                                 walrus.blob_id = %blob_id,
                                 "blob sync finished with success, but still exists in \
                                 BlobSyncHandler"
-                            );
-                        }
-                        Ok(Err(error)) => {
-                            // This case is also unexpected.
-                            tracing::warn!(
-                                walrus.blob_id = %blob_id,
-                                ?error,
-                                "blob sync failed with error, but still exists in BlobSyncHandler"
                             );
                         }
                         Err(error) => {
@@ -159,15 +143,8 @@ impl BlobSyncHandler {
         })
     }
 
-    fn mark_event_completed(&self, sync_result: EventInfo) -> Result<(), TypedStoreError> {
-        self.node
-            .mark_event_completed(sync_result.event_index, &sync_result.event_id)
-    }
-
     /// Cancels any existing blob sync for the provided `blob_id` and marks the corresponding event
     /// as completed.
-    ///
-    /// Returns `true` if an event was marked as complete.
     ///
     /// To avoid interference with later events (e.g., cancelling a sync initiated by a later event
     /// or immediately restarting the sync that is cancelled here), this function should be called
@@ -190,9 +167,7 @@ impl BlobSyncHandler {
             return Ok(());
         };
 
-        if let Some(sync_result) = handle.await?? {
-            self.mark_event_completed(sync_result)?;
-        }
+        handle.await?.mark_as_complete();
 
         Ok(())
     }
@@ -226,13 +201,10 @@ impl BlobSyncHandler {
             .collect();
         let count = join_handles.len();
 
-        let join_results = try_join_all(join_handles)
+        try_join_all(join_handles)
             .await?
             .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        for sync_result in join_results.into_iter().flatten() {
-            self.mark_event_completed(sync_result)?;
-        }
+            .for_each(CompletableHandle::mark_as_complete);
 
         if count > 0 {
             tracing::info!("cancelled {count} blob syncs for now expired blobs");
@@ -255,7 +227,7 @@ impl BlobSyncHandler {
         &self,
         blob_id: BlobId,
         certified_epoch: Epoch,
-        event_info: Option<EventInfo>,
+        event_handle: Option<EventHandle>,
         start: tokio::time::Instant,
     ) -> Result<Arc<Notify>, TypedStoreError> {
         let mut in_progress = self
@@ -272,9 +244,13 @@ impl BlobSyncHandler {
                     "otel.kind" = "CONSUMER",
                     "otel.status_code" = field::Empty,
                     "otel.status_message" = field::Empty,
-                    "walrus.event.index" = event_info.map(|info| info.event_index),
-                    "walrus.event.tx_digest" = ?event_info.map(|info| info.event_id.tx_digest),
-                    "walrus.event.event_seq" = ?event_info.map(|event| event.event_id.event_seq),
+                    "walrus.event.index" = event_handle.as_ref().map(|e| e.index()),
+                    "walrus.event.tx_digest" = ?event_handle.as_ref().map(
+                        |e| e.event_id().tx_digest
+                    ),
+                    "walrus.event.event_seq" = event_handle.as_ref().map(
+                        |e| e.event_id().event_seq
+                    ),
                     "walrus.event.kind" = "certified",
                     "walrus.blob_id" = %blob_id,
                     "error.type" = field::Empty,
@@ -285,7 +261,7 @@ impl BlobSyncHandler {
                 let synchronizer = BlobSynchronizer::new(
                     blob_id,
                     certified_epoch,
-                    event_info,
+                    event_handle,
                     self.node.clone(),
                     cancel_token.clone(),
                 );
@@ -297,12 +273,6 @@ impl BlobSyncHandler {
                 let sync_handle = tokio::spawn(async move {
                     let result = blob_sync_handler_clone
                         .sync(synchronizer, start, permits_clone)
-                        .inspect_err(|err| {
-                            let span = Span::current();
-                            span.record("otel.status_code", "ERROR");
-                            span.record("otel.status_message", field::display(err));
-                            span.record("error.type", "_OTHER");
-                        })
                         .instrument(spawned_trace)
                         .await;
                     notify_clone.notify_one();
@@ -314,32 +284,25 @@ impl BlobSyncHandler {
                 });
             }
             Entry::Occupied(_) => {
-                if let Some(EventInfo {
-                    event_id,
-                    event_index,
-                }) = event_info
-                {
-                    // A blob sync with a lower sequence number is already in progress. We can
-                    // safely try to increase the event cursor since it will only be advanced once
-                    // that sync is finished or cancelled due to an invalid blob event.
-                    self.node.mark_event_completed(event_index, &event_id)?;
-                }
+                // A blob sync with a lower sequence number is already in progress. We can safely
+                // try to increase the event cursor since it will only be advanced once that sync is
+                // finished or cancelled due to an invalid blob event.
+                event_handle.mark_as_complete();
                 finish_notify.notify_one();
             }
         }
         Ok(finish_notify)
     }
 
-    #[tracing::instrument(skip_all, err)]
+    #[tracing::instrument(skip_all)]
     pub async fn sync(
         self,
         synchronizer: BlobSynchronizer,
         start: tokio::time::Instant,
         permits: Permits,
-    ) -> Result<Option<EventInfo>, anyhow::Error> {
-        let node = &synchronizer.node;
-
-        let queued_gauge = metrics::with_label!(node.metrics.recover_blob_backlog, STATUS_QUEUED);
+    ) -> Option<EventHandle> {
+        let queued_gauge =
+            metrics::with_label!(self.node.metrics.recover_blob_backlog, STATUS_QUEUED);
         let _permit = permits
             .blob
             .acquire_owned()
@@ -348,46 +311,31 @@ impl BlobSyncHandler {
             .expect("semaphore should not be dropped");
 
         let in_progress_gauge =
-            metrics::with_label!(node.metrics.recover_blob_backlog, STATUS_IN_PROGRESS);
+            metrics::with_label!(self.node.metrics.recover_blob_backlog, STATUS_IN_PROGRESS);
         let _decrement_guard = GaugeGuard::acquire(&in_progress_gauge);
+        let blob_id = synchronizer.blob_id;
 
-        let output = async {
+        let (label, event_handle) = async move {
             select! {
                 _ = synchronizer.cancel_token.cancelled() => {
                     tracing::info!("cancelled blob sync");
-                    Ok((false, synchronizer.event_info))
+                    (metrics::STATUS_CANCELLED, synchronizer.event_handle)
                 }
-                sync_result = synchronizer.run(permits.sliver) => match sync_result {
-                    Ok(()) => {
-                        if let Some(EventInfo {
-                            event_id,
-                            event_index,
-                        }) = synchronizer.event_info
-                        {
-                            node.mark_event_completed(event_index, &event_id)?;
-                        }
-                        Ok((true, None))
-                    }
-                    Err(err) => Err(err),
+                _ = synchronizer.run(permits.sliver) => {
+                    synchronizer.event_handle.mark_as_complete();
+                    (metrics::STATUS_SUCCESS, None)
                 }
-
             }
         }
-        .await
-        .inspect_err(|error| tracing::error!(?error, "blob synchronization failed"));
+        .await;
 
-        // We remove the bob handler regardless of the result.
-        self.remove_sync_handle(&synchronizer.blob_id).await;
+        // We remove the blob handler regardless of the result.
+        self.remove_sync_handle(&blob_id).await;
 
-        let label = match output {
-            Ok((true, _)) => metrics::STATUS_SUCCESS,
-            Ok((false, _)) => metrics::STATUS_CANCELLED,
-            Err(_) => metrics::STATUS_FAILURE,
-        };
-        metrics::with_label!(node.metrics.recover_blob_duration_seconds, label)
+        metrics::with_label!(self.node.metrics.recover_blob_duration_seconds, label)
             .observe(start.elapsed().as_secs_f64());
 
-        output.map(|output| output.1)
+        event_handle
     }
 
     /// Cancels all blob syncs and returns the number of cancelled syncs.
@@ -402,15 +350,13 @@ impl BlobSyncHandler {
             .collect();
         let count = join_handles.len();
 
-        try_join_all(join_handles)
-            .await?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        try_join_all(join_handles).await?.into_iter().for_each(drop);
+
         Ok(count)
     }
 }
 
-type SyncJoinHandle = JoinHandle<Result<Option<EventInfo>, anyhow::Error>>;
+type SyncJoinHandle = JoinHandle<Option<EventHandle>>;
 
 #[derive(Debug)]
 struct InProgressSyncHandle {
@@ -439,7 +385,7 @@ enum RecoverSliverError {
 pub(super) struct BlobSynchronizer {
     blob_id: BlobId,
     node: Arc<StorageNodeInner>,
-    event_info: Option<EventInfo>,
+    event_handle: Option<EventHandle>,
     certified_epoch: Epoch,
     cancel_token: CancellationToken,
 }
@@ -448,14 +394,14 @@ impl BlobSynchronizer {
     pub fn new(
         blob_id: BlobId,
         certified_epoch: Epoch,
-        event_info: Option<EventInfo>,
+        event_handle: Option<EventHandle>,
         node: Arc<StorageNodeInner>,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
             blob_id,
             node,
-            event_info,
+            event_handle,
             certified_epoch,
             cancel_token,
         }
@@ -482,13 +428,14 @@ impl BlobSynchronizer {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn run(&self, sliver_permits: Arc<Semaphore>) -> anyhow::Result<()> {
+    async fn run(&self, sliver_permits: Arc<Semaphore>) {
         let histograms = &self.metrics().recover_blob_part_duration_seconds;
 
         let (_, metadata) = self
             .recover_metadata()
             .observe(histograms.clone(), labels_from_metadata_result)
-            .await?;
+            .await
+            .expect("database operations should not fail");
         let metadata = Arc::new(metadata);
 
         let futures_iter = self.storage().shards().into_iter().flat_map(|shard| {
@@ -551,11 +498,10 @@ impl BlobSynchronizer {
                 }
             }
         }
-
-        Ok(())
     }
 
-    /// Returns the metadata and true if it was recovered, false if it was retrieved from storage.
+    /// Returns the metadata and `true` if it was recovered, `false` if it was retrieved from
+    /// storage.
     #[tracing::instrument(skip_all, err)]
     async fn recover_metadata(
         &self,
