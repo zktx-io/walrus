@@ -24,7 +24,7 @@ use start_epoch_change_finisher::StartEpochChangeFinisher;
 use sui_types::{digests::TransactionDigest, event::EventID};
 use tokio::{select, sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{field, Instrument, Span};
+use tracing::{field, Instrument as _, Span};
 use typed_store::{rocks::MetricConf, TypedStoreError};
 use walrus_core::{
     encoding::{EncodingAxis, EncodingConfig, RecoverySymbolError},
@@ -601,7 +601,7 @@ impl StorageNode {
                         && event.event_epoch() + 1 < epoch_at_start
                     {
                         tracing::warn!(
-                            "the current epoch ({}) is far ahead of the event epoch: {};
+                            "the current epoch ({}) is far ahead of the event epoch ({}); \
                             node entering recovery mode",
                             epoch_at_start,
                             event.event_epoch()
@@ -662,24 +662,21 @@ impl StorageNode {
         self.inner
             .storage
             .update_blob_info(element_index, &blob_event)?;
+        tracing::debug!(?blob_event, "{} event received", blob_event.name());
         match blob_event {
             BlobEvent::Registered(event) => {
-                tracing::debug!("BlobRegistered event received: {:?}", event);
                 self.inner
                     .mark_event_completed(element_index, &event.event_id)?;
             }
             BlobEvent::Certified(event) => {
-                tracing::debug!("BlobCertified event received: {:?}", event);
                 self.process_blob_certified_event(element_index, event)
                     .await?;
             }
             BlobEvent::Deleted(event) => {
-                tracing::debug!("BlobDeleted event received: {:?}", event);
                 self.process_blob_deleted_event(element_index, event)
                     .await?;
             }
             BlobEvent::InvalidBlobID(event) => {
-                tracing::debug!("BlobInvalid event received: {:?}", event);
                 self.process_blob_invalid_event(element_index, event)
                     .await?;
             }
@@ -693,9 +690,13 @@ impl StorageNode {
         element_index: usize,
         epoch_change_event: EpochChangeEvent,
     ) -> anyhow::Result<()> {
+        tracing::info!(
+            ?epoch_change_event,
+            "{} event received",
+            epoch_change_event.name()
+        );
         match epoch_change_event {
             EpochChangeEvent::EpochParametersSelected(event) => {
-                tracing::info!("EpochParametersSelected event received: {:?}", event);
                 self.epoch_change_driver
                     .cancel_scheduled_voting_end(event.next_epoch);
                 self.epoch_change_driver.schedule_initiate_epoch_change(
@@ -705,27 +706,19 @@ impl StorageNode {
                     .mark_event_completed(element_index, &event.event_id)?;
             }
             EpochChangeEvent::EpochChangeStart(event) => {
-                tracing::info!(
-                    "EpochChangeStart event received: {:?}. Index: {:?}",
-                    event,
-                    element_index
-                );
                 self.process_epoch_change_start_event(element_index, &event)
                     .await?;
             }
             EpochChangeEvent::EpochChangeDone(event) => {
-                tracing::info!("EpochChangeDone event received: {:?}", event);
                 self.process_epoch_change_done_event(&event).await?;
                 self.inner
                     .mark_event_completed(element_index, &event.event_id)?;
             }
             EpochChangeEvent::ShardsReceived(event) => {
-                tracing::info!("ShardsReceived event received: {:?}", event);
                 self.inner
                     .mark_event_completed(element_index, &event.event_id)?;
             }
             EpochChangeEvent::ShardRecoveryStart(event) => {
-                tracing::info!("ShardRecoveryStart event received: {:?}", event);
                 self.inner
                     .mark_event_completed(element_index, &event.event_id)?;
             }
@@ -808,7 +801,10 @@ impl StorageNode {
                 // self.inner.storage.delete_blob(&event.blob_id, true)?;
             }
         } else {
-            tracing::warn!(%blob_id, "handling `BlobDeleted` event for untracked blob");
+            tracing::warn!(
+                walrus.blob_id = %blob_id,
+                "handling `BlobDeleted` event for an untracked blob"
+            );
         }
 
         self.inner
@@ -863,7 +859,8 @@ impl StorageNode {
                 tracing::info!(
                     event_epoch = %event.epoch,
                     committee_epoch = %self.inner.current_epoch(),
-                    "epoch change start event reaches new epoch that is still lagging" );
+                    "epoch change start event reaches new epoch that is still lagging"
+                );
             }
 
             if need_to_mark_event_complete {
@@ -958,7 +955,7 @@ impl StorageNode {
             .await
         {
             Ok(()) => {
-                tracing::debug!(
+                tracing::info!(
                     walrus.epoch = epoch,
                     "successfully started a transition to a new epoch"
                 );
@@ -966,7 +963,7 @@ impl StorageNode {
                 Ok(true)
             }
             Err(BeginCommitteeChangeError::EpochIsTheSameAsCurrent) => {
-                tracing::debug!(
+                tracing::info!(
                     walrus.epoch = epoch,
                     "epoch change event was for the epoch we are currently in, not skipping"
                 );
@@ -978,7 +975,7 @@ impl StorageNode {
                 // more recent committee or has already had the current committee marked as
                 // transitioning, our shards have also already been configured for the more
                 // recent committee and there is actual nothing to do.
-                tracing::debug!(
+                tracing::info!(
                     walrus.epoch = epoch,
                     "skipping epoch change start event for an older epoch"
                 );
@@ -1008,10 +1005,10 @@ impl StorageNode {
 
         for shard_id in &shard_diff.lost {
             let Some(shard_storage) = storage.shard_storage(*shard_id) else {
-                tracing::debug!("skipping lost shard during epoch change as it is not stored");
+                tracing::info!("skipping lost shard during epoch change as it is not stored");
                 continue;
             };
-            tracing::debug!(walrus.shard_index = %shard_id, "locking shard for epoch change");
+            tracing::info!(walrus.shard_index = %shard_id, "locking shard for epoch change");
             shard_storage
                 .lock_shard_for_epoch_change()
                 .context("failed to lock shard")?;
@@ -1063,14 +1060,14 @@ impl StorageNode {
             .committee_service
             .end_committee_change(event.epoch)
         {
-            Ok(()) => tracing::debug!(
+            Ok(()) => tracing::info!(
                 walrus.epoch = event.epoch,
                 "successfully ended the transition to the new epoch"
             ),
             // This likely means that the committee was fetched (for example on startup) and we
             // are not processing the event that would have notified us that the epoch was
             // changing.
-            Err(EndCommitteeChangeError::EpochChangeAlreadyDone) => tracing::debug!(
+            Err(EndCommitteeChangeError::EpochChangeAlreadyDone) => tracing::info!(
                 walrus.epoch = event.epoch,
                 "the committee had already transitioned to the new epoch"
             ),
@@ -1086,7 +1083,7 @@ impl StorageNode {
             Err(error @ EndCommitteeChangeError::ProvidedEpochIsInTheFuture { .. }) => {
                 tracing::error!(
                     ?error,
-                    "our committee service is lagging behind the events being processed which \
+                    "our committee service is lagging behind the events being processed, which \
                     should not happen"
                 );
                 return Err(error.into());
@@ -1665,7 +1662,7 @@ impl ServiceState for StorageNodeInner {
         let sync_shard_msg = signed_request.verify_signature_and_get_message(&public_key)?;
         let request = sync_shard_msg.as_ref().contents();
 
-        tracing::debug!("Sync shard request received: {:?}", request);
+        tracing::debug!(?request, "sync shard request received");
 
         // If the epoch of the requester should not be older than the current epoch of the node.
         // In a normal scenario, a storage node will never fetch shards from a future epoch.
