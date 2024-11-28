@@ -41,31 +41,20 @@ jobs:
     outputs:
       isRust: ${{ steps.diff.outputs.isRust }}
       isMove: ${{ steps.diff.outputs.isMove }}
-      relevantForE2eTests: ${{ steps.diff.outputs.relevantForE2eTests }}
+      isDenyConfig: ${{ steps.diff.outputs.isDenyConfig }}
+      isTestConfig: ${{ steps.diff.outputs.isTestConfig }}
+      isRelevantForRustTests: ${{ steps.diff.outputs.isRust == 'true' || steps.diff.outputs.isMove == 'true' || steps.diff.outputs.isTestConfig
+        == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # Pin v4.1.1
       - name: Detect Changes
-        uses: dorny/paths-filter@v3.0.2
+        uses: './.github/actions/diffs'
         id: diff
-        with:
-          filters: |
-            isMove:
-              - 'contracts/**'
-              - 'scripts/move_coverage.sh'
-              - '.github/workflows/code.yml'
-            isRust:
-              - 'crates/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - 'deny.toml'
-              - '.github/workflows/code.yml'
-              - '.config/nextest.toml'
 
   dependencies:
     name: Check dependencies
     needs: diff
-    if: ${{ needs.diff.outputs.isRust == 'true' }}
+    if: ${{ needs.diff.outputs.isRust == 'true' || needs.diff.outputs.isDenyConfig == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,11 +79,11 @@ jobs:
           cargo fmt --all -- --check
           --config group_imports=StdExternalCrate,imports_granularity=Crate,imports_layout=HorizontalVertical
       - name: Lint using clippy (w/o tests)
-        run: cargo clippy --all-features --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-features --no-deps -- -D warnings
       - name: Lint using clippy (w/ tests)
-        run: cargo clippy --all-features --tests --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-features --tests --no-deps -- -D warnings
       - name: Check documentation
-        run: cargo doc --no-deps --workspace
+        run: cargo doc --workspace --no-deps
 
   build:
     name: Build Rust code
@@ -107,12 +96,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
       - name: Build Rust code
-        run: cargo build --verbose
+        run: cargo build --workspace --verbose
 
   test-mainnet:
     name: Test Rust code with mainnet contracts
     needs: diff
-    if: ${{ needs.diff.outputs.isRust == 'true' || needs.diff.outputs.isMove == 'true' }}
+    if: ${{ needs.diff.outputs.isRelevantForRustTests == 'true' }}
     runs-on: ubuntu-ghcloud
     steps:
       - uses: taiki-e/install-action@v2.44.58
@@ -124,12 +113,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
           shared-key: v0-rust-test
       - name: Run tests
-        run: cargo nextest run --profile ci --run-ignored all --features mainnet-contracts
+        run: cargo nextest run --workspace --profile ci --run-ignored all --features mainnet-contracts
 
   test:
     name: Test Rust code with testnet contracts
     needs: diff
-    if: ${{ needs.diff.outputs.isRust == 'true' || needs.diff.outputs.isMove == 'true' }}
+    if: ${{ needs.diff.outputs.isRelevantForRustTests == 'true' }}
     runs-on: ubuntu-ghcloud
     steps:
       - uses: taiki-e/install-action@v2.44.58
@@ -141,7 +130,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
           shared-key: v0-rust-test
       - name: Run tests with testnet contracts
-        run: cargo nextest run --profile ci --run-ignored all
+        run: cargo nextest run --workspace --profile ci --run-ignored all
 
   test-coverage:
     name: Run all Rust tests and report coverage
@@ -164,7 +153,7 @@ jobs:
   simtests:
     name: Run all simtests with testnet contracts
     needs: diff
-    if: ${{ needs.diff.outputs.isRust == 'true' || needs.diff.outputs.isMove == 'true' }}
+    if: ${{ needs.diff.outputs.isRelevantForRustTests == 'true' }}
     runs-on: ubuntu-ghcloud
     continue-on-error: true
     env:
