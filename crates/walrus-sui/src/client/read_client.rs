@@ -60,8 +60,11 @@ const EVENT_MODULE: &str = "events";
 const MULTI_GET_OBJ_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CoinType {
+/// The type of coin.
+pub enum CoinType {
+    /// The WAL coin type.
     Wal,
+    /// The SUI coin type.
     Sui,
 }
 
@@ -311,12 +314,42 @@ impl SuiReadClient {
         self.system_pkg_id
     }
 
+    /// Returns the system object ID.
+    pub fn get_system_object_id(&self) -> ObjectID {
+        self.system_object_id
+    }
+
+    /// Returns the staking object ID.
+    pub fn get_staking_object_id(&self) -> ObjectID {
+        self.staking_object_id
+    }
+
+    /// Returns the balance of the owner for the given coin type.
+    pub(crate) async fn balance(
+        &self,
+        owner_address: SuiAddress,
+        coin_type: CoinType,
+    ) -> SuiClientResult<u64> {
+        let coin_type_option = match coin_type {
+            CoinType::Wal => Some(self.wal_coin_type()),
+            CoinType::Sui => None,
+        };
+        Ok(self
+            .sui_client
+            .coin_read_api()
+            .get_balance(owner_address, coin_type_option)
+            .await?
+            .total_balance
+            .try_into()
+            .expect("balances should fit into a u64"))
+    }
+
     /// Returns a vector of coins of provided `coin_type` whose total balance is at least `balance`.
     ///
     /// Returns a [`SuiClientError::NoCompatibleGasCoins`] or
     /// [`SuiClientError::NoCompatibleWalCoins`] error if no coins of sufficient total balance are
     /// found.
-    pub(crate) async fn get_coins_with_total_balance(
+    pub async fn get_coins_with_total_balance(
         &self,
         owner_address: SuiAddress,
         coin_type: CoinType,
@@ -324,7 +357,7 @@ impl SuiReadClient {
         exclude: Vec<ObjectID>,
     ) -> SuiClientResult<Vec<Coin>> {
         let coin_type_option = match coin_type {
-            CoinType::Wal => Some(self.coin_type()),
+            CoinType::Wal => Some(self.wal_coin_type()),
             CoinType::Sui => None,
         };
         self.sui_client
@@ -366,7 +399,8 @@ impl SuiReadClient {
         ))
     }
 
-    pub(crate) fn coin_type(&self) -> String {
+    /// Returns the type of the WAL coin.
+    pub fn wal_coin_type(&self) -> String {
         format!("{}::wal::WAL", self.system_pkg_id)
     }
 
