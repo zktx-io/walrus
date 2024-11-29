@@ -5,28 +5,32 @@
 set -euo pipefail
 
 trap ctrl_c INT
+
+function kill_tmux_sessions() {
+    { tmux ls || true; } | { grep -o "dryrun-node-\d*" || true; } | xargs -n1 tmux kill-session -t
+}
+
 function ctrl_c() {
-    tmux kill-server
+    kill_tmux_sessions
     exit 0
 }
 
-(tmux kill-server || true) 2>/dev/null
-
-nets=("devnet", "testnet", "localnet")
+kill_tmux_sessions
 
 function usage() {
     echo "Usage: $0 [OPTIONS]"
     echo "OPTIONS:"
     echo "  -c <committee_size>   Number of storage nodes (default: 4)"
     echo "  -s <n_shards>         Number of shards (default: 10)"
-    echo "  -n <network>          Network (${nets[@]}; default: devnet) to generate configs for"
+    echo "  -n <network>          Sui network to generate configs for (default: devnet)"
     echo "  -d <duration>         Set the length of the epoch (in human readable format, e.g., '60s', default: 1h)"
+    echo "  -t                    Use testnet contracts"
     echo "  -e                    Use existing config"
     echo "  -h                    Print this usage message"
 }
 
 function run_node() {
-    cmd="./target/debug/walrus-node run --config-path $working_dir/$1.yaml ${2:-} \
+    cmd="./target/release/walrus-node run --config-path $working_dir/$1.yaml ${2:-} \
         |& tee $working_dir/$1.log"
     echo $cmd
     tmux new -d -s "$1" "$cmd"
@@ -38,8 +42,9 @@ committee_size=4 # Default value of 4 if no argument is provided
 shards=10 # Default value of 4 if no argument is provided
 network=devnet
 epoch_duration=1h
+testnet_contracts=false
 
-while getopts "n:c:s:d:eh" arg; do
+while getopts "n:c:s:d:the" arg; do
     case "${arg}" in
         n)
             network=${OPTARG}
@@ -52,6 +57,9 @@ while getopts "n:c:s:d:eh" arg; do
             ;;
         d)
             epoch_duration=${OPTARG}
+            ;;
+        t)
+            testnet_contracts=true
             ;;
         e)
             existing=true
@@ -78,15 +86,16 @@ if ! [ "$shards" -ge "$committee_size" ] 2>/dev/null; then
     exit 1
 fi
 
-if ! [[ ${nets[@]} =~ $network ]]; then
-    echo "Invalid argument: $network is not a valid network (${nets[@]})."
-    usage
-    exit 1
+
+echo Building walrus, walrus-node, and walrus-deploy binaries...
+features="deploy"
+if $testnet_contracts; then
+    echo "Using testnet contracts."
+else
+    echo "Using mainnet contracts."
+    features="$features,mainnet-contracts"
 fi
-
-
-echo Building walrus-node and walrus-deploy binaries...
-cargo build --bin walrus-node --bin walrus-deploy
+cargo build --release --bin walrus --bin walrus --bin walrus-node --bin walrus-deploy --features "$features"
 
 # Set working directory
 working_dir="./working_dir"
@@ -107,14 +116,18 @@ if ! $existing; then
 
     # Deploy system contract
     echo Deploying system contract...
-    cargo run --bin walrus-deploy -- deploy-system-contract \
-    --working-dir $working_dir --sui-network $network --n-shards $shards --host-addresses $ips \
-    --storage-price 5 --write-price 1 --epoch-duration $epoch_duration
+    ./target/release/walrus-deploy deploy-system-contract \
+      --working-dir $working_dir \
+      --sui-network $network \
+      --n-shards $shards \
+      --host-addresses $ips \
+      --storage-price 5 \
+      --write-price 1 \
+      --epoch-duration $epoch_duration
 
     # Generate configs
     echo Generating configuration...
-    cargo run --bin walrus-deploy -- generate-dry-run-configs \
-    --working-dir $working_dir --use-legacy-event-provider
+    ./target/release/walrus-deploy generate-dry-run-configs --working-dir $working_dir
 fi
 
 i=0
