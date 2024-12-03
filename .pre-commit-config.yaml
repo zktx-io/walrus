@@ -86,3 +86,9 @@ repos:
         language: system
         files: "contracts/.*"
         pass_filenames: false
+      - id: move-format
+        name: move-format
+        entry: prettier-move -w contracts/*/sources/**/*.move
+        language: node
+        files: "contracts/.*"
+        additional_dependencies: ["prettier@3.4.1", "@mysten/prettier-plugin-move@0.2.1"]
