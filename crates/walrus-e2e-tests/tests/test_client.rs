@@ -3,6 +3,7 @@
 
 use std::{num::NonZeroU16, time::Duration};
 
+use sui_simulator::sui_types::base_types::{SuiAddress, SUI_ADDRESS_LENGTH};
 use tokio_stream::StreamExt;
 use walrus_core::{
     encoding::Primary,
@@ -27,11 +28,12 @@ use walrus_service::{
             NotEnoughSlivers,
         },
         StoreWhen,
+        WalrusWriteClient,
     },
     test_utils::{test_cluster, StorageNodeHandle},
 };
 use walrus_sui::{
-    client::{BlobPersistence, ReadClient},
+    client::{BlobPersistence, ExpirySelectionPolicy, PostStoreAction, ReadClient},
     types::{BlobEvent, ContractEvent},
 };
 use walrus_test_utils::{async_param_test, Result as TestResult};
@@ -122,7 +124,13 @@ async fn run_store_and_read_with_crash_failures(
         ..
     } = client
         .as_ref()
-        .reserve_and_store_blob(&blob, 1, StoreWhen::Always, BlobPersistence::Permanent)
+        .reserve_and_store_blob(
+            &blob,
+            1,
+            StoreWhen::Always,
+            BlobPersistence::Permanent,
+            PostStoreAction::Keep,
+        )
         .await?
     else {
         panic!("expect newly stored blob")
@@ -204,7 +212,7 @@ async fn test_inconsistency(failed_shards: &[usize]) -> TestResult {
     client
         .as_mut()
         .sui_client()
-        .certify_blob(blob_sui_object, &certificate)
+        .certify_blob(blob_sui_object, &certificate, PostStoreAction::Keep)
         .await?;
 
     // Wait to receive an inconsistent blob event.
@@ -299,6 +307,7 @@ async fn test_store_with_existing_blob_resource(
             epochs_ahead_required,
             StoreWhen::NotStored,
             BlobPersistence::Permanent,
+            PostStoreAction::Keep,
         )
         .await?;
 
@@ -368,6 +377,7 @@ async fn test_store_with_existing_storage_resource(
             epochs_ahead_required,
             StoreWhen::NotStored,
             BlobPersistence::Permanent,
+            PostStoreAction::Keep,
         )
         .await?;
 
@@ -401,19 +411,35 @@ async fn test_delete_blob(blobs_to_create: u32) -> TestResult {
     for idx in 1..blobs_to_create + 1 {
         client
             .as_ref()
-            .reserve_and_store_blob(&blob, idx, StoreWhen::Always, BlobPersistence::Deletable)
+            .reserve_and_store_blob(
+                &blob,
+                idx,
+                StoreWhen::Always,
+                BlobPersistence::Deletable,
+                PostStoreAction::Keep,
+            )
             .await?;
     }
 
     // Add a blob that is not deletable.
     let result = client
         .as_ref()
-        .reserve_and_store_blob(&blob, 1, StoreWhen::Always, BlobPersistence::Permanent)
+        .reserve_and_store_blob(
+            &blob,
+            1,
+            StoreWhen::Always,
+            BlobPersistence::Permanent,
+            PostStoreAction::Keep,
+        )
         .await?;
     let blob_id = result.blob_id();
 
     // Check that we have the correct number of blobs
-    let blobs = client.as_ref().sui_client().owned_blobs(false).await?;
+    let blobs = client
+        .as_ref()
+        .sui_client()
+        .owned_blobs(None, ExpirySelectionPolicy::Valid)
+        .await?;
     assert_eq!(blobs.len(), blobs_to_create as usize + 1);
 
     // Delete the blobs
@@ -421,7 +447,11 @@ async fn test_delete_blob(blobs_to_create: u32) -> TestResult {
     assert_eq!(deleted, blobs_to_create as usize);
 
     // Only one blob should remain: The non-deletable one.
-    let blobs = client.as_ref().sui_client().owned_blobs(false).await?;
+    let blobs = client
+        .as_ref()
+        .sui_client()
+        .owned_blobs(None, ExpirySelectionPolicy::Valid)
+        .await?;
     assert_eq!(blobs.len(), 1);
 
     // TODO(mlegner): Check correct handling on nodes.
@@ -438,7 +468,13 @@ async fn test_storage_nodes_delete_data_for_deleted_blobs() -> TestResult {
     let blob = walrus_test_utils::random_data(314);
 
     let store_result = client
-        .reserve_and_store_blob(&blob, 1, StoreWhen::Always, BlobPersistence::Deletable)
+        .reserve_and_store_blob(
+            &blob,
+            1,
+            StoreWhen::Always,
+            BlobPersistence::Deletable,
+            PostStoreAction::Keep,
+        )
         .await?;
     let blob_id = store_result.blob_id();
     assert!(matches!(store_result, BlobStoreResult::NewlyCreated { .. }));
@@ -497,7 +533,13 @@ async fn test_multiple_stores_same_blob() -> TestResult {
 
     for (epochs, store_when, persistence, is_already_certified) in configurations {
         let result = client
-            .reserve_and_store_blob(&blob, epochs, store_when, persistence)
+            .reserve_and_store_blob(
+                &blob,
+                epochs,
+                store_when,
+                persistence,
+                PostStoreAction::Keep,
+            )
             .await?;
 
         match result {
@@ -513,7 +555,10 @@ async fn test_multiple_stores_same_blob() -> TestResult {
 
     // At the end of all the operations above, count the number of blob objects owned by the
     // client.
-    let blobs = client.sui_client().owned_blobs(false).await?;
+    let blobs = client
+        .sui_client()
+        .owned_blobs(None, ExpirySelectionPolicy::Valid)
+        .await?;
     assert_eq!(blobs.len(), 9);
 
     Ok(())
@@ -576,6 +621,112 @@ async fn test_repeated_shard_move() -> TestResult {
         walrus_cluster.nodes[1].storage_node.existing_shards().len(),
         0
     );
+
+    Ok(())
+}
+
+#[ignore = "ignore E2E tests by default"]
+#[walrus_simtest]
+async fn test_burn_blobs() -> TestResult {
+    const N_BLOBS: usize = 3;
+    const N_TO_DELETE: usize = 2;
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (_sui_cluster_handle, _cluster, client) = test_cluster::default_setup().await?;
+
+    let mut blob_object_ids = vec![];
+    for idx in 0..N_BLOBS {
+        let blob = walrus_test_utils::random_data(314 + idx);
+        let result = client
+            .as_ref()
+            .reserve_and_store_blob(
+                &blob,
+                1,
+                StoreWhen::Always,
+                BlobPersistence::Permanent,
+                PostStoreAction::Keep,
+            )
+            .await?;
+        blob_object_ids.push({
+            let BlobStoreResult::NewlyCreated { blob_object, .. } = result else {
+                panic!("expect newly stored blob")
+            };
+            blob_object.id
+        });
+    }
+
+    let blobs = client
+        .as_ref()
+        .sui_client()
+        .owned_blobs(None, ExpirySelectionPolicy::Valid)
+        .await?;
+    assert_eq!(blobs.len(), N_BLOBS);
+
+    client
+        .as_ref()
+        .sui_client()
+        .burn_blobs(&blob_object_ids[..N_TO_DELETE])
+        .await?;
+
+    let blobs = client
+        .as_ref()
+        .sui_client()
+        .owned_blobs(None, ExpirySelectionPolicy::Valid)
+        .await?;
+    assert_eq!(blobs.len(), N_BLOBS - N_TO_DELETE);
+
+    Ok(())
+}
+
+const TARGET_ADDRESS: [u8; SUI_ADDRESS_LENGTH] = [42; SUI_ADDRESS_LENGTH];
+async_param_test! {
+    #[ignore = "ignore E2E tests by default"]
+    #[walrus_simtest]
+    test_post_store_action -> TestResult : [
+        keep: (PostStoreAction::Keep, 1, 0),
+        transfer: (
+            PostStoreAction::TransferTo(
+                SuiAddress::from_bytes(TARGET_ADDRESS).expect("valid address")
+            ),
+            0,
+            1
+        ),
+        burn: (PostStoreAction::Burn, 0, 0),
+    ]
+}
+async fn test_post_store_action(
+    post_store: PostStoreAction,
+    n_owned_blobs: usize,
+    n_target_blobs: usize,
+) -> TestResult {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (_sui_cluster_handle, _cluster, client) = test_cluster::default_setup().await?;
+    let target_address: SuiAddress = SuiAddress::from_bytes(TARGET_ADDRESS).expect("valid address");
+
+    let blob = walrus_test_utils::random_data(314);
+    client
+        .as_ref()
+        .write_blob(
+            &blob,
+            1,
+            StoreWhen::Always,
+            BlobPersistence::Permanent,
+            post_store,
+        )
+        .await?;
+
+    let owned_blobs = client
+        .as_ref()
+        .sui_client()
+        .owned_blobs(None, ExpirySelectionPolicy::Valid)
+        .await?;
+    assert_eq!(owned_blobs.len(), n_owned_blobs);
+    let target_address_blobs = client
+        .as_ref()
+        .sui_client()
+        .owned_blobs(Some(target_address), ExpirySelectionPolicy::Valid)
+        .await?;
+    assert_eq!(target_address_blobs.len(), n_target_blobs);
 
     Ok(())
 }

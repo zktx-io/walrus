@@ -34,7 +34,13 @@ use walrus_core::{
 };
 use walrus_sdk::{api::BlobStatus, error::NodeError};
 use walrus_sui::{
-    client::{BlobPersistence, ReadClient, SuiContractClient},
+    client::{
+        BlobPersistence,
+        ExpirySelectionPolicy,
+        PostStoreAction,
+        ReadClient,
+        SuiContractClient,
+    },
     types::{Blob, BlobEvent, StakedWal},
 };
 
@@ -63,7 +69,7 @@ pub use config::{
 };
 
 mod daemon;
-pub use daemon::ClientDaemon;
+pub use daemon::{ClientDaemon, WalrusWriteClient};
 
 mod error;
 pub use error::{ClientError, ClientErrorKind};
@@ -328,6 +334,7 @@ impl Client<SuiContractClient> {
         epochs_ahead: EpochCount,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> ClientResult<BlobStoreResult> {
         let (pairs, metadata) = self.encode_pairs_and_metadata(blob).await?;
 
@@ -338,6 +345,7 @@ impl Client<SuiContractClient> {
                 epochs_ahead,
                 store_when,
                 persistence,
+                post_store,
             )
         })
         .await
@@ -353,6 +361,7 @@ impl Client<SuiContractClient> {
         epochs_ahead: EpochCount,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> ClientResult<BlobStoreResult> {
         let (pairs, metadata) = self.encode_pairs_and_metadata(blob).await?;
 
@@ -362,6 +371,7 @@ impl Client<SuiContractClient> {
             epochs_ahead,
             store_when,
             persistence,
+            post_store,
         )
         .await
     }
@@ -403,6 +413,7 @@ impl Client<SuiContractClient> {
         epochs_ahead: EpochCount,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> ClientResult<BlobStoreResult> {
         let blob_id = *metadata.blob_id();
         self.check_blob_id(&blob_id)?;
@@ -476,7 +487,7 @@ impl Client<SuiContractClient> {
 
         let sui_cert_timer = Instant::now();
         self.sui_client
-            .certify_blob(blob_object.clone(), &certificate)
+            .certify_blob(blob_object.clone(), &certificate, post_store)
             .await
             .map_err(|e| ClientError::from(ClientErrorKind::CertificationFailed(e)))?;
         tracing::info!(
@@ -508,9 +519,10 @@ impl Client<SuiContractClient> {
         &self,
         blob_id: &'a BlobId,
     ) -> ClientResult<impl Iterator<Item = Blob> + 'a> {
-        Ok(self
+        let owned_blobs = self
             .sui_client
-            .owned_blobs(false)
+            .owned_blobs(None, ExpirySelectionPolicy::Valid);
+        Ok(owned_blobs
             .await?
             .into_iter()
             .filter(|blob| blob.blob_id == *blob_id && blob.deletable))

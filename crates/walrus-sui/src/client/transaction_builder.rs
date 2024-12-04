@@ -47,6 +47,11 @@ const CLOCK_OBJECT_ARG: ObjectArg = ObjectArg::SharedObject {
     mutable: false,
 };
 
+/// The maximum number of blobs that can be burned in a single PTB.
+/// This number is chosen just below the maximum number of commands in a PTB (1024).
+// NB: this should be kept in sync with the maximum number of commands in the Sui `ProtocolConfig`.
+pub const MAX_BURNS_PER_PTB: usize = 1000;
+
 #[derive(Debug, Clone, Copy)]
 /// A wrapper around an [`Argument`] or an [`ObjectID`] for use in [`WalrusPtbBuilder`].
 pub enum ArgumentOrOwnedObject {
@@ -284,6 +289,14 @@ impl WalrusPtbBuilder {
         self.mark_arg_as_consumed(&blob_arg);
         self.add_result_to_be_consumed(result_arg);
         Ok(result_arg)
+    }
+
+    /// Adds a call to `burn` the blob to the `pt_builder`.
+    pub async fn burn_blob(&mut self, blob_object: ArgumentOrOwnedObject) -> SuiClientResult<()> {
+        let blob_arg = self.argument_from_arg_or_obj(blob_object).await?;
+        self.move_call(contracts::blob::burn, vec![blob_arg])?;
+        self.mark_arg_as_consumed(&blob_arg);
+        Ok(())
     }
 
     /// Adds a transfer to the PTB. If the recipient is `None`, the sender address is used.

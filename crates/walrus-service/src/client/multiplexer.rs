@@ -19,7 +19,7 @@ use sui_sdk::{
 };
 use walrus_core::{BlobId, EpochCount};
 use walrus_sui::{
-    client::{BlobPersistence, SuiContractClient, SuiReadClient},
+    client::{BlobPersistence, PostStoreAction, SuiContractClient, SuiReadClient},
     utils::create_wallet,
 };
 
@@ -39,6 +39,7 @@ pub struct ClientMultiplexer {
     client_pool: WriteClientPool,
     read_client: Client<SuiReadClient>,
     _refill_handles: RefillHandles,
+    default_post_store_action: PostStoreAction,
 }
 
 impl ClientMultiplexer {
@@ -51,6 +52,7 @@ impl ClientMultiplexer {
     ) -> anyhow::Result<Self> {
         let sui_env = wallet.config.get_active_env()?.clone();
         let contract_client = config.new_contract_client(wallet, gas_budget).await?;
+        let main_address = contract_client.address();
 
         let sui_client = contract_client.sui_client().clone();
         let sui_read_client = contract_client.read_client.clone();
@@ -82,10 +84,21 @@ impl ClientMultiplexer {
             sui_client,
         );
 
+        // If the user has specified `keep == true`, the default post store action is to transfer
+        // the created objects to the main wallet after storing. Otherwise, they are burnt.
+        let default_post_store_action = if args.keep {
+            PostStoreAction::TransferTo(main_address)
+        } else {
+            PostStoreAction::Burn
+        };
+
+        tracing::info!(?default_post_store_action, "client multiplexer initialized");
+
         Ok(Self {
             client_pool,
             read_client,
             _refill_handles: refill_handles,
+            default_post_store_action,
         })
     }
 
@@ -97,12 +110,13 @@ impl ClientMultiplexer {
         epochs_ahead: EpochCount,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> ClientResult<BlobStoreResult> {
         let client = self.client_pool.next_client().await;
         tracing::debug!("submitting write request to client in pool");
 
         let result = client
-            .reserve_and_store_blob_retry_epoch(blob, epochs_ahead, store_when, persistence)
+            .write_blob(blob, epochs_ahead, store_when, persistence, post_store)
             .await?;
 
         Ok(result)
@@ -126,13 +140,18 @@ impl WalrusWriteClient for ClientMultiplexer {
         epochs_ahead: EpochCount,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> ClientResult<BlobStoreResult> {
-        self.submit_write(blob, epochs_ahead, store_when, persistence)
+        self.submit_write(blob, epochs_ahead, store_when, persistence, post_store)
             .await
+    }
+
+    fn default_post_store_action(&self) -> PostStoreAction {
+        self.default_post_store_action
     }
 }
 
-/// A pool of temporary write clients that are rotaated.
+/// A pool of temporary write clients that are rotated.
 pub struct WriteClientPool {
     pool: Vec<Arc<Client<SuiContractClient>>>,
     cur_idx: AtomicUsize,

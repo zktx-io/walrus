@@ -26,7 +26,7 @@ use sui_types::{
 };
 use tokio::sync::Mutex;
 use tokio_stream::Stream;
-use transaction_builder::WalrusPtbBuilder;
+use transaction_builder::{WalrusPtbBuilder, MAX_BURNS_PER_PTB};
 use walrus_core::{
     ensure,
     merkle::Node as MerkleNode,
@@ -160,6 +160,37 @@ pub enum BlobPersistence {
     Deletable,
 }
 
+/// Represents the selection of blob and storage objects in relation to their expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpirySelectionPolicy {
+    /// Select all the objects.
+    All,
+    /// Select only expired objects.
+    Expired,
+    /// Select only valid (non-expired) objects.
+    Valid,
+}
+
+impl ExpirySelectionPolicy {
+    /// Returns the policy for a give `include_expired` flag.
+    pub fn from_include_expired_flag(include_expired: bool) -> Self {
+        if include_expired {
+            Self::All
+        } else {
+            Self::Valid
+        }
+    }
+
+    /// Return `true` if the expiry epoch matches the policy for the current epoch.
+    pub fn matches(&self, expiry_epoch: Epoch, current_epoch: Epoch) -> bool {
+        match self {
+            Self::All => true,
+            Self::Expired => expiry_epoch <= current_epoch,
+            Self::Valid => expiry_epoch > current_epoch,
+        }
+    }
+}
+
 impl BlobPersistence {
     /// Returns `true` if the blob is deletable.
     pub fn is_deletable(&self) -> bool {
@@ -177,6 +208,17 @@ impl BlobPersistence {
             Self::Permanent
         }
     }
+}
+
+/// The action to be performed for newly-created blobs.
+#[derive(Debug, Clone, Copy)]
+pub enum PostStoreAction {
+    /// Burn the blob object.
+    Burn,
+    /// Transfer the blob object to the given address.
+    TransferTo(SuiAddress),
+    /// Keep the blob object in the wallet that created it.
+    Keep,
 }
 
 /// Result alias for functions returning a `SuiClientError`.
@@ -372,12 +414,26 @@ impl SuiContractClient {
         &self,
         blob: Blob,
         certificate: &ConfirmationCertificate,
+        post_store: PostStoreAction,
     ) -> SuiClientResult<()> {
         // Lock the wallet here to ensure there are no race conditions with object references.
         let wallet = self.wallet().await;
 
         let mut pt_builder = WalrusPtbBuilder::new(self.read_client.clone(), self.wallet_address);
         pt_builder.certify_blob(blob.id.into(), certificate).await?;
+
+        match post_store {
+            PostStoreAction::TransferTo(address) => {
+                pt_builder
+                    .transfer(Some(address), vec![blob.id.into()])
+                    .await?;
+            }
+            PostStoreAction::Burn => {
+                pt_builder.burn_blob(blob.id.into()).await?;
+            }
+            PostStoreAction::Keep => (),
+        }
+
         let (ptb, _sui_cost) = pt_builder.finish().await?;
         let res = self.sign_and_send_ptb(&wallet, ptb, None).await?;
         if res.errors.is_empty() {
@@ -584,27 +640,33 @@ impl SuiContractClient {
     }
 
     /// Returns the list of [`Blob`] objects owned by the wallet currently in use.
-    pub async fn owned_blobs(&self, include_expired: bool) -> SuiClientResult<Vec<Blob>> {
+    ///
+    /// If `owner` is `None`, the current wallet address is used.
+    pub async fn owned_blobs(
+        &self,
+        owner: Option<SuiAddress>,
+        selection_policy: ExpirySelectionPolicy,
+    ) -> SuiClientResult<Vec<Blob>> {
         let current_epoch = self.read_client.current_committee().await?.epoch;
         Ok(self
             .read_client
-            .get_owned_objects::<Blob>(self.wallet_address, &[])
+            .get_owned_objects::<Blob>(owner.unwrap_or(self.wallet_address), &[])
             .await?
-            .filter(|blob| include_expired || blob.storage.end_epoch > current_epoch)
+            .filter(|blob| selection_policy.matches(blob.storage.end_epoch, current_epoch))
             .collect())
     }
 
     /// Returns the list of [`StorageResource`] objects owned by the wallet currently in use.
     pub async fn owned_storage(
         &self,
-        include_expired: bool,
+        selection_policy: ExpirySelectionPolicy,
     ) -> SuiClientResult<Vec<StorageResource>> {
         let current_epoch = self.read_client.current_committee().await?.epoch;
         Ok(self
             .read_client
             .get_owned_objects::<StorageResource>(self.wallet_address, &[])
             .await?
-            .filter(|storage| include_expired || storage.end_epoch > current_epoch)
+            .filter(|storage| selection_policy.matches(storage.end_epoch, current_epoch))
             .collect())
     }
 
@@ -622,7 +684,7 @@ impl SuiContractClient {
         end_epoch: Epoch,
     ) -> SuiClientResult<Option<StorageResource>> {
         Ok(self
-            .owned_storage(false)
+            .owned_storage(ExpirySelectionPolicy::Valid)
             .await?
             .into_iter()
             .filter(|storage| {
@@ -734,7 +796,7 @@ impl SuiContractClient {
     }
 
     /// Sends the `amount` gas to the provided `address`.
-    pub async fn send_sui(&self, amount: u64, address: SuiAddress) -> Result<()> {
+    pub async fn send_sui(&self, amount: u64, address: SuiAddress) -> SuiClientResult<()> {
         let mut pt_builder = ProgrammableTransactionBuilder::new();
 
         // Lock the wallet here to ensure there are no race conditions with object references.
@@ -747,7 +809,7 @@ impl SuiContractClient {
     }
 
     /// Sends the `amount` WAL to the provided `address`.
-    pub async fn send_wal(&self, amount: u64, address: SuiAddress) -> Result<()> {
+    pub async fn send_wal(&self, amount: u64, address: SuiAddress) -> SuiClientResult<()> {
         tracing::debug!(%address, "sending WAL to address");
         let mut pt_builder = self.transaction_builder();
 
@@ -756,6 +818,27 @@ impl SuiContractClient {
         pt_builder.pay_wal(address, amount).await?;
         let (ptb, _) = pt_builder.finish().await?;
         self.sign_and_send_ptb(&wallet, ptb, None).await?;
+        Ok(())
+    }
+
+    /// Burns the blob objects with the given object IDs.
+    ///
+    /// May use multiple PTBs in sequence to burn all the given object IDs.
+    pub async fn burn_blobs(&self, blob_object_ids: &[ObjectID]) -> SuiClientResult<()> {
+        tracing::debug!(n_blobs = blob_object_ids.len(), "burning blobs");
+
+        // Lock the wallet here to ensure there are no race conditions with object references.
+        let wallet = self.wallet().await;
+
+        for id_block in blob_object_ids.chunks(MAX_BURNS_PER_PTB) {
+            let mut pt_builder = self.transaction_builder();
+            for id in id_block {
+                pt_builder.burn_blob(id.into()).await?;
+            }
+            let (ptb, _) = pt_builder.finish().await?;
+            self.sign_and_send_ptb(&wallet, ptb, None).await?;
+        }
+
         Ok(())
     }
 }

@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use itertools::Itertools as _;
 use prometheus::Registry;
 use rand::seq::SliceRandom;
 use sui_config::{sui_config_dir, SUI_CLIENT_CONFIG};
@@ -23,11 +24,12 @@ use walrus_core::{
     EpochCount,
 };
 use walrus_sui::{
-    client::{BlobPersistence, ReadClient},
+    client::{BlobPersistence, ExpirySelectionPolicy, PostStoreAction, ReadClient},
     utils::{price_for_encoded_length, SuiNetwork},
 };
 
 use super::args::{
+    BurnSelection,
     CliCommands,
     DaemonArgs,
     DaemonCommands,
@@ -207,6 +209,11 @@ impl ClientCommandRunner {
                 exchange_id,
                 amount,
             } => self.exchange_sui_for_wal(exchange_id, amount).await,
+
+            CliCommands::BurnBlobs {
+                burn_selection,
+                yes,
+            } => self.burn_blobs(burn_selection, yes.into()).await,
         }
     }
 
@@ -345,6 +352,7 @@ impl ClientCommandRunner {
                     epochs,
                     store_when,
                     persistence,
+                    PostStoreAction::Keep,
                 )
                 .await?;
             result.print_output(self.json)
@@ -432,7 +440,12 @@ impl ClientCommandRunner {
         let contract_client = config
             .new_contract_client(self.wallet?, self.gas_budget)
             .await?;
-        let blobs = contract_client.owned_blobs(include_expired).await?;
+        let blobs = contract_client
+            .owned_blobs(
+                None,
+                ExpirySelectionPolicy::from_include_expired_flag(include_expired),
+            )
+            .await?;
         blobs.print_output(self.json)
     }
 
@@ -551,7 +564,7 @@ impl ClientCommandRunner {
             } else if let Some(object_id) = object_id {
                 if let Some(to_delete) = client
                     .sui_client()
-                    .owned_blobs(false)
+                    .owned_blobs(None, ExpirySelectionPolicy::Valid)
                     .await?
                     .into_iter()
                     .find(|blob| blob.id == object_id)
@@ -629,6 +642,41 @@ impl ClientCommandRunner {
         );
         client.exchange_sui_for_wal(exchange_id, amount).await?;
         ExchangeOutput { amount_sui: amount }.print_output(self.json)
+    }
+
+    pub(crate) async fn burn_blobs(
+        self,
+        burn_selection: BurnSelection,
+        confirmation: UserConfirmation,
+    ) -> Result<()> {
+        let sui_client = self
+            .config?
+            .new_contract_client(self.wallet?, self.gas_budget)
+            .await?;
+        let object_ids = burn_selection.get_object_ids(&sui_client).await?;
+
+        if confirmation.is_required() {
+            let object_list = object_ids.iter().map(|id| id.to_string()).join("\n");
+            println!(
+                "{} You are about to burn the following blob object(s):\n{}\n({} total). \
+                \nIf unsure, please enter `No` and check the `--help` manual.",
+                warning(),
+                object_list,
+                object_ids.len()
+            );
+            if !ask_for_confirmation()? {
+                println!("{} Aborting. No blobs were burned.", success());
+                return Ok(());
+            }
+        }
+
+        let spinner = styled_spinner();
+        spinner.set_message("burning blobs...");
+        sui_client.burn_blobs(&object_ids).await?;
+        spinner.finish_with_message("done");
+
+        println!("{} The specified blob objects have been burned", success());
+        Ok(())
     }
 }
 

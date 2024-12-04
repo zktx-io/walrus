@@ -28,7 +28,7 @@ use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_redoc::{Redoc, Servable};
 use walrus_core::{encoding::Primary, BlobId, EpochCount};
-use walrus_sui::client::{BlobPersistence, ReadClient, SuiContractClient};
+use walrus_sui::client::{BlobPersistence, PostStoreAction, ReadClient, SuiContractClient};
 
 use super::{responses::BlobStoreResult, Client, ClientResult, StoreWhen};
 use crate::common::telemetry::{metrics_middleware, register_http_metrics, MakeHttpSpan};
@@ -44,14 +44,20 @@ pub trait WalrusReadClient {
     fn set_metric_registry(&mut self, registry: &Registry);
 }
 
+/// Trait representing a client that can write blobs to Walrus.
 pub trait WalrusWriteClient: WalrusReadClient {
+    /// Writes a blob to Walrus.
     fn write_blob(
         &self,
         blob: &[u8],
         epochs_ahead: EpochCount,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> impl std::future::Future<Output = ClientResult<BlobStoreResult>> + Send;
+
+    /// Returns the default [`PostStoreAction`] for this client.
+    fn default_post_store_action(&self) -> PostStoreAction;
 }
 
 impl<T: ReadClient> WalrusReadClient for Client<T> {
@@ -71,9 +77,23 @@ impl WalrusWriteClient for Client<SuiContractClient> {
         epochs_ahead: EpochCount,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> ClientResult<BlobStoreResult> {
-        self.reserve_and_store_blob_retry_epoch(blob, epochs_ahead, store_when, persistence)
-            .await
+        let result = self
+            .reserve_and_store_blob_retry_epoch(
+                blob,
+                epochs_ahead,
+                store_when,
+                persistence,
+                post_store,
+            )
+            .await?;
+
+        Ok(result)
+    }
+
+    fn default_post_store_action(&self) -> PostStoreAction {
+        PostStoreAction::Keep
     }
 }
 
