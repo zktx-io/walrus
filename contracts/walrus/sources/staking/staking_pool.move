@@ -605,8 +605,12 @@ public(package) fun is_empty(pool: &StakingPool): bool {
     let pending_stake = pool.pending_stake.unwrap();
     let non_empty = pending_stake.keys().count!(|epoch| pending_stake[epoch] != 0);
 
+    pool.rewards_pool.value() == 0 &&
     pool.pool_token_balance == 0 &&
     pool.commission.value() == 0 &&
     pool.wal_balance == 0 &&
     non_empty == 0
 }
+
+#[test_only]
+public(package) fun pool_token_balance(pool: &StakingPool): u64 { pool.pool_token_balance }
