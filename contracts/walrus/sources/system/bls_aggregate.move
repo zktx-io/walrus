@@ -4,7 +4,7 @@
 module walrus::bls_aggregate;
 
 use sui::{
-    bls12381::{Self, bls12381_min_pk_verify, G1},
+    bls12381::{Self, bls12381_min_pk_verify, G1, UncompressedG1},
     group_ops::{Self, Element},
     vec_map::{Self, VecMap}
 };
@@ -12,13 +12,13 @@ use walrus::messages::{Self, CertifiedMessage};
 
 // Error codes
 // Error types in `walrus-sui/types/move_errors.rs` are auto-generated from the Move error codes.
-const ETotalMemberOrder: u64 = 0;
+const EInvalidBitmap: u64 = 0;
 const ESigVerification: u64 = 1;
 const ENotEnoughStake: u64 = 2;
 const EIncorrectCommittee: u64 = 3;
 
 public struct BlsCommitteeMember has copy, drop, store {
-    public_key: Element<G1>,
+    public_key: Element<UncompressedG1>,
     weight: u16,
     node_id: ID,
 }
@@ -31,6 +31,8 @@ public struct BlsCommittee has copy, drop, store {
     n_shards: u16,
     /// The epoch in which the committee is active.
     epoch: u32,
+    /// The aggregation of public keys for all members of the committee
+    total_aggregated_key: Element<G1>,
 }
 
 /// Constructor for committee.
@@ -51,12 +53,19 @@ public(package) fun new_bls_committee(
     //       the staking, and don't require Option<BlsCommittee> there.
     // assert!(n_shards != 0, EIncorrectCommittee);
 
-    BlsCommittee { members, n_shards, epoch }
+    // Compute the total aggregated key, e.g. the sum of all public keys in the committee.
+    let total_aggregated_key = bls12381::uncompressed_g1_to_g1(
+        &bls12381::uncompressed_g1_sum(
+            &members.map!(|member| member.public_key),
+        ),
+    );
+
+    BlsCommittee { members, n_shards, epoch, total_aggregated_key }
 }
 
 /// Constructor for committee member.
 public(package) fun new_bls_committee_member(
-    public_key: Element<G1>,
+    public_key: Element<UncompressedG1>,
     weight: u16,
     node_id: ID,
 ): BlsCommitteeMember {
@@ -126,12 +135,12 @@ public(package) fun to_vec_map(self: &BlsCommittee): VecMap<ID, u16> {
 public(package) fun verify_quorum_in_epoch(
     self: &BlsCommittee,
     signature: vector<u8>,
-    signers: vector<u16>,
+    signers_bitmap: vector<u8>,
     message: vector<u8>,
 ): CertifiedMessage {
     let stake_support = self.verify_certificate(
         &signature,
-        &signers,
+        &signers_bitmap,
         &message,
     );
 
@@ -144,44 +153,60 @@ public(package) fun verify_quorum(self: &BlsCommittee, weight: u16): bool {
 }
 
 /// Verify an aggregate BLS signature is a certificate in the epoch, and return
-/// the type of
-/// certificate and the bytes certified. The `signers` vector is an increasing
-/// list of indexes
-/// into the `members` vector of the committee. If there is a certificate, the
-/// function
-/// returns the total stake. Otherwise, it aborts.
+/// the type of certificate and the bytes certified.
+/// The `signers_bitmap` is a bitmap of the indices of the signers in the committee.
+/// If there is a certificate, the function returns the total stake.
+/// Otherwise, it aborts.
 public(package) fun verify_certificate(
     self: &BlsCommittee,
     signature: &vector<u8>,
-    signers: &vector<u16>,
+    signers_bitmap: &vector<u8>,
     message: &vector<u8>,
 ): u16 {
     // Use the signers flags to construct the key and the weights.
 
-    // Lower bound for the next `member_index` to ensure they are monotonically
-    // increasing
-    let mut min_next_member_index = 0;
-    let mut aggregate_key = bls12381::g1_identity();
-    let mut aggregate_weight = 0;
+    let mut non_signer_aggregate_weight = 0;
+    let mut non_signer_public_keys: vector<Element<UncompressedG1>> = vector::empty();
+    let mut offset: u64 = 0;
 
-    signers.do_ref!(|member_index| {
-        let member_index = *member_index as u64;
-        assert!(member_index >= min_next_member_index, ETotalMemberOrder);
-        min_next_member_index = member_index + 1;
+    // The signers bitmap must be exactly long enough to hold all members.
+    let excess_bits = signers_bitmap.length() * 8 - self.members.length();
+    assert!(excess_bits >= 0 && excess_bits < 8, EInvalidBitmap);
 
-        // Bounds check happens here
-        let member = &self.members[member_index];
-        let key = &member.public_key;
-        let weight = member.weight;
+    signers_bitmap.do_ref!(|byte| {
+        (8u8).do!(|i| {
+            let index = offset + (i as u64);
+            let is_signer = (*byte >> i) & 1 == 1;
 
-        aggregate_key = bls12381::g1_add(&aggregate_key, key);
-        aggregate_weight = aggregate_weight + weight;
+            // If the index is out of bounds, the bit must be 0 to ensure
+            // uniqueness of the signers_bitmap.
+            if (index >= self.members.length()) {
+                assert!(!is_signer, EInvalidBitmap);
+                return
+            };
+
+            // There will be fewer non-signers than signers, so we handle
+            // non-signers here.
+            if (!is_signer) {
+                let member = self.members[index];
+                non_signer_aggregate_weight = non_signer_aggregate_weight + member.weight;
+                non_signer_public_keys.push_back(member.public_key);
+            };
+        });
+        offset = offset + 8;
     });
 
-    // The expression below is the solution to the inequality:
-    // n_shards = 3 f + 1
-    // stake >= 2f + 1
+    let aggregate_weight = self.n_shards - non_signer_aggregate_weight;
     assert!(self.verify_quorum(aggregate_weight), ENotEnoughStake);
+
+    // Compute the aggregate public key as the difference between the total
+    // aggregated key and the sum of the non-signer public keys.
+    let aggregate_key = bls12381::g1_sub(
+        &self.total_aggregated_key,
+        &bls12381::uncompressed_g1_to_g1(
+            &bls12381::uncompressed_g1_sum(&non_signer_public_keys),
+        ),
+    );
 
     // Verify the signature
     let pub_key_bytes = group_ops::bytes(&aggregate_key);

@@ -425,6 +425,10 @@ pub(crate) struct BlsCommittee {
     n_shards: u16,
     /// The current epoch
     epoch: Epoch,
+    #[cfg(feature = "mainnet-contracts")]
+    /// Aggregated key for all committee members
+    #[serde(deserialize_with = "deserialize_public_key")]
+    aggregated_keys: PublicKey,
 }
 
 /// Sui type for system object

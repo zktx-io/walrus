@@ -265,8 +265,16 @@ impl WalrusPtbBuilder {
         blob_object: ArgumentOrOwnedObject,
         certificate: &ConfirmationCertificate,
     ) -> SuiClientResult<()> {
-        let mut signers = certificate.signers.clone();
-        signers.sort_unstable();
+        #[cfg(not(feature = "mainnet-contracts"))]
+        let signers = {
+            let mut signers = certificate.signers.clone();
+            signers.sort_unstable();
+            signers
+        };
+
+        #[cfg(feature = "mainnet-contracts")]
+        let signers = Self::signers_to_bitmap(&certificate.signers);
+
         let certify_args = vec![
             self.system_arg(Mutability::Immutable).await?,
             self.argument_from_arg_or_obj(blob_object).await?,
@@ -276,6 +284,17 @@ impl WalrusPtbBuilder {
         ];
         self.move_call(contracts::system::certify_blob, certify_args)?;
         Ok(())
+    }
+
+    #[cfg(feature = "mainnet-contracts")]
+    fn signers_to_bitmap(signers: &[u16]) -> Vec<u8> {
+        let mut bitmap = vec![0; signers.len().div_ceil(8)];
+        for signer in signers {
+            let byte_index = signer / 8;
+            let bit_index = signer % 8;
+            bitmap[byte_index as usize] |= 1 << bit_index;
+        }
+        bitmap
     }
 
     /// Adds a call to `delete_blob` to the `pt_builder` and returns the result [`Argument`].
@@ -385,8 +404,16 @@ impl WalrusPtbBuilder {
         &mut self,
         certificate: &InvalidBlobCertificate,
     ) -> SuiClientResult<()> {
-        let mut signers = certificate.signers.clone();
-        signers.sort_unstable();
+        #[cfg(not(feature = "mainnet-contracts"))]
+        let signers = {
+            let mut signers = certificate.signers.clone();
+            signers.sort_unstable();
+            signers
+        };
+
+        #[cfg(feature = "mainnet-contracts")]
+        let signers = Self::signers_to_bitmap(&certificate.signers);
+
         let invalidate_args = vec![
             self.system_arg(Mutability::Immutable).await?,
             self.pt_builder.pure(certificate.signature.as_bytes())?,
