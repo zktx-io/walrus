@@ -29,6 +29,8 @@ public(package) fun new(wal_amount: u64, pool_token_amount: u64): PoolExchangeRa
     }
 }
 
+/// Assumptions:
+/// - token_amount is at most the amount of pool tokens in the pool
 public(package) fun get_wal_amount(exchange_rate: &PoolExchangeRate, token_amount: u64): u64 {
     // When either amount is 0, that means we have no stakes with this pool.
     // The other amount might be non-zero when there's dust left in the pool.
@@ -42,6 +44,8 @@ public(package) fun get_wal_amount(exchange_rate: &PoolExchangeRate, token_amoun
     res as u64
 }
 
+/// Assumptions:
+/// - wal_amount is at most the amount of WAL in the pool
 public(package) fun get_token_amount(exchange_rate: &PoolExchangeRate, wal_amount: u64): u64 {
     // When either amount is 0, that means we have no stakes with this pool.
     // The other amount might be non-zero when there's dust left in the pool.

@@ -308,7 +308,7 @@ public(package) fun withdraw_stake(
 
     assert!(staked_wal.is_withdrawing(), ENotWithdrawing);
     assert!(staked_wal.withdraw_epoch() <= wctx.epoch(), EWithdrawEpochNotReached);
-    assert!(staked_wal.activation_epoch() <= wctx.epoch(), EActivationEpochNotReached);
+    assert!(activation_epoch <= wctx.epoch(), EActivationEpochNotReached);
 
     // token amount is either set in the `StakedWal` or, in case of the early
     // withdrawal, is calculated from the principal amount and the exchange rate
@@ -351,7 +351,9 @@ public(package) fun advance_epoch(
     assert!(current_epoch > pool.latest_epoch, EPoolAlreadyUpdated);
     assert!(rewards.value() == 0 || pool.wal_balance > 0, EIncorrectEpochAdvance);
 
-    // update the commission_rate if there's a pending value for the current epoch
+    // update the commission_rate if there's a pending value for the current epoch.
+    // note that pending commission rates are set 2 epochs ahead, so users are
+    // aware of the rate change in advance.
     pool.pending_commission_rate.inner().try_get(&current_epoch).do!(|commission_rate| {
         pool.commission_rate = commission_rate as u16;
         pool.pending_commission_rate.flush(current_epoch);
@@ -360,6 +362,7 @@ public(package) fun advance_epoch(
     // split the commission from the rewards
     let total_rewards = rewards.value();
     let commission = rewards.split(total_rewards * (pool.commission_rate as u64) / 100_00);
+    pool.commission.join(commission);
 
     // add rewards to the pool and update the `wal_balance`
     let rewards_amount = rewards.value();
@@ -370,7 +373,6 @@ public(package) fun advance_epoch(
 
     // perform stake deduction / addition for the current epoch - wctx.epoch()
     pool.process_pending_stake(wctx);
-    pool.commission.join(commission);
 }
 
 /// Process the pending stake and withdrawal requests for the pool. Called in the
@@ -510,6 +512,8 @@ public(package) fun destroy_empty(pool: StakingPool) {
 /// Returns the exchange rate for the given current or future epoch. If there
 /// isn't a value for the specified epoch, it will look for the most recent
 /// value down to the pool activation epoch.
+/// Note that exchange rates are only set for epochs in which the node is in
+/// the committee, and otherwise the rate remains static.
 public(package) fun exchange_rate_at_epoch(pool: &StakingPool, mut epoch: u32): PoolExchangeRate {
     let activation_epoch = pool.activation_epoch;
     while (epoch >= activation_epoch) {

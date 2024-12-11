@@ -125,6 +125,7 @@ public(package) fun set_network_public_key(
     self: &mut StorageNodeInfo,
     network_public_key: vector<u8>,
 ) {
+    assert!(network_public_key.length() == 33, EInvalidNetworkPublicKey);
     self.network_public_key = network_public_key;
 }
 

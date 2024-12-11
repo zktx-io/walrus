@@ -82,6 +82,7 @@ public fun register_candidate(
         ctx,
     );
 
+    // Switch the commission receiver from the sender (default) to the cap.
     let cap = storage_node::new_cap(node_id, ctx);
     let receiver = commission::receiver_object(object::id(&cap));
     staking_mut.set_commission_receiver(node_id, commission::auth_as_sender(ctx), receiver);

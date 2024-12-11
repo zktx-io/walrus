@@ -8,6 +8,10 @@ module walrus::committee;
 
 use sui::vec_map::{Self, VecMap};
 
+// Error codes
+// Error types in `walrus-sui/types/move_errors.rs` are auto-generated from the Move error codes.
+const EInvalidShardAssignment: u64 = 0;
+
 /// Represents the current committee in the system. Each node in the committee
 /// has assigned shard IDs.
 public struct Committee(VecMap<ID, vector<u16>>) has copy, drop, store;
@@ -18,6 +22,9 @@ public(package) fun empty(): Committee { Committee(vec_map::empty()) }
 
 /// Initializes the committee with the given `assigned_number` of shards per
 /// node. Shards are assigned sequentially to each node.
+///
+/// Assumptions:
+/// - The values of assigned_number are <= 1000 (i.e., the limit of a vector)
 public(package) fun initialize(assigned_number: VecMap<ID, u16>): Committee {
     let mut shard_idx: u16 = 0;
     let (keys, values) = assigned_number.into_keys_values();
@@ -36,16 +43,23 @@ public(package) fun initialize(assigned_number: VecMap<ID, u16>): Committee {
 /// Transitions the current committee to the new committee with the given shard
 /// assignments. The function tries to minimize the number of changes by keeping
 /// as many shards in place as possible.
-///
-/// This assumes that the number of shards in the new committee is equal to the
-/// number of shards in the current committee. Check for this is not performed.
 public(package) fun transition(cmt: &Committee, mut new_assignments: VecMap<ID, u16>): Committee {
+    // Store the total number of shards in the new committee, before
+    // new_assignments is modified.
+    let mut new_num_of_shards = 0;
+    new_assignments.size().do!(|idx| {
+        let (_, shards) = new_assignments.get_entry_by_idx(idx);
+        new_num_of_shards = new_num_of_shards + *shards;
+    });
+
     let mut new_cmt = vec_map::empty();
     let mut to_move = vector[];
     let size = cmt.0.size();
 
+    let mut current_num_of_shards = 0;
     size.do!(|idx| {
         let (node_id, prev_shards) = cmt.0.get_entry_by_idx(idx);
+        current_num_of_shards = current_num_of_shards + prev_shards.length();
         let node_id = *node_id;
         let assigned_len = new_assignments.get_idx_opt(&node_id).map!(|idx| {
             let (_, value) = new_assignments.remove_entry_by_idx(idx);
@@ -77,22 +91,15 @@ public(package) fun transition(cmt: &Committee, mut new_assignments: VecMap<ID, 
             new_cmt.insert(node_id, node_shards);
         };
 
-        // if the node is in the new committee, and we already freed enough
-        // shards from other nodes, perform the reassignment. Alternatively,
-        // mark the node as needing more shards, so when we free up enough
-        // shards, we can assign them to this node
+        // Mark the node as needing more shards.
         if (curr_len < assigned_len) {
-            let diff = assigned_len - curr_len;
-            if (to_move.length() >= diff) {
-                let mut node_shards = *prev_shards;
-                diff.do!(|_| node_shards.push_back(to_move.pop_back()));
-                new_cmt.insert(node_id, node_shards);
-            } else {
-                // insert it back, we didn't have enough shards to assign
-                new_assignments.insert(node_id, assigned_len as u16);
-            };
+            new_assignments.insert(node_id, assigned_len as u16);
         };
     });
+
+    // Check that the number of shards in the new committee is equal to
+    // the number of shards in the current committee.
+    assert!((new_num_of_shards as u64) == current_num_of_shards, EInvalidShardAssignment);
 
     // Now the `new_assignments` only contains nodes for which we didn't have
     // enough shards to assign, and the nodes that were not part of the old
