@@ -6,7 +6,7 @@ module walrus::bls_tests;
 
 use sui::bls12381::{Self, g1_to_uncompressed_g1};
 use walrus::{
-    bls_aggregate::{Self, BlsCommittee, new_bls_committee, verify_certificate},
+    bls_aggregate::{Self, BlsCommittee, new_bls_committee},
     messages,
     test_utils::{
         bls_aggregate_sigs,
