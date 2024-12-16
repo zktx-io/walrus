@@ -34,6 +34,7 @@ use walrus_sui::{
     client::{SuiClientError, SuiContractClient, SuiReadClient},
     types::{move_structs::VotingParams, NetworkAddress, NodeRegistrationParams},
 };
+use walrus_utils::backoff::ExponentialBackoffConfig;
 
 use super::storage::DatabaseConfig;
 use crate::{
@@ -365,6 +366,9 @@ pub struct SuiConfig {
     /// Location of the wallet config.
     #[serde(deserialize_with = "utils::resolve_home_dir")]
     pub wallet_config: PathBuf,
+    /// The configuration for the backoff strategy used for retries.
+    #[serde(default)]
+    pub backoff_config: ExponentialBackoffConfig,
     /// Gas budget for transactions.
     #[serde(default = "defaults::gas_budget")]
     pub gas_budget: u64,
@@ -378,6 +382,7 @@ impl SuiConfig {
             self.system_object,
             self.staking_object,
             self.walrus_package,
+            self.backoff_config.clone(),
         )
         .await
     }
@@ -389,6 +394,7 @@ impl SuiConfig {
             self.system_object,
             self.staking_object,
             self.walrus_package,
+            self.backoff_config.clone(),
             self.gas_budget,
         )
         .await

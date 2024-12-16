@@ -59,6 +59,7 @@ use walrus_sui::{
     },
 };
 use walrus_test_utils::WithTempDir;
+use walrus_utils::backoff::ExponentialBackoffConfig;
 
 #[cfg(msim)]
 use crate::node::config::{self, SuiConfig};
@@ -806,6 +807,7 @@ impl StorageNodeHandleBuilder {
                 walrus_package: Some(system_context.package_id),
                 wallet_config: self.node_wallet_dir.unwrap().join("wallet_config.yaml"),
                 event_polling_interval: config::defaults::polling_interval(),
+                backoff_config: ExponentialBackoffConfig::default(),
                 gas_budget: config::defaults::gas_budget(),
             }),
             ..storage_node_config().inner
@@ -1733,7 +1735,7 @@ pub mod test_cluster {
     use futures::future;
     use tokio::sync::Mutex;
     use walrus_sui::{
-        client::{SuiContractClient, SuiReadClient},
+        client::{retry_client::RetriableSuiClient, SuiContractClient, SuiReadClient},
         test_utils::{
             self,
             system_setup::{
@@ -1842,7 +1844,13 @@ pub mod test_cluster {
         for _ in members.iter() {
             let client = test_utils::new_wallet_on_sui_test_cluster(sui_cluster.clone())
                 .await?
-                .and_then_async(|wallet| system_ctx.new_contract_client(wallet, DEFAULT_GAS_BUDGET))
+                .and_then_async(|wallet| {
+                    system_ctx.new_contract_client(
+                        wallet,
+                        ExponentialBackoffConfig::default(),
+                        DEFAULT_GAS_BUDGET,
+                    )
+                })
                 .await?;
             node_wallet_dirs.push(client.temp_dir.path().to_owned());
             contract_clients.push(client);
@@ -1871,7 +1879,11 @@ pub mod test_cluster {
 
         // Build the walrus cluster
         let sui_read_client = SuiReadClient::new(
-            wallet.as_ref().get_client().await?,
+            RetriableSuiClient::new_from_wallet(
+                wallet.as_ref(),
+                ExponentialBackoffConfig::default(),
+            )
+            .await?,
             system_ctx.system_object,
             system_ctx.staking_object,
             Some(system_ctx.package_id),

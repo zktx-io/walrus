@@ -337,6 +337,7 @@ mod commands {
     use walrus_core::ensure;
     use walrus_service::utils;
     use walrus_sui::{client::ReadClient as _, types::NetworkAddress};
+    use walrus_utils::backoff::ExponentialBackoffConfig;
 
     use super::*;
 
@@ -652,6 +653,7 @@ mod commands {
                 walrus_package,
                 wallet_config,
                 event_polling_interval: config::defaults::polling_interval(),
+                backoff_config: ExponentialBackoffConfig::default(),
                 gas_budget,
             }),
             voting_params: VotingParams {
