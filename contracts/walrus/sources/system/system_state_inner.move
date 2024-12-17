@@ -445,6 +445,32 @@ public(package) fun certify_event_blob(
     blob.burn();
 }
 
+/// Adds rewards to the system for the specified number of epochs ahead.
+/// The rewards are split equally across the future accounting ring buffer up to the
+/// specified epoch.
+public(package) fun add_subsidy(
+    self: &mut SystemStateInnerV1,
+    subsidy: Coin<WAL>,
+    epochs_ahead: u32,
+) {
+    // Check the period is within the allowed range.
+    assert!(epochs_ahead > 0, EInvalidEpochsAhead);
+    assert!(epochs_ahead <= self.future_accounting.max_epochs_ahead(), EInvalidEpochsAhead);
+
+    let mut subsidy_balance = subsidy.into_balance();
+    let reward_per_epoch = subsidy_balance.value() / (epochs_ahead as u64);
+    let leftover_rewards = subsidy_balance.value() % (epochs_ahead as u64);
+
+    epochs_ahead.do!(|i| {
+        let accounts = self.future_accounting.ring_lookup_mut(i);
+        let rewards_balance = accounts.rewards_balance();
+        rewards_balance.join(subsidy_balance.split(reward_per_epoch));
+    });
+
+    // Add leftover rewards to the first epoch's accounting.
+    self.future_accounting.ring_lookup_mut(0).rewards_balance().join(subsidy_balance);
+}
+
 // === Accessors ===
 
 /// Get epoch. Uses the committee to get the epoch.
@@ -532,4 +558,11 @@ public(package) fun get_event_blob_certification_state(
     system: &SystemStateInnerV1,
 ): &EventBlobCertificationState {
     &system.event_blob_certification_state
+}
+
+#[test_only]
+public(package) fun get_future_accounting(
+    self: &mut SystemStateInnerV1,
+): &mut FutureAccountingRingBuffer {
+    &mut self.future_accounting
 }
