@@ -600,6 +600,7 @@ impl ShardStorage {
 
                 next_blob_info = self.batch_fetched_slivers_and_check_missing_blobs(
                     epoch,
+                    &node,
                     &fetched_slivers,
                     sliver_type,
                     next_blob_info,
@@ -655,9 +656,11 @@ impl ShardStorage {
     /// Helper function to add fetched slivers to the db batch and check for missing blobs.
     /// Advance `blob_info_iter`` to the next blob that is greater than the last fetched blob id,
     /// which is the next expected blob to fetch, and return the next expected blob.
+    #[allow(clippy::too_many_arguments)]
     fn batch_fetched_slivers_and_check_missing_blobs(
         &self,
         epoch: Epoch,
+        node: &Arc<StorageNodeInner>,
         fetched_slivers: &[(BlobId, Sliver)],
         sliver_type: SliverType,
         mut next_blob_info: Option<(BlobId, BlobInfo)>,
@@ -674,6 +677,12 @@ impl ShardStorage {
             //TODO(#705): verify sliver validity.
             //  - blob is certified
             //  - metadata is correct
+
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                debug_assert!(node.storage.has_metadata(blob_id)?);
+            }
+
             match sliver {
                 Sliver::Primary(primary) => {
                     assert_eq!(sliver_type, SliverType::Primary);
@@ -904,17 +913,15 @@ impl ShardStorage {
             "start recovering missing blob"
         );
 
-        let Some(metadata) = node.storage.get_metadata(&blob_id)? else {
+        let metadata = if let Some(metadata) = node.storage.get_metadata(&blob_id)? {
+            metadata
+        } else {
             if !node.is_blob_certified(&blob_id)? {
                 self.skip_recover_blob(blob_id, sliver_type, &node)?;
                 return Ok(());
             }
-            tracing::warn!(
-                "blob {} is missing in the metadata table. For certified blob, Blob sync task should
-                recover the metadata. Skip recovering it for now.",
-                blob_id
-            );
-            return Ok(());
+            // We need to recover the blob. So check if we also need to recover the metadata.
+            node.get_or_recover_blob_metadata(&blob_id, epoch).await?
         };
 
         let sliver_id = self

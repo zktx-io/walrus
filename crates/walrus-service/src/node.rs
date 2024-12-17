@@ -45,7 +45,7 @@ use walrus_core::{
         StorageConfirmation,
         SyncShardResponse,
     },
-    metadata::{UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
+    metadata::{BlobMetadataWithId, UnverifiedBlobMetadataWithId, VerifiedBlobMetadataWithId},
     BlobId,
     Epoch,
     InconsistencyProof,
@@ -614,7 +614,6 @@ impl StorageNode {
                     maybe_epoch_at_start = None;
 
                     // Checks if the node is severely lagging behind.
-                    // This applies to node both in `Active` or `RecoveryInProgress` status.
                     if node_status != NodeStatus::RecoveryCatchUp
                         && event.event_epoch() + 1 < epoch_at_start
                     {
@@ -835,6 +834,8 @@ impl StorageNode {
         event_handle: EventHandle,
         event: &EpochChangeStart,
     ) -> anyhow::Result<()> {
+        // TODO(WAL-479): need to check if the node is lagging or not.
+
         // Irrespective of whether we are in this epoch, we can cancel any scheduled calls to change
         // to or end voting for the epoch identified by the event, as we're already in that epoch.
         self.epoch_change_driver
@@ -843,28 +844,75 @@ impl StorageNode {
             .cancel_scheduled_epoch_change_initiation(event.epoch);
 
         if self.inner.storage.node_status()? == NodeStatus::RecoveryCatchUp {
-            self.inner
-                .committee_service
-                .begin_committee_change_to_latest_committee()
-                .await?;
-            if event.epoch == self.inner.current_epoch() {
-                tracing::info!(
-                    epoch = %event.epoch,
-                    "processing event reaches the latest epoch, start recover entire node"
-                );
-                self.start_node_recovery(event_handle, event).await?;
-            } else {
-                tracing::info!(
-                    event_epoch = %event.epoch,
-                    committee_epoch = %self.inner.current_epoch(),
-                    "epoch change start event reaches new epoch that is still lagging"
-                );
-                event_handle.mark_as_complete();
-            }
+            self.node_catch_up_process_epoch_change_start(event_handle, event)
+                .await
+        } else {
+            self.node_in_sync_process_epoch_change_start(event_handle, event)
+                .await
+        }
+    }
 
+    /// The node is in RecoveryCatchUp mode and processing the epoch change start event.
+    async fn node_catch_up_process_epoch_change_start(
+        &self,
+        event_handle: EventHandle,
+        event: &EpochChangeStart,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .committee_service
+            .begin_committee_change_to_latest_committee()
+            .await?;
+
+        if event.epoch < self.inner.current_epoch() {
+            // We have not caught up to the latest epoch yet, so we can skip the event.
+            event_handle.mark_as_complete();
             return Ok(());
         }
 
+        tracing::info!(
+            epoch = %event.epoch,
+            "processing event during node RecoveryCatchUp reaches the latest epoch"
+        );
+
+        let active_committees = self.inner.committee_service.active_committees();
+        if !active_committees
+            .current_committee()
+            .contains(self.inner.public_key())
+        {
+            tracing::info!(
+                "node is not in the current committee, set node status to Standby status"
+            );
+            self.inner.storage.set_node_status(NodeStatus::Standby)?;
+            event_handle.mark_as_complete();
+            return Ok(());
+        }
+
+        if !active_committees
+            .previous_committee()
+            .is_some_and(|c| c.contains(self.inner.public_key()))
+        {
+            tracing::info!("node just became a new committee member, process shard changes");
+            // This node just became a new committee member. Process shard changes as a new
+            // committee member.
+            self.process_shard_changes_in_new_epoch(event_handle, event, true)
+                .await?;
+        } else {
+            tracing::info!("start node recovery to catch up to the latest epoch");
+            // This node is a past and current committee member. Start node recovery to catch up
+            // to the latest epoch.
+            self.start_node_recovery(event_handle, event).await?;
+        }
+
+        Ok(())
+    }
+
+    /// The node is up-to-date with the epoch and event processing. Process the epoch change start
+    /// event.
+    async fn node_in_sync_process_epoch_change_start(
+        &self,
+        event_handle: EventHandle,
+        event: &EpochChangeStart,
+    ) -> anyhow::Result<()> {
         if !self.begin_committee_change(event.epoch).await? {
             event_handle.mark_as_complete();
             return Ok(());
@@ -875,8 +923,35 @@ impl StorageNode {
             .cancel_all_expired_syncs_and_mark_events_completed()
             .await?;
 
-        self.process_shard_changes_in_new_epoch(event_handle, event)
-            .await
+        let active_committees = self.inner.committee_service.active_committees();
+        let current_node_status = self.inner.storage.node_status()?;
+
+        if current_node_status == NodeStatus::Standby
+            && active_committees
+                .current_committee()
+                .contains(self.inner.public_key())
+        {
+            tracing::info!(
+                "node is in Standby status just became a new committee member, \
+                process shard changes"
+            );
+            self.process_shard_changes_in_new_epoch(event_handle, event, true)
+                .await
+        } else {
+            if current_node_status != NodeStatus::Standby
+                && !active_committees
+                    .current_committee()
+                    .contains(self.inner.public_key())
+            {
+                // The reason we set the node status to Standby here is that the node is not in the
+                // current committee, and therefore from this epoch, it won't sync any blob
+                // metadata. In the case it becomes committee member again, it needs to sync blob
+                // metadata again.
+                self.inner.storage.set_node_status(NodeStatus::Standby)?;
+            }
+            self.process_shard_changes_in_new_epoch(event_handle, event, false)
+                .await
+        }
     }
 
     /// Starts the node recovery process.
@@ -989,15 +1064,15 @@ impl StorageNode {
         &self,
         event_handle: EventHandle,
         event: &EpochChangeStart,
+        new_node_joining_committee: bool,
     ) -> anyhow::Result<()> {
         let public_key = self.inner.public_key();
         let storage = &self.inner.storage;
         let committees = self.inner.committee_service.active_committees();
+        assert!(event.epoch <= committees.epoch());
 
         let shard_diff =
             ShardDiff::diff_previous(&committees, &storage.existing_shards(), public_key);
-
-        assert!(event.epoch <= committees.epoch());
 
         for shard_id in &shard_diff.lost {
             let Some(shard_storage) = storage.shard_storage(*shard_id) else {
@@ -1029,11 +1104,25 @@ impl StorageNode {
                 .create_storage_for_shards_in_background(shard_diff.gained.clone())
                 .await?;
 
+            if new_node_joining_committee {
+                // Set node status to RecoverMetadata to sync metadata for the new shards.
+                // Note that this must be set before marking the event as complete, so that
+                // node crashing before setting the status will always be setting the status
+                // again when re-processing the EpochChangeStart event.
+                //
+                // It's also important to set RecoverMetadata status after creating storage for
+                // the new shards. Restarting seeing RecoverMetadata status will assume all the
+                // shards are created.
+                self.inner
+                    .storage
+                    .set_node_status(NodeStatus::RecoverMetadata)?;
+            }
+
             // There shouldn't be an epoch change event for the genesis epoch.
             assert!(event.epoch != GENESIS_EPOCH);
-            for shard in &shard_diff.gained {
-                self.shard_sync_handler.start_new_shard_sync(*shard).await?;
-            }
+            self.shard_sync_handler
+                .start_sync_shards(shard_diff.gained, new_node_joining_committee)
+                .await?;
             ongoing_shard_sync = true;
         }
 
@@ -1127,6 +1216,30 @@ impl StorageNodeInner {
 
     pub(crate) fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    /// Recovers the blob metadata from the committee service.
+    pub(crate) async fn get_or_recover_blob_metadata(
+        &self,
+        blob_id: &BlobId,
+        certified_epoch: Epoch,
+    ) -> Result<BlobMetadataWithId<true>, TypedStoreError> {
+        tracing::debug!(%blob_id, "check blob metadata existence");
+
+        if let Some(metadata) = self.storage.get_metadata(blob_id)? {
+            tracing::debug!(%blob_id, "not syncing metadata: already stored");
+            return Ok(metadata);
+        }
+
+        tracing::debug!(%blob_id, "syncing metadata");
+        let metadata = self
+            .committee_service
+            .get_and_verify_metadata(*blob_id, certified_epoch)
+            .await;
+
+        self.storage.put_verified_metadata(&metadata)?;
+        tracing::debug!(%blob_id, "metadata successfully synced");
+        Ok(metadata)
     }
 
     fn current_epoch(&self) -> Epoch {
@@ -3327,7 +3440,7 @@ mod tests {
     //   - 23 blobs created and certified in node 0.
     //   - Create a new shard in node 1 with shard index 0 to test sync.
     async fn setup_cluster_for_shard_sync_tests(
-    ) -> TestResult<(TestCluster, Vec<EncodedBlob>, Arc<ShardStorage>)> {
+    ) -> TestResult<(TestCluster, Vec<EncodedBlob>, Storage, Arc<ShardStorage>)> {
         let blobs: Vec<[u8; 32]> = (1..24).map(|i| [i; 32]).collect();
         let blobs: Vec<_> = blobs.iter().map(|b| &b[..]).collect();
         let (cluster, _, blob_details) =
@@ -3343,13 +3456,19 @@ mod tests {
         let shard_storage_dst = node_inner.storage.shard_storage(ShardIndex(0)).unwrap();
         shard_storage_dst.update_status_in_test(ShardStatus::None)?;
 
-        Ok((cluster, blob_details, shard_storage_dst.clone()))
+        Ok((
+            cluster,
+            blob_details,
+            node_inner.storage.clone(),
+            shard_storage_dst.clone(),
+        ))
     }
 
     // Checks that all primary and secondary slivers match the original encoding of the blobs.
     // Checks that blobs in the skip list are not synced.
     fn check_all_blobs_are_synced(
         blob_details: &[EncodedBlob],
+        storage_dst: &Storage,
         shard_storage_dst: &ShardStorage,
         skip_blob_indices: &[usize],
     ) -> anyhow::Result<()> {
@@ -3395,6 +3514,13 @@ mod tests {
                         secondary: dst_secondary,
                     }
                 );
+
+                // Check that metadata is synced.
+                assert_eq!(
+                    details.metadata,
+                    storage_dst.get_metadata(&blob_id).unwrap().unwrap(),
+                );
+
                 Ok(())
             })
     }
@@ -3416,12 +3542,24 @@ mod tests {
     }
 
     // Tests shard transfer only using shard sync functionality.
-    #[tokio::test]
-    async fn sync_shard_complete_transfer() -> TestResult {
+    async_param_test! {
+        sync_shard_complete_transfer -> TestResult: [
+            only_sync_blob: (false),
+            also_sync_metadata: (true),
+        ]
+    }
+    async fn sync_shard_complete_transfer(
+        wipe_metadata_before_transfer_in_dst: bool,
+    ) -> TestResult {
         telemetry_subscribers::init_for_testing();
 
-        let (cluster, blob_details, shard_storage_dst) =
+        let (cluster, blob_details, storage_dst, shard_storage_dst) =
             setup_cluster_for_shard_sync_tests().await?;
+
+        if wipe_metadata_before_transfer_in_dst {
+            storage_dst.clear_metadata_in_test()?;
+            storage_dst.set_node_status(NodeStatus::RecoverMetadata)?;
+        }
 
         let shard_storage_src = cluster.nodes[0]
             .storage_node
@@ -3440,7 +3578,7 @@ mod tests {
         cluster.nodes[1]
             .storage_node
             .shard_sync_handler
-            .start_new_shard_sync(ShardIndex(0))
+            .start_sync_shards(vec![ShardIndex(0)], wipe_metadata_before_transfer_in_dst)
             .await?;
 
         // Waits for the shard to be synced.
@@ -3452,7 +3590,7 @@ mod tests {
         assert_eq!(blob_details.len(), 23);
 
         // Checks that the shard is completely migrated.
-        check_all_blobs_are_synced(&blob_details, &shard_storage_dst, &[])?;
+        check_all_blobs_are_synced(&blob_details, &storage_dst, &shard_storage_dst, &[])?;
 
         Ok(())
     }
@@ -3485,8 +3623,13 @@ mod tests {
     }
 
     // Tests shard transfer completely using shard recovery functionality.
-    #[tokio::test]
-    async fn sync_shard_shard_recovery() -> TestResult {
+    async_param_test! {
+        sync_shard_shard_recovery -> TestResult: [
+            only_sync_blob: (false),
+            also_sync_metadata: (true),
+        ]
+    }
+    async fn sync_shard_shard_recovery(wipe_metadata_before_transfer_in_dst: bool) -> TestResult {
         telemetry_subscribers::init_for_testing();
 
         let (cluster, blob_details, _) =
@@ -3517,13 +3660,25 @@ mod tests {
         let shard_storage_dst = node_inner.storage.shard_storage(ShardIndex(0)).unwrap();
         shard_storage_dst.update_status_in_test(ShardStatus::None)?;
 
+        if wipe_metadata_before_transfer_in_dst {
+            node_inner.storage.clear_metadata_in_test()?;
+            node_inner
+                .storage
+                .set_node_status(NodeStatus::RecoverMetadata)?;
+        }
+
         cluster.nodes[1]
             .storage_node
             .shard_sync_handler
-            .start_new_shard_sync(ShardIndex(0))
+            .start_sync_shards(vec![ShardIndex(0)], wipe_metadata_before_transfer_in_dst)
             .await?;
         wait_for_shard_in_active_state(shard_storage_dst.as_ref()).await?;
-        check_all_blobs_are_synced(&blob_details, shard_storage_dst.as_ref(), &[])?;
+        check_all_blobs_are_synced(
+            &blob_details,
+            &node_inner.storage.clone(),
+            shard_storage_dst.as_ref(),
+            &[],
+        )?;
 
         Ok(())
     }
@@ -3531,8 +3686,13 @@ mod tests {
     // Tests shard transfer partially using shard recovery functionality and partially using shard
     // sync.
     // This test also tests that no missing blobs after sync completion.
-    #[tokio::test]
-    async fn sync_shard_partial_recovery() -> TestResult {
+    async_param_test! {
+        sync_shard_partial_recovery -> TestResult: [
+            only_sync_blob: (false),
+            also_sync_metadata: (true),
+        ]
+    }
+    async fn sync_shard_partial_recovery(wipe_metadata_before_transfer_in_dst: bool) -> TestResult {
         let skip_stored_blob_index: [usize; 12] = [3, 4, 5, 9, 10, 11, 15, 18, 19, 20, 21, 22];
         let (cluster, blob_details, _) = setup_shard_recovery_test_cluster(
             |blob_index| !skip_stored_blob_index.contains(&blob_index),
@@ -3566,13 +3726,25 @@ mod tests {
         let shard_storage_dst = node_inner.storage.shard_storage(ShardIndex(0)).unwrap();
         shard_storage_dst.update_status_in_test(ShardStatus::None)?;
 
+        if wipe_metadata_before_transfer_in_dst {
+            node_inner.storage.clear_metadata_in_test()?;
+            node_inner
+                .storage
+                .set_node_status(NodeStatus::RecoverMetadata)?;
+        }
+
         cluster.nodes[1]
             .storage_node
             .shard_sync_handler
-            .start_new_shard_sync(ShardIndex(0))
+            .start_sync_shards(vec![ShardIndex(0)], wipe_metadata_before_transfer_in_dst)
             .await?;
         wait_for_shard_in_active_state(shard_storage_dst.as_ref()).await?;
-        check_all_blobs_are_synced(&blob_details, shard_storage_dst.as_ref(), &[])?;
+        check_all_blobs_are_synced(
+            &blob_details,
+            &node_inner.storage,
+            shard_storage_dst.as_ref(),
+            &[],
+        )?;
 
         Ok(())
     }
@@ -3671,7 +3843,12 @@ mod tests {
 
         // Shard recovery should be completed, and all the data should be synced.
         wait_for_shard_in_active_state(shard_storage_dst.as_ref()).await?;
-        check_all_blobs_are_synced(&blob_details, shard_storage_dst.as_ref(), &[3, 9, 19])?;
+        check_all_blobs_are_synced(
+            &blob_details,
+            &node_inner.storage,
+            shard_storage_dst.as_ref(),
+            &[3, 9, 19],
+        )?;
 
         clear_fail_point("shard_recovery_skip_initial_blob_certification_check");
 
@@ -3691,7 +3868,9 @@ mod tests {
             // Timeout needs to be longer than shard sync retry interval.
             tokio::time::timeout(Duration::from_secs(120), async {
                 loop {
-                    if shard_sync_handler.current_sync_task_count().await == 0 {
+                    if shard_sync_handler.current_sync_task_count().await == 0
+                        && shard_sync_handler.no_pending_recover_metadata().await
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3730,7 +3909,7 @@ mod tests {
         ) -> TestResult {
             telemetry_subscribers::init_for_testing();
 
-            let (cluster, blob_details, shard_storage_dst) =
+            let (cluster, blob_details, storage_dst, shard_storage_dst) =
                 setup_cluster_for_shard_sync_tests().await?;
 
             register_fail_point_arg(
@@ -3779,7 +3958,7 @@ mod tests {
             wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
 
             // Checks that the shard is completely migrated.
-            check_all_blobs_are_synced(&blob_details, &shard_storage_dst, &[])?;
+            check_all_blobs_are_synced(&blob_details, &storage_dst, &shard_storage_dst, &[])?;
 
             Ok(())
         }
@@ -3798,7 +3977,7 @@ mod tests {
         async fn sync_shard_src_abnormal_return(fail_point: &'static str) -> TestResult {
             telemetry_subscribers::init_for_testing();
 
-            let (cluster, _blob_details, _shard_storage_dst) =
+            let (cluster, _blob_details, storage_dst, shard_storage_dst) =
                 setup_cluster_for_shard_sync_tests().await?;
 
             register_fail_point_if(fail_point, || true);
@@ -3812,7 +3991,7 @@ mod tests {
 
             // Waits for the shard sync process to stop.
             wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
-            check_all_blobs_are_synced(&_blob_details, &_shard_storage_dst, &[])?;
+            check_all_blobs_are_synced(&_blob_details, &storage_dst, &shard_storage_dst, &[])?;
 
             Ok(())
         }
@@ -3901,7 +4080,7 @@ mod tests {
             wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
 
             // All blobs should be recovered in the new dst node.
-            check_all_blobs_are_synced(&details, &shard_storage_dst, &[])?;
+            check_all_blobs_are_synced(&details, &node_inner.storage, &shard_storage_dst, &[])?;
 
             // Checks that shard sync recovery is not triggered.
             assert!(!shard_sync_recovery_triggered.load(Ordering::SeqCst));
@@ -3996,7 +4175,56 @@ mod tests {
                 .await?;
 
             wait_for_shard_in_active_state(shard_storage_dst.as_ref()).await?;
-            check_all_blobs_are_synced(&blob_details, shard_storage_dst.as_ref(), &[])?;
+            check_all_blobs_are_synced(
+                &blob_details,
+                &node_inner.storage,
+                shard_storage_dst.as_ref(),
+                &[],
+            )?;
+
+            Ok(())
+        }
+
+        #[walrus_simtest]
+        async fn sync_shard_recovery_metadata_restart() -> TestResult {
+            telemetry_subscribers::init_for_testing();
+
+            let (cluster, blob_details, storage_dst, shard_storage_dst) =
+                setup_cluster_for_shard_sync_tests().await?;
+
+            register_fail_point_if("fail_point_shard_sync_recovery_metadata_error", || true);
+
+            storage_dst.remove_storage_for_shards(&[ShardIndex(1)])?;
+            storage_dst.clear_metadata_in_test()?;
+            storage_dst.set_node_status(NodeStatus::RecoverMetadata)?;
+
+            // Starts the shard syncing process in the new shard, which will fail at the specified
+            // break index.
+            cluster.nodes[1]
+                .storage_node
+                .shard_sync_handler
+                .start_sync_shards(vec![ShardIndex(0)], true)
+                .await?;
+
+            // Waits for the shard sync process to stop.
+            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
+
+            assert!(shard_storage_dst.status().unwrap() == ShardStatus::None);
+
+            clear_fail_point("fail_point_shard_sync_recovery_metadata_error");
+
+            // restart the shard syncing process, to simulate a reboot.
+            cluster.nodes[1]
+                .storage_node
+                .shard_sync_handler
+                .restart_syncs()
+                .await?;
+
+            // Waits for the shard to be synced.
+            wait_until_no_sync_tasks(&cluster.nodes[1].storage_node.shard_sync_handler).await?;
+
+            // Checks that the shard is completely migrated.
+            check_all_blobs_are_synced(&blob_details, &storage_dst, &shard_storage_dst, &[])?;
 
             Ok(())
         }

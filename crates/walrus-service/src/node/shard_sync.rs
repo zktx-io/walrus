@@ -6,6 +6,8 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(msim)]
+use sui_macros::fail_point_if;
 use tokio::sync::Mutex;
 use walrus_core::ShardIndex;
 use walrus_sdk::error::ServiceError;
@@ -15,15 +17,17 @@ use super::{
     config::ShardSyncConfig,
     errors::SyncShardClientError,
     storage::{ShardStatus, ShardStorage},
+    NodeStatus,
     StorageNodeInner,
 };
-use crate::node::{errors::ShardNotAssigned, metrics};
+use crate::node::{errors::ShardNotAssigned, metrics, storage::blob_info::BlobInfoApi};
 
 /// Manages tasks for syncing shards during epoch change.
 #[derive(Debug, Clone)]
 pub struct ShardSyncHandler {
     node: Arc<StorageNodeInner>,
     shard_sync_in_progress: Arc<Mutex<HashMap<ShardIndex, tokio::task::JoinHandle<()>>>>,
+    task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     config: ShardSyncConfig,
 }
 
@@ -32,11 +36,122 @@ impl ShardSyncHandler {
         Self {
             node,
             shard_sync_in_progress: Arc::new(Mutex::new(HashMap::new())),
+            task_handle: Arc::new(Mutex::new(None)),
             config,
         }
     }
 
+    /// Starts sync shards. If `recover_metadata` is true, sync certified blob metadata before
+    /// syncing shards.
+    pub async fn start_sync_shards(
+        &self,
+        shards: Vec<ShardIndex>,
+        recover_metadata: bool,
+    ) -> Result<(), SyncShardClientError> {
+        let mut task_handle = self.task_handle.lock().await;
+        let sync_handler_clone = self.clone();
+        let old_task = task_handle.replace(tokio::spawn(async move {
+            sync_handler_clone
+                .sync_shards_task(shards, recover_metadata)
+                .await
+        }));
+
+        if let Some(old_task) = old_task {
+            old_task.abort();
+        }
+
+        Ok(())
+    }
+
+    async fn sync_shards_task(&self, shards: Vec<ShardIndex>, recover_metadata: bool) {
+        if recover_metadata {
+            assert!(
+                self.node
+                    .storage
+                    .node_status()
+                    .expect("reading db should not fail")
+                    == NodeStatus::RecoverMetadata
+            );
+
+            if let Err(sync_metadata_error) = self.sync_certified_blob_metadata().await {
+                tracing::error!(
+                    ?sync_metadata_error,
+                    "failed to sync blob metadata; aborting shard sync"
+                );
+                return;
+            }
+        }
+
+        for shard in shards {
+            if let Err(error) = self.start_new_shard_sync(shard).await {
+                tracing::error!(
+                    ?error,
+                    %shard,
+                    "failed to start shard sync; aborting shard sync"
+                );
+                continue;
+            }
+        }
+
+        // Once we have started the shard sync task, the shard status has been persisted to
+        // disk, so we can mark the node as active. Any restart from this point will re-start
+        // the shard sync tasks only without syncing metadata again.
+        if self
+            .node
+            .storage
+            .node_status()
+            .expect("reading db should not fail")
+            == NodeStatus::RecoverMetadata
+        {
+            self.node
+                .storage
+                .set_node_status(NodeStatus::Active)
+                .expect("setting node status should not fail");
+        }
+    }
+
+    /// Syncs the certified blob metadata before the current epoch.
+    async fn sync_certified_blob_metadata(&self) -> Result<(), SyncShardClientError> {
+        tracing::info!("start syncing blob metadata");
+        let blob_infos = self
+            .node
+            .storage
+            .certified_blob_info_iter_before_epoch(self.node.current_epoch());
+
+        #[cfg(msim)]
+        {
+            let mut sync_blob_metadata_error = false;
+            fail_point_if!("fail_point_shard_sync_recovery_metadata_error", || {
+                sync_blob_metadata_error = true
+            });
+            if sync_blob_metadata_error {
+                return Err(SyncShardClientError::Internal(anyhow::anyhow!(
+                    "fail point triggered sync blob metadata error"
+                )));
+            }
+        }
+
+        // TODO(WAL-478):
+        //   - create a end point that can transfer multiple blob metadata at once.
+        //   - do this in parallel to speed up the sync.
+        for blob_info in blob_infos {
+            let (blob_id, blob_info) = blob_info?;
+
+            self.node
+                .get_or_recover_blob_metadata(
+                    &blob_id,
+                    blob_info
+                        .initial_certified_epoch()
+                        .expect("certified blob must have certified epoch set"),
+                )
+                .await?;
+        }
+        tracing::info!("finished syncing blob metadata");
+        Ok(())
+    }
+
     /// Starts syncing a new shard. This method is used when a new shard is assigned to the node.
+    // TODO: make this function private.
     pub async fn start_new_shard_sync(
         &self,
         shard_index: ShardIndex,
@@ -95,13 +210,35 @@ impl ShardSyncHandler {
     /// Restarts syncing shards that were previously syncing. This method is used when restarting
     /// the node.
     pub async fn restart_syncs(&self) -> Result<(), anyhow::Error> {
-        for shard_storage in self.node.storage.existing_shard_storages() {
-            // Restart the syncing task for shards that were previously syncing (in ActiveSync
-            // status).
-            let shard_status = shard_storage.status()?;
-            if shard_status == ShardStatus::ActiveSync || shard_status == ShardStatus::ActiveRecover
-            {
-                self.start_shard_sync_impl(shard_storage.clone()).await;
+        let current_node_status = self.node.storage.node_status()?;
+        if current_node_status == NodeStatus::RecoverMetadata {
+            let shards_to_sync = self
+                .node
+                .storage
+                .existing_shard_storages()
+                .iter()
+                .map(|s| s.id())
+                .collect::<Vec<_>>();
+
+            let sync_handler_clone = self.clone();
+            self.task_handle
+                .lock()
+                .await
+                .replace(tokio::spawn(async move {
+                    sync_handler_clone
+                        .sync_shards_task(shards_to_sync, true)
+                        .await
+                }));
+        } else {
+            for shard_storage in self.node.storage.existing_shard_storages() {
+                // Restart the syncing task for shards that were previously syncing (in ActiveSync
+                // status).
+                let shard_status = shard_storage.status()?;
+                if shard_status == ShardStatus::ActiveSync
+                    || shard_status == ShardStatus::ActiveRecover
+                {
+                    self.start_shard_sync_impl(shard_storage.clone()).await;
+                }
             }
         }
         Ok(())
@@ -239,6 +376,12 @@ impl ShardSyncHandler {
     #[cfg(test)]
     pub async fn current_sync_task_count(&self) -> usize {
         self.shard_sync_in_progress.lock().await.len()
+    }
+
+    #[cfg(all(msim, test, feature = "test-utils"))]
+    pub async fn no_pending_recover_metadata(&self) -> bool {
+        let task_handle = self.task_handle.lock().await;
+        task_handle.is_none() || task_handle.as_ref().unwrap().is_finished()
     }
 }
 
