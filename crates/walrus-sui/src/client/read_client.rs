@@ -763,9 +763,25 @@ impl ReadClient for SuiReadClient {
         })
     }
 
+    #[cfg(not(feature = "walrus-mainnet"))]
     async fn stake_assignment(&self) -> SuiClientResult<HashMap<ObjectID, u64>> {
         let staking_object = self.get_staking_object().await?.inner;
         Ok(staking_object.active_set.nodes.into_iter().collect())
+    }
+
+    #[cfg(feature = "walrus-mainnet")]
+    async fn stake_assignment(&self) -> SuiClientResult<HashMap<ObjectID, u64>> {
+        use crate::types::move_structs::ActiveSet;
+
+        let staking_object = self.get_staking_object().await?;
+        let active_set_id = staking_object.inner.active_set;
+        let key_tag = contracts::extended_field::Key
+            .to_move_struct_tag_with_type_map(&self.type_origin_map, &[])?;
+        let active_set: ActiveSet = self
+            .sui_client
+            .get_dynamic_field(active_set_id, key_tag.into(), ())
+            .await?;
+        Ok(active_set.nodes.into_iter().collect())
     }
 }
 

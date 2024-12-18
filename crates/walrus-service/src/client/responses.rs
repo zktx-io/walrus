@@ -280,6 +280,7 @@ impl StorageNodeInfo {
             next_epoch_public_key,
             network_public_key,
             shard_ids,
+            ..
         } = value;
         Self {
             name,

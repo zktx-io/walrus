@@ -20,6 +20,8 @@ use walrus::{
     committee::{Self, Committee},
     epoch_parameters::{Self, EpochParams},
     events,
+    extended_field::{Self, ExtendedField},
+    node_metadata::NodeMetadata,
     staked_wal::StakedWal,
     staking_pool::{Self, StakingPool},
     storage_node::StorageNodeCap,
@@ -85,7 +87,7 @@ public struct StakingInnerV1 has key, store {
     /// the Sui epochs, not to be mistaken with `ctx.epoch()`.
     epoch: u32,
     /// Stores the active set of storage nodes. Tracks the total amount of staked WAL.
-    active_set: ActiveSet,
+    active_set: ExtendedField<ActiveSet>,
     /// The next committee in the system.
     next_committee: Option<Committee>,
     /// The current committee in the system.
@@ -115,7 +117,10 @@ public(package) fun new(
         first_epoch_start: epoch_zero_duration + clock.timestamp_ms(),
         pools: object_table::new(ctx),
         epoch: 0,
-        active_set: active_set::new(TEMP_ACTIVE_SET_SIZE_LIMIT, MIN_STAKE),
+        active_set: extended_field::new(
+            active_set::new(TEMP_ACTIVE_SET_SIZE_LIMIT, MIN_STAKE),
+            ctx,
+        ),
         next_committee: option::none(),
         committee: committee::empty(),
         previous_committee: committee::empty(),
@@ -132,6 +137,7 @@ public(package) fun create_pool(
     self: &mut StakingInnerV1,
     name: String,
     network_address: String,
+    metadata: NodeMetadata,
     public_key: vector<u8>,
     network_public_key: vector<u8>,
     proof_of_possession: vector<u8>,
@@ -144,6 +150,7 @@ public(package) fun create_pool(
     let pool = staking_pool::new(
         name,
         network_address,
+        metadata,
         public_key,
         network_public_key,
         proof_of_possession,
@@ -345,6 +352,15 @@ public(package) fun set_network_public_key(
     self.pools[cap.node_id()].set_network_public_key(network_public_key);
 }
 
+/// Sets the metadata of a storage node.
+public(package) fun set_node_metadata(
+    self: &mut StakingInnerV1,
+    cap: &StorageNodeCap,
+    metadata: NodeMetadata,
+) {
+    self.pools[cap.node_id()].set_node_metadata(metadata);
+}
+
 // === Staking ===
 
 /// Blocks staking for the pool, marks it as "withdrawing".
@@ -380,7 +396,7 @@ public(package) fun stake_with_pool(
         EpochState::NextParamsSelected(_) => pool.wal_balance_at_epoch(wctx.epoch() + 2),
         _ => pool.wal_balance_at_epoch(wctx.epoch() + 1),
     };
-    self.active_set.insert_or_update(node_id, balance);
+    self.active_set.borrow_mut().insert_or_update(node_id, balance);
     staked_wal
 }
 
@@ -428,7 +444,7 @@ public(package) fun select_committee(self: &mut StakingInnerV1) {
 }
 
 fun apportionment(self: &StakingInnerV1): (vector<ID>, vector<u16>) {
-    let (active_ids, stake) = self.active_set.active_ids_and_stake();
+    let (active_ids, stake) = self.active_set.borrow().active_ids_and_stake();
     let n_nodes = stake.length();
     // TODO better ranking (#943)
     let priorities = vector::tabulate!(n_nodes, |i| n_nodes - i);
@@ -531,7 +547,10 @@ public(package) fun advance_epoch(self: &mut StakingInnerV1, mut rewards: Balanc
 
     node_ids.zip_do!(shard_assignments, |node_id, shards| {
         self.pools[node_id].advance_epoch(rewards.split(rewards_per_shard * shards.length()), wctx);
-        self.active_set.update(node_id, self.pools[node_id].wal_balance_at_epoch(wctx.epoch() + 1));
+        self
+            .active_set
+            .borrow_mut()
+            .update(node_id, self.pools[node_id].wal_balance_at_epoch(wctx.epoch() + 1));
     });
 
     // Save any leftover rewards due to rounding.
@@ -587,6 +606,11 @@ public fun shard_transfer_failed(
 }
 
 // === Accessors ===
+
+/// Returns the metadata of the node with the given `ID`.
+public(package) fun node_metadata(self: &StakingInnerV1, node_id: ID): NodeMetadata {
+    self.pools[node_id].node_info().metadata()
+}
 
 /// Returns the Option with next committee.
 public(package) fun next_committee(self: &StakingInnerV1): &Option<Committee> {
@@ -657,7 +681,7 @@ public(package) fun is_epoch_sync_done(self: &StakingInnerV1): bool {
 
 #[test_only]
 public(package) fun active_set(self: &mut StakingInnerV1): &mut ActiveSet {
-    &mut self.active_set
+    self.active_set.borrow_mut()
 }
 
 #[test_only]

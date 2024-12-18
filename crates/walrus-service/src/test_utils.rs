@@ -52,6 +52,7 @@ use walrus_sui::{
         Committee,
         ContractEvent,
         NetworkAddress,
+        NodeMetadata,
         NodeRegistrationParams,
         StorageNode as SuiStorageNode,
         StorageNodeCap,
@@ -1607,6 +1608,8 @@ impl StorageNodeTestConfig {
             next_epoch_public_key: None,
             network_public_key: self.network_key_pair.public().clone(),
             shard_ids: self.shards.clone(),
+            #[cfg(feature = "walrus-mainnet")]
+            metadata: ObjectID::random(),
         }
     }
 
@@ -1621,6 +1624,7 @@ impl StorageNodeTestConfig {
             storage_price: 5,
             write_price: 1,
             node_capacity: 1_000_000_000,
+            metadata: NodeMetadata::default(),
         }
     }
 }
@@ -1749,6 +1753,8 @@ pub(crate) fn test_committee_with_epoch(weights: &[u16], epoch: Epoch) -> Commit
             network_public_key: NetworkKeyPair::generate().public().clone(),
             name: String::new(),
             network_address: NetworkAddress("host:0".to_owned()),
+            #[cfg(feature = "walrus-mainnet")]
+            metadata: ObjectID::random(),
         })
         .collect();
 
@@ -2082,6 +2088,7 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
             public_host: Some(rest_api_address.ip().to_string()),
             public_port: Some(rest_api_address.port()),
             metrics_push: None,
+            metadata: None,
         },
         temp_dir,
     }

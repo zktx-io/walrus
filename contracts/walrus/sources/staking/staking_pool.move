@@ -10,6 +10,7 @@ use wal::wal::WAL;
 use walrus::{
     commission::{Self, Auth, Receiver},
     messages,
+    node_metadata::NodeMetadata,
     pending_values::{Self, PendingValues},
     pool_exchange_rate::{Self, PoolExchangeRate},
     staked_wal::{Self, StakedWal},
@@ -136,6 +137,7 @@ public struct StakingPool has key, store {
 public(package) fun new(
     name: String,
     network_address: String,
+    metadata: NodeMetadata,
     public_key: vector<u8>,
     network_public_key: vector<u8>,
     proof_of_possession: vector<u8>,
@@ -184,6 +186,8 @@ public(package) fun new(
             network_address,
             public_key,
             network_public_key,
+            metadata,
+            ctx,
         ),
         commission_rate,
         activation_epoch,
@@ -484,6 +488,11 @@ public(package) fun set_network_public_key(self: &mut StakingPool, network_publi
     self.node_info.set_network_public_key(network_public_key);
 }
 
+/// Sets the node metadata.
+public(package) fun set_node_metadata(self: &mut StakingPool, metadata: NodeMetadata) {
+    self.node_info.set_node_metadata(metadata);
+}
+
 /// Destroy the pool if it is empty.
 public(package) fun destroy_empty(pool: StakingPool) {
     assert!(pool.is_empty(), EPoolNotEmpty);
@@ -495,11 +504,13 @@ public(package) fun destroy_empty(pool: StakingPool) {
         rewards_pool,
         commission,
         extra_fields,
+        node_info,
         ..,
     } = pool;
 
     id.delete();
     exchange_rates.drop();
+    node_info.destroy();
     commission.destroy_zero();
     rewards_pool.destroy_zero();
     extra_fields.destroy_empty();

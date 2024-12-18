@@ -102,6 +102,9 @@ pub struct StorageNode {
     /// The network key of the storage node.
     #[serde(deserialize_with = "deserialize_public_key")]
     pub network_public_key: NetworkPublicKey,
+    #[cfg(feature = "walrus-mainnet")]
+    /// The metadata for the pool.
+    pub metadata: ObjectID,
     /// The indices of the shards held by the storage node.
     #[serde(default, skip_deserializing)]
     pub shard_ids: Vec<ShardIndex>,
@@ -394,9 +397,14 @@ pub(crate) struct StakingInnerV1 {
     pub(crate) pools: ObjectID,
     /// The current epoch of the Walrus system.
     pub(crate) epoch: Epoch,
+    #[cfg(not(feature = "walrus-mainnet"))]
     /// Stores the active set of storage nodes. Provides automatic sorting and
     /// tracks the total amount of staked WAL.
     pub(crate) active_set: ActiveSet,
+    #[cfg(feature = "walrus-mainnet")]
+    /// Stores the active set of storage nodes. Provides automatic sorting and
+    /// tracks the total amount of staked WAL.
+    pub(crate) active_set: ObjectID,
     /// The next committee in the system.
     pub(crate) next_committee: Option<CommitteeShardAssignment>,
     /// The current committee in the system.

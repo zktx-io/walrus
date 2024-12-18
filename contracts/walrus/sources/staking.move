@@ -10,6 +10,7 @@ use sui::{clock::Clock, coin::Coin, dynamic_object_field as df};
 use wal::wal::WAL;
 use walrus::{
     commission::{Self, Auth, Receiver},
+    node_metadata::NodeMetadata,
     staked_wal::StakedWal,
     staking_inner::{Self, StakingInnerV1},
     storage_node::{Self, StorageNodeCap},
@@ -57,6 +58,7 @@ public fun register_candidate(
     // node info
     name: String,
     network_address: String,
+    metadata: NodeMetadata,
     public_key: vector<u8>,
     network_public_key: vector<u8>,
     proof_of_possession: vector<u8>,
@@ -72,6 +74,7 @@ public fun register_candidate(
     let node_id = staking_mut.create_pool(
         name,
         network_address,
+        metadata,
         public_key,
         network_public_key,
         proof_of_possession,
@@ -147,7 +150,12 @@ public fun set_node_capacity_vote(self: &mut Staking, cap: &StorageNodeCap, node
     self.inner_mut().set_node_capacity_vote(cap, node_capacity);
 }
 
-// === Update Node Parameters ===
+// === Get/ Update Node Parameters ===
+
+/// Get `NodeMetadata` for the given node.
+public fun node_metadata(self: &Staking, node_id: ID): NodeMetadata {
+    self.inner().node_metadata(node_id)
+}
 
 /// Sets the public key of a node to be used starting from the next epoch for which the node is
 /// selected.
@@ -178,6 +186,11 @@ public fun set_network_public_key(
     network_public_key: vector<u8>,
 ) {
     self.inner_mut().set_network_public_key(cap, network_public_key);
+}
+
+/// Sets the metadata of a storage node.
+public fun set_node_metadata(self: &mut Staking, cap: &StorageNodeCap, metadata: NodeMetadata) {
+    self.inner_mut().set_node_metadata(cap, metadata);
 }
 
 // === Epoch Change ===
