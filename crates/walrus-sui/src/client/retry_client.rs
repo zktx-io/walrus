@@ -296,6 +296,32 @@ impl RetriableSuiClient {
         .await
     }
 
+    #[tracing::instrument(level = Level::DEBUG, skip_all)]
+    pub(crate) async fn get_sui_objects<U>(
+        &self,
+        object_ids: Vec<ObjectID>,
+    ) -> SuiClientResult<Vec<U>>
+    where
+        U: AssociatedContractStruct,
+    {
+        retry_rpc_errors(self.get_strategy(), || async {
+            let responses = self
+                .sui_client
+                .read_api()
+                .multi_get_object_with_options(
+                    object_ids.to_vec(),
+                    SuiObjectDataOptions::new().with_bcs().with_type(),
+                )
+                .await?;
+
+            responses
+                .iter()
+                .map(|r| get_sui_object_from_object_response(r))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+    }
+
     pub(crate) async fn get_dynamic_field_object<K, V>(
         &self,
         parent: ObjectID,

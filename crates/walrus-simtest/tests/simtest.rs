@@ -51,20 +51,25 @@ mod tests {
         // Write a random blob.
         let blob = walrus_test_utils::random_data(data_length);
 
-        let BlobStoreResult::NewlyCreated {
-            blob_object: blob_confirmation,
-            ..
-        } = client
+        let store_results = client
             .as_ref()
-            .reserve_and_store_blob_retry_epoch(
-                &blob,
+            .reserve_and_store_blobs_retry_epoch(
+                &[blob.as_slice()],
                 5,
                 StoreWhen::Always,
                 BlobPersistence::Permanent,
                 PostStoreAction::Keep,
             )
             .await
-            .context("store blob should not fail")?
+            .context("store blob should not fail")?;
+        let store_result = &store_results
+            .first()
+            .expect("should have exactly one result");
+
+        let BlobStoreResult::NewlyCreated {
+            blob_object: blob_confirmation,
+            ..
+        } = store_result
         else {
             panic!("expect newly stored blob")
         };
