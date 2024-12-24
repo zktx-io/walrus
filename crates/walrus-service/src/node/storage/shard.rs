@@ -588,6 +588,13 @@ impl ShardStorage {
                     SliverType::Secondary => self.secondary_slivers.batch(),
                 };
 
+                metrics::with_label!(
+                    node.metrics.sync_shard_sync_sliver_progress,
+                    &self.id.to_string(),
+                    &sliver_type.to_string()
+                )
+                .set(next_starting_blob_id.first_two_bytes() as i64);
+
                 let fetched_slivers = node
                     .committee_service
                     .sync_shard_before_epoch(
@@ -628,7 +635,8 @@ impl ShardStorage {
 
                 metrics::with_label!(
                     node.metrics.sync_shard_sync_sliver_total,
-                    &self.id.to_string()
+                    &self.id.to_string(),
+                    &sliver_type.to_string()
                 )
                 .inc_by(fetched_slivers.len() as u64);
 
@@ -831,7 +839,8 @@ impl ShardStorage {
                 );
                 metrics::with_label!(
                     node.metrics.sync_shard_recover_sliver_skip_total,
-                    &self.id.to_string()
+                    &self.id.to_string(),
+                    &sliver_type.to_string()
                 )
                 .inc();
                 self.pending_recover_slivers
@@ -892,7 +901,8 @@ impl ShardStorage {
         );
         metrics::with_label!(
             node.metrics.sync_shard_recover_sliver_cancellation_total,
-            &self.id.to_string()
+            &self.id.to_string(),
+            &sliver_type.to_string()
         )
         .inc();
         self.pending_recover_slivers
@@ -932,7 +942,8 @@ impl ShardStorage {
 
         metrics::with_label!(
             node.metrics.sync_shard_recover_sliver_total,
-            &self.id.to_string()
+            &self.id.to_string(),
+            &sliver_type.to_string()
         )
         .inc();
 
@@ -982,7 +993,8 @@ impl ShardStorage {
             Ok(sliver) => {
                 metrics::with_label!(
                     node.metrics.sync_shard_recover_sliver_success_total,
-                    &self.id.to_string()
+                    &self.id.to_string(),
+                    &sliver_type.to_string()
                 )
                 .inc();
                 self.put_sliver(&blob_id, &sliver)?;
@@ -991,7 +1003,8 @@ impl ShardStorage {
                 tracing::debug!("received an inconsistency proof when recovering sliver");
                 metrics::with_label!(
                     node.metrics.sync_shard_recover_sliver_error_total,
-                    &self.id.to_string()
+                    &self.id.to_string(),
+                    &sliver_type.to_string()
                 )
                 .inc();
                 // TODO(#704): once committee service supports multi-epoch. This needs to use the

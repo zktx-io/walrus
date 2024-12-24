@@ -112,6 +112,18 @@ impl BlobId {
         blob_id
     }
 
+    /// Extracts the first two bytes of the blob ID as a `u16`, with the left most bit being the
+    /// most significant.
+    ///
+    /// The extracted can be used to monitor the progress of tasks that scans over blob IDs.
+    pub fn first_two_bytes(&self) -> u16 {
+        u16::from_be_bytes(
+            self.0[0..2]
+                .try_into()
+                .expect("two bytes can be converted to a u16"),
+        )
+    }
+
     fn new_with_hash_function<T>(
         merkle_root: Node,
         encoding: EncodingType,
