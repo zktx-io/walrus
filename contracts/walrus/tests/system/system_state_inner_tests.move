@@ -4,7 +4,7 @@
 #[test_only]
 module walrus::system_state_inner_tests;
 
-use sui::{clock, test_utils::destroy};
+use sui::test_utils::destroy;
 use walrus::{storage_accounting as sa, system_state_inner, test_utils::mint};
 
 fun add_subsidy_test(rewards: u64, epochs_ahead: u32) {
@@ -20,7 +20,7 @@ fun add_subsidy_test(rewards: u64, epochs_ahead: u32) {
     // Distribute the rewards across epochs.
     epochs_ahead.do!(|i| {
         let expected_reward = base_reward + if ((i as u64) < leftovers) { 1 } else { 0 };
-        let rb = sa::rewards_balance(sa::ring_lookup_mut(system.get_future_accounting(), i));
+        let rb = sa::rewards_balance(sa::ring_lookup_mut(system.future_accounting_mut(), i));
         assert!(rb.value() == expected_reward);
     });
 
@@ -58,11 +58,11 @@ fun test_add_subsidy_uneven_distribution() {
     // The first epoch should get 2 more rewards than the others. They are the leftover_rewards.
     let first_epoch_rewards = reward_per_epoch + 2;
 
-    let rb0 = sa::rewards_balance(sa::ring_lookup_mut(system.get_future_accounting(), 0));
+    let rb0 = sa::rewards_balance(sa::ring_lookup_mut(system.future_accounting_mut(), 0));
     assert!(rb0.value() == first_epoch_rewards);
-    let rb1 = sa::rewards_balance(sa::ring_lookup_mut(system.get_future_accounting(), 1));
+    let rb1 = sa::rewards_balance(sa::ring_lookup_mut(system.future_accounting_mut(), 1));
     assert!(rb1.value() == reward_per_epoch);
-    let rb2 = sa::rewards_balance(sa::ring_lookup_mut(system.get_future_accounting(), 2));
+    let rb2 = sa::rewards_balance(sa::ring_lookup_mut(system.future_accounting_mut(), 2));
     assert!(rb2.value() == reward_per_epoch);
     destroy(system);
 }
@@ -70,7 +70,6 @@ fun test_add_subsidy_uneven_distribution() {
 #[test, expected_failure(abort_code = system_state_inner::EInvalidEpochsAhead)]
 fun test_add_subsidy_zero_epochs_ahead_fail() {
     let ctx = &mut tx_context::dummy();
-    let clock = clock::create_for_testing(ctx);
     let mut system = system_state_inner::new_for_testing();
 
     let subsidy = mint(1000, ctx);
@@ -78,6 +77,5 @@ fun test_add_subsidy_zero_epochs_ahead_fail() {
     // Test adding rewards for 0 epochs ahead (should fail)
     system.add_subsidy(subsidy, 0);
 
-    destroy(system);
-    clock.destroy_for_testing();
+    abort
 }

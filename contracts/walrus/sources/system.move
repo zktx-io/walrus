@@ -5,7 +5,7 @@
 /// Module: system
 module walrus::system;
 
-use sui::{balance::Balance, coin::Coin, dynamic_object_field};
+use sui::{balance::Balance, coin::Coin, dynamic_object_field, vec_map::VecMap};
 use wal::wal::WAL;
 use walrus::{
     blob::Blob,
@@ -161,6 +161,39 @@ public fun add_subsidy(system: &mut System, subsidy: Coin<WAL>, epochs_ahead: u3
     system.inner_mut().add_subsidy(subsidy, epochs_ahead)
 }
 
+// === Deny List Features ===
+
+/// Register a deny list update.
+public fun register_deny_list_update(
+    self: &mut System,
+    cap: &StorageNodeCap,
+    deny_list_root: u256,
+    deny_list_sequence: u64,
+) {
+    self.inner_mut().register_deny_list_update(cap, deny_list_root, deny_list_sequence)
+}
+
+/// Perform the update of the deny list.
+public fun update_deny_list(
+    self: &mut System,
+    cap: &mut StorageNodeCap,
+    signature: vector<u8>,
+    members_bitmap: vector<u8>,
+    message: vector<u8>,
+) {
+    self.inner_mut().update_deny_list(cap, signature, members_bitmap, message)
+}
+
+/// Delete a blob that is deny listed by f+1 members.
+public fun delete_deny_listed_blob(
+    self: &System,
+    signature: vector<u8>,
+    members_bitmap: vector<u8>,
+    message: vector<u8>,
+) {
+    self.inner().delete_deny_listed_blob(signature, members_bitmap, message)
+}
+
 // === Public Accessors ===
 
 /// Get epoch. Uses the committee to get the epoch.
@@ -202,8 +235,8 @@ public(package) fun committee_mut(self: &mut System): &mut BlsCommittee {
 public(package) fun advance_epoch(
     self: &mut System,
     new_committee: BlsCommittee,
-    new_epoch_params: EpochParams,
-): Balance<WAL> {
+    new_epoch_params: &EpochParams,
+): VecMap<ID, Balance<WAL>> {
     self.inner_mut().advance_epoch(new_committee, new_epoch_params)
 }
 
@@ -294,4 +327,9 @@ fun new_id(ctx: &mut TxContext): ID {
 #[test_only]
 public(package) fun new_package_id(system: &System): Option<ID> {
     system.new_package_id
+}
+
+#[test_only]
+public(package) fun destroy_for_testing(self: System) {
+    sui::test_utils::destroy(self);
 }

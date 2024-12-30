@@ -13,7 +13,14 @@ use prometheus::{
     Registry,
 };
 pub(crate) use telemetry::with_label;
-use walrus_sui::types::{BlobCertified, BlobEvent, ContractEvent, EpochChangeEvent, PackageEvent};
+use walrus_sui::types::{
+    BlobCertified,
+    BlobEvent,
+    ContractEvent,
+    DenyListEvent,
+    EpochChangeEvent,
+    PackageEvent,
+};
 
 use crate::{
     common::telemetry::{self, CurrentEpochMetric, CurrentEpochStateMetric},
@@ -150,6 +157,7 @@ impl TelemetryLabel for BlobEvent {
             BlobEvent::Certified(event) => event.label(),
             BlobEvent::Deleted(_) => "deleted",
             BlobEvent::InvalidBlobID(_) => "invalid-blob",
+            BlobEvent::DenyListBlobDeleted(_) => "deny-list-deleted",
         }
     }
 }
@@ -175,12 +183,22 @@ impl TelemetryLabel for PackageEvent {
     }
 }
 
+impl TelemetryLabel for DenyListEvent {
+    fn label(&self) -> &'static str {
+        match self {
+            DenyListEvent::DenyListUpdate(_) => "deny-list-updated",
+            DenyListEvent::RegisterDenyListUpdate(_) => "register-deny-list-update",
+        }
+    }
+}
+
 impl TelemetryLabel for ContractEvent {
     fn label(&self) -> &'static str {
         match self {
             ContractEvent::BlobEvent(event) => event.label(),
             ContractEvent::EpochChangeEvent(event) => event.label(),
             ContractEvent::PackageEvent(event) => event.label(),
+            ContractEvent::DenyListEvent(event) => event.label(),
         }
     }
 }

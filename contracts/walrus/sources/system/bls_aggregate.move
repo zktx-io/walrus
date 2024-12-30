@@ -87,7 +87,7 @@ public(package) fun new_bls_committee_member(
 // === Accessors for BlsCommitteeMember ===
 
 /// Get the node id of the committee member.
-public(package) fun node_id(self: &BlsCommitteeMember): sui::object::ID {
+public(package) fun node_id(self: &BlsCommitteeMember): ID {
     self.node_id
 }
 

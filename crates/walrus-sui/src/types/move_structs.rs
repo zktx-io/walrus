@@ -146,6 +146,15 @@ pub struct StorageNodeCap {
     pub last_epoch_sync_done: Epoch,
     /// The last event blob attestation from the storage node.
     pub last_event_blob_attestation: Option<EventBlobAttestation>,
+    #[cfg(feature = "walrus-mainnet")]
+    /// The root of the deny list.
+    pub deny_list_root: [u8; 32],
+    #[cfg(feature = "walrus-mainnet")]
+    /// The sequence number of the deny list.
+    pub deny_list_sequence_number: u64,
+    #[cfg(feature = "walrus-mainnet")]
+    /// The size of the deny list.
+    pub deny_list_size: u64,
 }
 
 impl AssociatedContractStruct for StorageNodeCap {
@@ -425,6 +434,7 @@ pub(crate) struct StakingInnerV1 {
     pub(crate) next_epoch_params: Option<EpochParams>,
     /// The state of the current epoch.
     pub(crate) epoch_state: EpochState,
+    #[cfg(not(feature = "walrus-mainnet"))]
     /// Rewards left over from the previous epoch that couldn't be distributed due to rounding.
     pub(crate) leftover_rewards: u64,
     #[cfg(feature = "walrus-mainnet")]
@@ -509,6 +519,9 @@ pub(crate) struct SystemStateInnerV1 {
     pub future_accounting: FutureAccountingRingBuffer,
     /// Event blob certification state.
     pub event_blob_certification_state: EventBlobCertificationState,
+    #[cfg(feature = "walrus-mainnet")]
+    /// Extended field with the size of the deny list for committee members.
+    pub deny_list_sized: ObjectID,
 }
 
 impl AssociatedContractStruct for SystemStateInnerV1 {

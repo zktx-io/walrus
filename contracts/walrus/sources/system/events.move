@@ -86,6 +86,28 @@ public struct ContractUpgraded has copy, drop {
     version: u64,
 }
 
+/// Signals that a Denylist update has started.
+public struct RegisterDenyListUpdate has copy, drop {
+    epoch: u32,
+    root: u256,
+    sequence_number: u64,
+    node_id: ID,
+}
+
+/// Signals that a Denylist update has been certified.
+public struct DenyListUpdate has copy, drop {
+    epoch: u32,
+    root: u256,
+    sequence_number: u64,
+    node_id: ID,
+}
+
+/// Signals that a blob was denylisted by f+1 nodes.
+public struct DenyListBlobDeleted has copy, drop {
+    epoch: u32,
+    blob_id: u256,
+}
+
 // === Functions to emit the events from other modules ===
 
 public(package) fun emit_blob_registered(
@@ -155,4 +177,26 @@ public(package) fun emit_shard_recovery_start(epoch: u32, shards: vector<u16>) {
 
 public(package) fun emit_contract_upgraded(epoch: u32, package_id: ID, version: u64) {
     event::emit(ContractUpgraded { epoch, package_id, version })
+}
+
+public(package) fun emit_register_deny_list_update(
+    epoch: u32,
+    root: u256,
+    sequence_number: u64,
+    node_id: ID,
+) {
+    event::emit(RegisterDenyListUpdate { epoch, root, sequence_number, node_id })
+}
+
+public(package) fun emit_deny_list_update(
+    epoch: u32,
+    root: u256,
+    sequence_number: u64,
+    node_id: ID,
+) {
+    event::emit(DenyListUpdate { epoch, root, sequence_number, node_id })
+}
+
+public(package) fun emit_deny_listed_blob_deleted(epoch: u32, blob_id: u256) {
+    event::emit(DenyListBlobDeleted { epoch, blob_id })
 }

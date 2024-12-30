@@ -857,6 +857,10 @@ impl StorageNode {
                 self.process_package_event(event_handle, package_event)
                     .await?;
             }
+            EventStreamElement::ContractEvent(ContractEvent::DenyListEvent(_event)) => {
+                // TODO: Implement DenyListEvent handling (WAL-424)
+                event_handle.mark_as_complete();
+            }
             EventStreamElement::CheckpointBoundary => {
                 event_handle.mark_as_complete();
             }
@@ -887,6 +891,13 @@ impl StorageNode {
             }
             BlobEvent::InvalidBlobID(event) => {
                 self.process_blob_invalid_event(event_handle, event).await?;
+            }
+            BlobEvent::DenyListBlobDeleted(_) => {
+                // TODO: WAL-424
+                // it's fine to panic here with a todo!, because in order to trigger this event, we
+                // need f+1 signatures and until the rust integration is implemented no such event
+                // should be emitted.
+                todo!("DenyListBlobDeleted event handling");
             }
         }
         Ok(())
