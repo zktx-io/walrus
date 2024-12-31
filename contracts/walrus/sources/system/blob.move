@@ -103,7 +103,7 @@ public struct BlobIdDerivation has drop {
 }
 
 /// Derives the blob_id for a blob given the root_hash, encoding_type and size.
-public(package) fun derive_blob_id(root_hash: u256, encoding_type: u8, size: u64): u256 {
+public fun derive_blob_id(root_hash: u256, encoding_type: u8, size: u64): u256 {
     let blob_id_struct = BlobIdDerivation {
         encoding_type,
         size,
@@ -308,4 +308,13 @@ public fun insert_or_update_metadata_pair(self: &mut Blob, key: String, value: S
 /// Aborts if the metadata does not exist.
 public fun remove_metadata_pair(self: &mut Blob, key: &String): (String, String) {
     self.metadata().remove(key)
+}
+
+#[test_only]
+public fun certify_with_certified_msg_for_testing(
+    blob: &mut Blob,
+    current_epoch: u32,
+    message: CertifiedBlobMessage,
+) {
+    certify_with_certified_msg(blob, current_epoch, message)
 }
