@@ -43,7 +43,7 @@ use crate::{
     contracts,
     types::{
         move_errors::MoveExecutionError,
-        move_structs::EpochState,
+        move_structs::{EpochState, SharedBlob},
         Blob,
         BlobEvent,
         Committee,
@@ -214,7 +214,7 @@ impl BlobPersistence {
 }
 
 /// The action to be performed for newly-created blobs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostStoreAction {
     /// Burn the blob object.
     Burn,
@@ -222,6 +222,21 @@ pub enum PostStoreAction {
     TransferTo(SuiAddress),
     /// Keep the blob object in the wallet that created it.
     Keep,
+    /// Put the blob into a shared blob object.
+    Share,
+}
+
+impl PostStoreAction {
+    /// Constructs [`Self`] based on the value of a `share` flag.
+    ///
+    /// If `share` is true, returns [`Self::Share`], otherwise returns [`Self::Keep`].
+    pub fn from_share(share: bool) -> Self {
+        if share {
+            Self::Share
+        } else {
+            Self::Keep
+        }
+    }
 }
 
 /// Result alias for functions returning a `SuiClientError`.
@@ -422,13 +437,15 @@ impl SuiContractClient {
 
     /// Certifies the specified blob on Sui, given a certificate that confirms its storage and
     /// returns the certified blob.
+    ///
+    /// If the post store action is `share`, returns a mapping blob ID -> shared_blob_object_id.
     // NB: This intentionally takes an owned `Blob` object even though it is not required, as the
     // corresponding object on Sui will be changed in the process.
     pub async fn certify_blobs(
         &self,
         blobs_with_certificates: &[(&Blob, ConfirmationCertificate)],
         post_store: PostStoreAction,
-    ) -> SuiClientResult<()> {
+    ) -> SuiClientResult<HashMap<BlobId, ObjectID>> {
         // Lock the wallet here to ensure there are no race conditions with object references.
         let wallet = self.wallet().await;
 
@@ -445,15 +462,53 @@ impl SuiContractClient {
                     pt_builder.burn_blob(blob.id.into()).await?;
                 }
                 PostStoreAction::Keep => (),
+                PostStoreAction::Share => {
+                    pt_builder.new_shared_blob(blob.id.into()).await?;
+                }
             }
         }
 
         let (ptb, _sui_cost) = pt_builder.finish().await?;
         let res = self.sign_and_send_ptb(&wallet, ptb, None).await?;
-        if res.errors.is_empty() {
-            Ok(())
+
+        if !res.errors.is_empty() {
+            return Err(anyhow!("could not certify blob: {:?}", res.errors).into());
+        }
+
+        if post_store != PostStoreAction::Share {
+            return Ok(HashMap::new());
+        }
+
+        // If the blobs are shared, create a mapping blob ID -> shared_blob_object_id.
+        let object_ids = get_created_sui_object_ids_by_type(
+            &res,
+            &contracts::shared_blob::SharedBlob
+                .to_move_struct_tag_with_type_map(&self.read_client.type_origin_map(), &[])?,
+        )?;
+        ensure!(
+            object_ids.len() == blobs_with_certificates.len(),
+            "unexpected number of shared blob objects created: {} (expected {})",
+            object_ids.len(),
+            blobs_with_certificates.len()
+        );
+
+        // If there is only one blob, we can directly return the mapping.
+        if object_ids.len() == 1 {
+            Ok(HashMap::from([(
+                blobs_with_certificates[0].0.blob_id,
+                object_ids[0],
+            )]))
         } else {
-            Err(anyhow!("could not certify blob: {:?}", res.errors).into())
+            // Fetch all SharedBlob objects and collect them as a mapping blob id
+            // to shared blob object id.
+            let shared_blobs = self
+                .sui_client()
+                .get_sui_objects::<SharedBlob>(object_ids)
+                .await?;
+            Ok(shared_blobs
+                .into_iter()
+                .map(|shared_blob| (shared_blob.blob.blob_id, shared_blob.id))
+                .collect())
         }
     }
 

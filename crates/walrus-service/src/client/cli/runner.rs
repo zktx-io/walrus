@@ -134,6 +134,7 @@ impl ClientCommandRunner {
                 dry_run,
                 force,
                 deletable,
+                share,
             } => {
                 self.store(
                     files,
@@ -141,6 +142,7 @@ impl ClientCommandRunner {
                     dry_run,
                     StoreWhen::always(force),
                     BlobPersistence::from_deletable(deletable),
+                    PostStoreAction::from_share(share),
                 )
                 .await
             }
@@ -301,6 +303,7 @@ impl ClientCommandRunner {
         dry_run: bool,
         store_when: StoreWhen,
         persistence: BlobPersistence,
+        post_store: PostStoreAction,
     ) -> Result<()> {
         let client = get_contract_client(self.config?, self.wallet, self.gas_budget, &None).await?;
 
@@ -323,6 +326,10 @@ impl ClientCommandRunner {
             fixed_params.max_epochs_ahead,
             epochs
         );
+
+        if persistence.is_deletable() && post_store == PostStoreAction::Share {
+            anyhow::bail!("deletable blobs cannot be shared");
+        }
 
         if dry_run {
             tracing::info!("performing dry-run store for {} files", files.len());
@@ -366,7 +373,7 @@ impl ClientCommandRunner {
                     epochs,
                     store_when,
                     persistence,
-                    PostStoreAction::Keep,
+                    post_store,
                 )
                 .await?;
             let blobs_len = blobs.len();

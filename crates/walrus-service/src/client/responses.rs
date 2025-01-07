@@ -110,6 +110,10 @@ pub enum BlobStoreResult {
         resource_operation: RegisterBlobOp,
         /// The storage cost, excluding gas.
         cost: u64,
+        /// The shared blob object ID if created.
+        #[serde_as(as = "Option<DisplayFromStr>")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shared_blob_object: Option<ObjectID>,
     },
     /// The blob is known to Walrus but was marked as invalid.
     ///
