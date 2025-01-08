@@ -7,7 +7,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+sui-types = ["dep:sui-types"]
 test-utils = ["walrus-test-utils"]
+walrus-mainnet = []
 
 [dependencies]
 base64.workspace = true
@@ -17,6 +19,7 @@ rand.workspace = true
 raptorq.workspace = true
 serde.workspace = true
 serde_with.workspace = true
+sui-types = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 utoipa = { workspace = true, optional = true }

@@ -47,7 +47,7 @@ test-utils = [
   "walrus-core/test-utils",
   "walrus-sui/test-utils",
 ]
-walrus-mainnet = ["walrus-sui/walrus-mainnet"]
+walrus-mainnet = ["walrus-core/walrus-mainnet", "walrus-sdk/walrus-mainnet", "walrus-sui/walrus-mainnet"]
 
 [dependencies]
 anyhow.workspace = true
@@ -120,7 +120,7 @@ typed-store = { workspace = true, optional = true }
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-redoc.workspace = true
 uuid.workspace = true
-walrus-core = { workspace = true, features = ["utoipa"] }
+walrus-core = { workspace = true, features = ["sui-types", "utoipa"] }
 walrus-sdk.workspace = true
 walrus-sui = { workspace = true, features = ["utoipa"] }
 walrus-test-utils = { workspace = true, optional = true }
