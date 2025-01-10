@@ -23,6 +23,8 @@ use super::{
     Secondary,
     WrongSymbolSizeError,
 };
+#[cfg(feature = "walrus-mainnet")]
+use crate::metadata::BlobMetadataApi as _;
 use crate::{
     merkle::{MerkleAuth, Node},
     metadata::BlobMetadata,
