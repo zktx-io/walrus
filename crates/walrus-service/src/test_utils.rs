@@ -723,7 +723,7 @@ impl StorageNodeHandleBuilder {
             protocol_key_pair: node_info.key_pair.into(),
             network_key_pair: node_info.network_key_pair.into(),
             rest_api_address: node_info.rest_api_address,
-            public_host: Some(node_info.rest_api_address.ip().to_string()),
+            public_host: node_info.rest_api_address.ip().to_string(),
             blocklist_path: self.blocklist_path,
             disable_event_blob_writer: self.disable_event_blob_writer,
             ..storage_node_config().inner
@@ -858,7 +858,7 @@ impl StorageNodeHandleBuilder {
             protocol_key_pair: node_info.key_pair.into(),
             network_key_pair: node_info.network_key_pair.into(),
             rest_api_address: node_info.rest_api_address,
-            public_host: Some(node_info.rest_api_address.ip().to_string()),
+            public_host: node_info.rest_api_address.ip().to_string(),
             event_provider_config: EventProviderConfig::CheckpointBasedEventProcessor(None),
             disable_event_blob_writer,
             sui: Some(SuiConfig {
@@ -2268,7 +2268,7 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
     let rest_api_address = unused_socket_address(false);
     WithTempDir {
         inner: StorageNodeConfig {
-            name: Some("node".to_string()),
+            name: "node".to_string(),
             protocol_key_pair: walrus_core::test_utils::protocol_key_pair().into(),
             network_key_pair: walrus_core::test_utils::network_key_pair().into(),
             rest_api_address,
@@ -2293,10 +2293,10 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
                 write_price: 1,
                 node_capacity: 1_000_000_000,
             },
-            public_host: Some(rest_api_address.ip().to_string()),
-            public_port: Some(rest_api_address.port()),
+            public_host: rest_api_address.ip().to_string(),
+            public_port: rest_api_address.port(),
             metrics_push: None,
-            metadata: None,
+            metadata: Default::default(),
         },
         temp_dir,
     }

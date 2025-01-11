@@ -13,22 +13,24 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use config::PathOrInPlace;
-use fastcrypto::traits::KeyPair;
 use fs::File;
 use humantime::Duration;
 use prometheus::Registry;
 use sui_sdk::wallet_context::WalletContext;
-use sui_types::base_types::ObjectID;
+use sui_types::base_types::{ObjectID, SuiAddress};
 use tokio::{
     runtime::{self, Runtime},
     sync::oneshot,
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use walrus_core::keys::{NetworkKeyPair, ProtocolKeyPair};
+use walrus_core::{
+    keys::{NetworkKeyPair, ProtocolKeyPair},
+    Epoch,
+};
 use walrus_service::{
     node::{
         config::{
@@ -74,37 +76,18 @@ struct Args {
 #[derive(Subcommand, Debug, Clone)]
 #[clap(rename_all = "kebab-case")]
 enum Commands {
-    /// Generate Sui wallet, keys, and configuration for a Walrus node.
+    /// Generate Sui wallet, keys, and configuration for a Walrus node and optionally generates a
+    /// YAML file that can be used to register the node by a third party.
     ///
-    /// This overwrites existing files in the configuration directory.
-    /// Fails if the specified directory does not exist yet.
-    Setup {
-        #[clap(long)]
-        /// The path to the directory in which to set up wallet and node configuration.
-        config_directory: PathBuf,
-        #[clap(long)]
-        /// The path where the Walrus database will be stored.
-        storage_path: PathBuf,
-        /// Sui network for which the config is generated.
-        ///
-        /// Available options are `devnet`, `testnet`, and `localnet`.
-        #[clap(long, default_value = "testnet")]
-        sui_network: SuiNetwork,
-        /// Timeout for the faucet call.
-        #[clap(long, default_value = "1min")]
-        faucet_timeout: Duration,
-        #[clap(flatten)]
-        config_args: ConfigArgs,
-    },
+    /// Attempts to create the specified directory. Fails if the directory is not empty (unless the
+    /// `--force` option is provided).
+    Setup(SetupArgs),
 
     /// Register a new node with the Walrus storage network.
     Register {
         /// The path to the node's configuration file.
         #[clap(long)]
         config_path: PathBuf,
-        /// The name of the node.
-        #[clap(long)]
-        name: Option<String>,
     },
 
     /// Run a storage node with the provided configuration.
@@ -141,6 +124,9 @@ enum Commands {
         path_args: PathArgs,
         #[clap(flatten)]
         config_args: ConfigArgs,
+        /// Overwrite existing files.
+        #[clap(long)]
+        force: bool,
     },
 
     /// Repair a corrupted RocksDB database due to non-clean shutdowns.
@@ -194,13 +180,50 @@ impl KeyType {
 }
 
 #[derive(Debug, Clone, clap::Args)]
+struct SetupArgs {
+    #[clap(long)]
+    /// The path to the directory in which to set up wallet and node configuration.
+    config_directory: PathBuf,
+    #[clap(long)]
+    /// The path where the Walrus database will be stored.
+    storage_path: PathBuf,
+    /// Sui network for which the config is generated.
+    ///
+    /// Available options are `devnet`, `testnet`, and `localnet`.
+    #[clap(long, default_value = "testnet")]
+    sui_network: SuiNetwork,
+    /// Whether to attempt to get SUI tokens from the faucet.
+    #[clap(long, action)]
+    use_faucet: bool,
+    /// Timeout for the faucet call.
+    #[clap(long, default_value = "1min", requires = "use_faucet")]
+    faucet_timeout: Duration,
+    #[clap(flatten)]
+    config_args: ConfigArgs,
+    /// Overwrite existing files.
+    #[clap(long)]
+    force: bool,
+    /// The wallet address of the third party that will register the node.
+    ///
+    /// If this is set, a YAML file is generated that can be used to register the node by a
+    /// third party.
+    #[clap(long)]
+    registering_third_party: Option<SuiAddress>,
+    /// The epoch at which the node will be registered.
+    #[clap(long, requires = "registering_third_party", default_value_t = 0)]
+    registration_epoch: Epoch,
+}
+
+#[derive(Debug, Clone, clap::Args)]
 struct ConfigArgs {
     #[clap(long)]
-    /// Object ID of the Walrus system object.
-    system_object: ObjectID,
+    /// Object ID of the Walrus system object. If not provided, a dummy value is used and the
+    /// system object needs to be manually added to the configuration file at a later time.
+    system_object: Option<ObjectID>,
     #[clap(long)]
-    /// Object ID of the Walrus staking object.
-    staking_object: ObjectID,
+    /// Object ID of the Walrus staking object. If not provided, a dummy value is used and the
+    /// staking object needs to be manually added to the configuration file at a later time.
+    staking_object: Option<ObjectID>,
     #[clap(long)]
     /// Initial storage capacity of this node in bytes.
     ///
@@ -211,6 +234,9 @@ struct ConfigArgs {
     #[clap(long)]
     /// The host name or public IP address of the node.
     public_host: String,
+    /// The name of the storage node used in the registration.
+    #[clap(long)]
+    name: String,
     // ***************************
     //   Optional fields below
     // ***************************
@@ -247,15 +273,22 @@ struct ConfigArgs {
     #[clap(long, default_value_t = 0)]
     /// The commission rate of the storage node, in basis points.
     commission_rate: u16,
-    #[clap(long)]
-    /// The name of the storage node used in the registration.
-    name: Option<String>,
+    /// The image URL of the storage node.
+    #[clap(long, default_value = "")]
+    image_url: String,
+    /// The project URL of the storage node.
+    #[clap(long, default_value = "")]
+    project_url: String,
+    /// The description of the storage node.
+    #[clap(long, default_value = "")]
+    description: String,
 }
 
 #[derive(Debug, Clone, clap::Args)]
 struct PathArgs {
     #[clap(long)]
-    /// The output path for the generated configuration file.
+    /// The output path for the generated configuration file. If the file already exists, it is
+    /// not overwritten and the operation will fail unless the `--force` option is provided.
     config_path: PathBuf,
     #[clap(long)]
     /// The path where the Walrus database will be stored.
@@ -279,21 +312,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     match args.command {
-        Commands::Setup {
-            config_directory,
-            storage_path,
-            sui_network,
-            faucet_timeout,
-            config_args,
-        } => commands::setup(
-            config_directory,
-            storage_path,
-            sui_network,
-            faucet_timeout.into(),
-            config_args,
-        )?,
+        Commands::Setup(setup_args) => commands::setup(setup_args)?,
 
-        Commands::Register { config_path, name } => commands::register_node(config_path, name)?,
+        Commands::Register { config_path } => commands::register_node(config_path)?,
 
         Commands::Run {
             config_path,
@@ -314,7 +335,10 @@ fn main() -> anyhow::Result<()> {
         Commands::GenerateConfig {
             path_args,
             config_args,
-        } => commands::generate_config(path_args, config_args)?,
+            force,
+        } => {
+            commands::generate_config(path_args, config_args, force)?;
+        }
 
         Commands::RepairDb { db_path } => commands::repair_db(db_path)?,
     }
@@ -322,10 +346,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 mod commands {
-
-    use std::time::Duration;
-
-    use config::EventProviderConfig;
+    use config::{EventProviderConfig, NodeRegistrationParamsForThirdPartyRegistration};
     use rocksdb::{Options, DB};
     #[cfg(not(msim))]
     use tokio::task::JoinSet;
@@ -333,7 +354,7 @@ mod commands {
     use walrus_service::utils;
     use walrus_sui::{
         client::{contract_config::ContractConfig, ReadClient as _},
-        types::NetworkAddress,
+        types::NodeMetadata,
     };
     use walrus_utils::backoff::ExponentialBackoffConfig;
 
@@ -367,16 +388,15 @@ mod commands {
         });
 
         tracing::info!(version = VERSION, "Walrus binary version");
+        config.load_keys()?;
         tracing::info!(
-            walrus.node.public_key = %config.protocol_key_pair.load()?.as_ref().public(),
+            walrus.node.public_key = %config.protocol_key_pair().public(),
             "Walrus protocol public key",
         );
-        // Load the network_key_pair so that it can be passed to the
-        // MetricPushRuntime.
-        let network_key_pair = config.network_key_pair.load()?;
+        let network_key_pair = config.network_key_pair().clone();
         tracing::info!(
-            walrus.node.network_key = %network_key_pair.as_ref().public(),
-            "Walrus network key",
+            walrus.node.network_key = %network_key_pair.public(),
+            "Walrus network public key",
         );
         tracing::info!(
             metrics_address = %config.metrics_address, "started Prometheus HTTP endpoint",
@@ -511,12 +531,8 @@ mod commands {
             "Generating {key_type} key pair and writing it to '{}'",
             path.display()
         );
-        let mut file = if force {
-            File::create(path)
-        } else {
-            File::create_new(path)
-        }
-        .with_context(|| format!("Cannot create the keyfile '{}'", path.display()))?;
+        let mut file = create_file(path, force)
+            .with_context(|| format!("Cannot create the keyfile '{}'", path.display()))?;
 
         file.write_all(
             match key_type {
@@ -530,43 +546,25 @@ mod commands {
     }
 
     #[tokio::main]
-    pub(crate) async fn register_node(
-        config_path: PathBuf,
-        name: Option<String>,
-    ) -> anyhow::Result<()> {
+    pub(crate) async fn register_node(config_path: PathBuf) -> anyhow::Result<()> {
         let mut config = StorageNodeConfig::load(&config_path)?;
-        let node_name = name.or(config.name.clone()).ok_or(anyhow!(
-            "Name is required to register a node. Set it in the config file or provide it as a \
-                command-line argument."
-        ))?;
 
-        config.protocol_key_pair.load()?;
-        config.network_key_pair.load()?;
+        config.load_keys()?;
 
         // If we have an IP address, use a SocketAddr to get the string representation
         // as IPv6 addresses are enclosed in square brackets.
-        let Some(public_host) = config.public_host.clone() else {
-            bail!("The 'public_host' must be set in the configuration file.");
-        };
         ensure!(
-            !public_host.contains(':'),
+            !config.public_host.contains(':'),
             "DNS names must not contain ':'; the public port can be specified in the config file \
                 with the `public_port` parameter."
         );
-        let public_port = config.public_port.unwrap_or(REST_API_PORT);
-        let public_address = if let Ok(ip_addr) = IpAddr::from_str(&public_host) {
-            NetworkAddress(SocketAddr::new(ip_addr, public_port).to_string())
-        } else {
-            NetworkAddress(format!("{}:{}", public_host, public_port))
-        };
-        let registration_params = config.to_registration_params(public_address, node_name);
+        let registration_params = config.to_registration_params();
 
         // Uses the Sui wallet configuration in the storage node config to register the node.
         let contract_client = get_contract_client_from_node_config(&config).await?;
         let proof_of_possession = walrus_sui::utils::generate_proof_of_possession(
             config.protocol_key_pair(),
             &contract_client,
-            &registration_params,
             contract_client.current_epoch().await?,
         );
 
@@ -604,8 +602,12 @@ mod commands {
             write_price,
             commission_rate,
             name,
+            image_url,
+            project_url,
+            description,
         }: ConfigArgs,
-    ) -> anyhow::Result<()> {
+        force: bool,
+    ) -> anyhow::Result<StorageNodeConfig> {
         let sui_rpc = if let Some(rpc) = sui_rpc {
             rpc
         } else {
@@ -636,14 +638,29 @@ mod commands {
                 '--public-port' option."
         );
 
+        let system_object = system_object.unwrap_or_else(|| {
+            tracing::warn!(
+                "no system object provided; \
+                please replace the dummy value in the config file manually"
+            );
+            ObjectID::ZERO
+        });
+        let staking_object = staking_object.unwrap_or_else(|| {
+            tracing::warn!(
+                "no staking object provided; \
+                please replace the dummy value in the config file manually"
+            );
+            ObjectID::ZERO
+        });
         let contract_config = ContractConfig::new(system_object, staking_object);
+        let metadata = NodeMetadata::new(image_url, project_url, description);
 
         let config = StorageNodeConfig {
             storage_path,
             protocol_key_pair: PathOrInPlace::from_path(protocol_key_path),
             network_key_pair: PathOrInPlace::from_path(network_key_path),
-            public_host: Some(public_host),
-            public_port: Some(public_port),
+            public_host,
+            public_port,
             rest_api_address,
             metrics_address,
             sui: Some(SuiConfig {
@@ -663,19 +680,29 @@ mod commands {
             event_provider_config,
             disable_event_blob_writer,
             name,
+            metadata,
             ..Default::default()
         };
 
         // Generate and write config file.
         let yaml_config =
-            serde_yaml::to_string(&config).context("Failed to serialize configuration to YAML")?;
-        fs::write(&config_path, yaml_config)
-            .context("Failed to write the generated configuration to a file")?;
+            serde_yaml::to_string(&config).context("failed to serialize configuration to YAML")?;
+        let mut file = create_file(&config_path, force).with_context(|| {
+            format!(
+                "failed to create the config file '{}'",
+                config_path.display()
+            )
+        })?;
+        file.write_all(yaml_config.as_bytes()).context(format!(
+            "failed to write the generated configuration to '{}'",
+            config_path.display()
+        ))?;
         println!(
-            "Storage node configuration written to '{}'",
+            "storage node configuration written to '{}'",
             config_path.display()
         );
-        Ok(())
+
+        Ok(config)
     }
 
     pub fn repair_db(db_path: PathBuf) -> anyhow::Result<()> {
@@ -689,12 +716,29 @@ mod commands {
 
     #[tokio::main]
     pub(crate) async fn setup(
-        config_directory: PathBuf,
-        storage_path: PathBuf,
-        sui_network: SuiNetwork,
-        faucet_timeout: Duration,
-        config_args: ConfigArgs,
+        SetupArgs {
+            config_directory,
+            storage_path,
+            sui_network,
+            use_faucet,
+            faucet_timeout,
+            config_args,
+            force,
+            registering_third_party,
+            registration_epoch,
+        }: SetupArgs,
     ) -> anyhow::Result<()> {
+        fs::create_dir_all(&config_directory).context(format!(
+            "failed to create the config directory '{}'",
+            config_directory.display()
+        ))?;
+        if !force && config_directory.read_dir()?.next().is_some() {
+            bail!(
+                "the specified configuration directory '{}' is not empty; \
+                use the '--force' option to overwrite existing files",
+                config_directory.display()
+            );
+        }
         let config_path = config_directory.join("walrus-node.yaml");
         let protocol_key_path = config_directory.join("protocol.key");
         let network_key_path = config_directory.join("network.key");
@@ -708,14 +752,19 @@ mod commands {
         keygen(&protocol_key_path, KeyType::Protocol, true)?;
         keygen(&network_key_path, KeyType::Network, true)?;
 
-        let wallet_address =
-            utils::generate_sui_wallet(sui_network, &wallet_config, faucet_timeout).await?;
+        let wallet_address = utils::generate_sui_wallet(
+            sui_network,
+            &wallet_config,
+            use_faucet,
+            faucet_timeout.into(),
+        )
+        .await?;
         println!(
             "Successfully generated a new Sui wallet with address {}",
             wallet_address
         );
 
-        generate_config(
+        let mut config = generate_config(
             PathArgs {
                 config_path,
                 storage_path,
@@ -724,7 +773,47 @@ mod commands {
                 wallet_config,
             },
             config_args,
-        )
+            force,
+        )?;
+
+        if let Some(registering_third_party) = registering_third_party {
+            let registration_params_path = config_directory.join("registration-params.yaml");
+            config.load_keys()?;
+            let proof_of_possession = walrus_sui::utils::generate_proof_of_possession_for_address(
+                config.protocol_key_pair(),
+                registering_third_party,
+                registration_epoch,
+            );
+            let registration_params = NodeRegistrationParamsForThirdPartyRegistration {
+                node_registration_params: config.to_registration_params(),
+                proof_of_possession,
+                wallet_address,
+            };
+            let yaml_config = serde_yaml::to_string(&registration_params)
+                .context("failed to serialize registration parameters to YAML")?;
+            let mut file = create_file(&registration_params_path, force).with_context(|| {
+                format!(
+                    "failed to create the registration parameters file '{}'",
+                    registration_params_path.display()
+                )
+            })?;
+            file.write_all(yaml_config.as_bytes()).context(format!(
+                "failed to write the generated registration parameters to '{}'",
+                registration_params_path.display()
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    /// Creates a new file at the given path. If force is true, overwrites any existing file.
+    /// Otherwise, fails if the file already exists.
+    fn create_file(path: &Path, force: bool) -> Result<File, std::io::Error> {
+        if force {
+            File::create(path)
+        } else {
+            File::create_new(path)
+        }
     }
 }
 
