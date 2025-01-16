@@ -31,6 +31,7 @@ use walrus_core::{
     BlobId,
     Epoch,
     EpochCount,
+    ShardIndex,
     Sliver,
 };
 use walrus_sdk::{api::BlobStatus, error::NodeError};
@@ -1539,6 +1540,19 @@ impl<T> Client<T> {
             }
         }
         Ok(())
+    }
+
+    /// Returns the shards of the given node in the write committee.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn shards_of(&self, node_names: &[String]) -> Vec<ShardIndex> {
+        let committees = self.committees.read().await;
+        committees
+            .write_committee()
+            .members()
+            .iter()
+            .filter(|node| node_names.contains(&node.name))
+            .flat_map(|node| node.shard_ids.clone())
+            .collect::<Vec<_>>()
     }
 
     /// Maps the sliver pairs to the node in the write committee that holds their shard.
