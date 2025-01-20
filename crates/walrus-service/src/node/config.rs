@@ -379,6 +379,8 @@ pub struct ShardSyncConfig {
     pub blob_certified_check_interval: Duration,
     /// The number of metadata to fetch in parallel.
     pub max_concurrent_metadata_fetch: usize,
+    /// Maximum number of concurrent shard syncs allowed per node.
+    pub shard_sync_concurrency: usize,
 }
 
 impl Default for ShardSyncConfig {
@@ -390,6 +392,7 @@ impl Default for ShardSyncConfig {
             max_concurrent_blob_recovery_during_shard_recovery: 5,
             blob_certified_check_interval: Duration::from_secs(60),
             max_concurrent_metadata_fetch: 10,
+            shard_sync_concurrency: 10,
         }
     }
 }

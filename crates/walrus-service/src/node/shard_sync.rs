@@ -9,7 +9,7 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 #[cfg(msim)]
 use sui_macros::{fail_point_arg, fail_point_if};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use walrus_core::{BlobId, ShardIndex};
 use walrus_sdk::error::ServiceError;
 use walrus_utils::backoff::{self, ExponentialBackoff};
@@ -29,6 +29,7 @@ pub struct ShardSyncHandler {
     node: Arc<StorageNodeInner>,
     shard_sync_in_progress: Arc<Mutex<HashMap<ShardIndex, tokio::task::JoinHandle<()>>>>,
     task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    shard_sync_semaphore: Arc<Semaphore>,
     config: ShardSyncConfig,
 }
 
@@ -38,6 +39,7 @@ impl ShardSyncHandler {
             node,
             shard_sync_in_progress: Arc::new(Mutex::new(HashMap::new())),
             task_handle: Arc::new(Mutex::new(None)),
+            shard_sync_semaphore: Arc::new(Semaphore::new(config.shard_sync_concurrency)),
             config,
         }
     }
@@ -294,7 +296,6 @@ impl ShardSyncHandler {
             current_epoch
         );
 
-        // TODO(#705): implement rate limiting for shard syncs.
         let mut shard_sync_in_progress = self.shard_sync_in_progress.lock().await;
         let Entry::Vacant(entry) = shard_sync_in_progress.entry(shard_storage.id()) else {
             // We have checked the shard_sync_in_progress map before starting the sync task. So,
@@ -322,6 +323,17 @@ impl ShardSyncHandler {
             let directly_recover_shard = Arc::new(Mutex::new(false));
 
             backoff::retry(backoff, || async {
+                // The rate limit is enforced by the semaphore, without considering
+                // the priority of the syncs.
+                let Ok(_permit) = shard_sync_handler_clone
+                    .shard_sync_semaphore
+                    .acquire()
+                    .await
+                else {
+                    tracing::error!("failed to acquire shard sync semaphore.");
+                    return false;
+                };
+
                 metrics::with_label!(node_clone.metrics.shard_sync_total, "start").inc();
                 let recover_shard = *directly_recover_shard.lock().await;
                 let sync_result = shard_storage
@@ -332,7 +344,6 @@ impl ShardSyncHandler {
                         recover_shard,
                     )
                     .await;
-
                 match sync_result {
                     Ok(_) => {
                         metrics::with_label!(node_clone.metrics.shard_sync_total, "complete").inc();
