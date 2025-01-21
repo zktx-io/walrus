@@ -73,6 +73,7 @@ axum = { workspace = true, features = [
   "tower-log",
   "tracing",
 ] }
+axum-extra = { version = "0.9.6", features = ["typed-header"] }
 axum-server = { workspace = true, features = ["tls-rustls-no-provider"] }
 bcs.workspace = true
 byteorder.workspace = true
@@ -91,6 +92,7 @@ indicatif.workspace = true
 indoc.workspace = true
 integer-encoding.workspace = true
 itertools.workspace = true
+jsonwebtoken = "9.2.0"
 mime = { workspace = true, optional = true }
 move-core-types.workspace = true
 mysten-metrics = { workspace = true, optional = true }
@@ -100,6 +102,7 @@ p256.workspace = true
 pin-project.workspace = true
 prettytable = { workspace = true, optional = true }
 prometheus.workspace = true
+querystr = "1.1.1"
 rand.workspace = true
 rcgen.workspace = true
 regex.workspace = true
@@ -142,7 +145,10 @@ walrus-test-utils = { workspace = true, optional = true }
 walrus-utils.workspace = true
 
 [dev-dependencies]
+hex = "0.4.3"
+http-body-util = "0.1.1"
 mockall.workspace = true
+ring = "0.17.8"
 tempfile.workspace = true
 walrus-core = { workspace = true, features = ["test-utils"] }
 walrus-proc-macros = { workspace = true, features = ["walrus-simtest"] }

@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
+use jsonwebtoken::Algorithm;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 use sui_types::base_types::ObjectID;
@@ -22,6 +23,7 @@ use walrus_sui::{
 };
 
 use super::{parse_blob_id, read_blob_from_file, BlobIdDecimal, HumanReadableBytes};
+use crate::client::config::AuthConfig;
 
 /// The command-line arguments for the Walrus client.
 #[derive(Parser, Debug, Clone, Deserialize)]
@@ -555,6 +557,37 @@ pub struct PublisherArgs {
     #[clap(long, action)]
     #[serde(default)]
     pub keep: bool,
+    /// If set, the publisher will verify the JWT token.
+    ///
+    /// If not specified, the verification is disabled.
+    /// This is useful, e.g., in case the API Gateway has already checked the token.
+    /// The secret can be hex string, starting with `0x`.
+    #[clap(long)]
+    #[serde(default)]
+    pub jwt_decode_secret: Option<String>,
+    /// If unset, the JWT authentication algorithm will be HMAC.
+    ///
+    /// The following algorithms are supported: "HS256", "HS384", "HS512", "ES256", "ES384",
+    /// "RS256", "RS384", "PS256", "PS384", "PS512", "RS512", "EdDSA".
+    #[clap(long)]
+    #[serde(default)]
+    pub jwt_algorithm: Option<Algorithm>,
+    /// If set and greater than 0, the publisher will check if the JWT token is expired based on
+    /// the "issued at" (`iat`) value.
+    #[clap(long)]
+    #[serde(default)]
+    pub jwt_expiring_sec: u64,
+    /// If set, the publisher will verify that the requested upload matches the claims in the JWT.
+    ///
+    /// Specifically, the publisher will:
+    /// - Verify that the number of `epochs` in query is the the same as `epochs` in the JWT, if
+    ///   present;
+    /// - Verify that the `send_object_to` field in the query is the same as the `send_object_to`
+    ///   in the JWT, if present;
+    // TODO: /// - Verify the size/hash of uploaded file
+    #[clap(long)]
+    #[serde(default)]
+    pub jwt_verify_upload: bool,
 }
 
 impl PublisherArgs {
@@ -579,6 +612,24 @@ impl PublisherArgs {
             max_body_size = self.format_max_body_size(),
             message
         );
+    }
+
+    pub(crate) fn generate_auth_config(&mut self) -> Result<Option<AuthConfig>> {
+        if self.jwt_decode_secret.is_some() || self.jwt_expiring_sec > 0 || self.jwt_verify_upload {
+            let mut config = self
+                .jwt_decode_secret
+                .take()
+                .map(AuthConfig::new)
+                .unwrap_or(Ok(AuthConfig::default()))?;
+            config.expiring_sec = self.jwt_expiring_sec;
+            config.verify_upload = self.jwt_verify_upload;
+            config.algorithm = self.jwt_algorithm;
+            tracing::info!("Auth config applied: {config:?}");
+            Ok(Some(config))
+        } else {
+            tracing::info!("Auth disabled");
+            Ok(None)
+        }
     }
 }
 
@@ -970,6 +1021,10 @@ mod tests {
                 wal_refill_amount: default::wal_refill_amount(),
                 sub_wallets_min_balance: default::sub_wallets_min_balance(),
                 keep: false,
+                jwt_decode_secret: None,
+                jwt_algorithm: None,
+                jwt_expiring_sec: 0,
+                jwt_verify_upload: false,
             },
         })
     }

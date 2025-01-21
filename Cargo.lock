@@ -5505,13 +5505,14 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "8.3.0"
+version = "9.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6971da4d9c3aa03c3d8f3ff0f4155b534aad021292003895a469716b2a230378"
+checksum = "b9ae10193d25051e74945f1ea2d0b42e03cc3b890f7e4cc5faa44997d808193f"
 dependencies = [
  "base64 0.21.7",
- "pem 1.1.1",
- "ring 0.16.20",
+ "js-sys",
+ "pem",
+ "ring 0.17.8",
  "serde",
  "serde_json",
  "simple_asn1",
@@ -8534,6 +8535,12 @@ dependencies = [
  "web-sys",
  "winapi",
 ]
+
+[[package]]
+name = "querystr"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a08e2b842d3aaf98316ed56c8dffdd2046d596404a956ef43094f6355c9f1d3"
 
 [[package]]
 name = "quick-error"
@@ -14114,6 +14121,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.7.9",
+ "axum-extra",
  "axum-server 0.7.1",
  "bcs",
  "byteorder",
@@ -14125,13 +14133,16 @@ dependencies = [
  "futures",
  "futures-util",
  "git-version",
+ "hex",
  "home",
+ "http-body-util",
  "hostname",
  "humantime",
  "indicatif",
  "indoc",
  "integer-encoding 4.0.2",
  "itertools 0.13.0",
+ "jsonwebtoken",
  "mime",
  "mockall 0.12.1",
  "move-core-types",
@@ -14142,10 +14153,12 @@ dependencies = [
  "pin-project",
  "prettytable",
  "prometheus",
+ "querystr",
  "rand 0.8.5",
  "rcgen",
  "regex",
  "reqwest 0.12.12",
+ "ring 0.17.8",
  "rocksdb",
  "rustls 0.23.21",
  "serde",
