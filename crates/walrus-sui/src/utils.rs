@@ -25,10 +25,10 @@ use sui_sdk::{
     SuiClient,
 };
 use sui_types::{
-    base_types::{ObjectRef, SuiAddress},
+    base_types::SuiAddress,
     crypto::SignatureScheme,
     programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{ProgrammableTransaction, TransactionData},
+    transaction::TransactionData,
 };
 use walrus_core::{
     encoding::encoded_blob_length_for_n_shards,
@@ -276,29 +276,6 @@ impl std::fmt::Display for SuiNetwork {
     }
 }
 
-/// Sign and send a [`ProgrammableTransaction`].
-pub async fn sign_and_send_ptb(
-    sender: SuiAddress,
-    wallet: &WalletContext,
-    programmable_transaction: ProgrammableTransaction,
-    gas_coins: Vec<ObjectRef>,
-    gas_budget: u64,
-) -> anyhow::Result<SuiTransactionBlockResponse> {
-    let gas_price = wallet.get_reference_gas_price().await?;
-
-    let transaction = TransactionData::new_programmable(
-        sender,
-        gas_coins,
-        programmable_transaction,
-        gas_budget,
-        gas_price,
-    );
-
-    let transaction = wallet.sign_transaction(&transaction);
-
-    wallet.execute_transaction_may_fail(transaction).await
-}
-
 /// Loads a sui wallet from `config_path`.
 pub fn load_wallet(config_path: Option<PathBuf>) -> Result<WalletContext> {
     let config_path =
@@ -405,7 +382,7 @@ pub async fn request_sui_from_faucet(
 
 /// Gets 1 SUI for `address` from the provided wallet if the wallet has at least 2 SUI, otherwise
 /// request SUI from the faucet.
-// TODO(WAL-529): Refactor and completely remove the faucet from the deploymentflow.
+// TODO(WAL-529): Refactor and completely remove the faucet from the deployment flow.
 pub async fn get_sui_from_wallet_or_faucet(
     address: SuiAddress,
     wallet: &mut WalletContext,
@@ -422,7 +399,7 @@ pub async fn get_sui_from_wallet_or_faucet(
     if balance.total_balance >= 3 * one_sui as u128 {
         let mut ptb = ProgrammableTransactionBuilder::new();
         ptb.transfer_sui(address, Some(one_sui));
-        let tx = ptb.finish();
+        let ptb = ptb.finish();
         let gas_budget = one_sui / 2;
         let gas_coins = wallet
             .get_client()
@@ -433,7 +410,17 @@ pub async fn get_sui_from_wallet_or_faucet(
             .iter()
             .map(|coin| coin.object_ref())
             .collect();
-        sign_and_send_ptb(sender, wallet, tx, gas_coins, gas_budget).await?;
+
+        let transaction = TransactionData::new_programmable(
+            sender,
+            gas_coins,
+            ptb,
+            gas_budget,
+            wallet.get_reference_gas_price().await?,
+        );
+        wallet
+            .execute_transaction_may_fail(wallet.sign_transaction(&transaction))
+            .await?;
         Ok(())
     } else {
         request_sui_from_faucet(address, network, &wallet.get_client().await?).await?;
