@@ -403,12 +403,17 @@ pub enum CliCommands {
         #[clap(long)]
         amount: u64,
     },
-    /// Extend a shared blob.
+    /// Extend an owned or shared blob.
     Extend {
-        /// The object ID of the shared blob to extend.
+        /// The object ID of the blob to extend.
         #[clap(long)]
-        shared_blob_obj_id: ObjectID,
-        /// The number of epochs to extend the shared blob for.
+        blob_obj_id: ObjectID,
+
+        /// If the blob_obj_id refers to a shared blob object, this flag must be present.
+        #[clap(long)]
+        shared: bool,
+
+        /// The number of epochs to extend the blob for.
         ///
         /// If set to `max`, the blob is stored for the maximum number of epochs allowed by the
         /// system object on chain. Otherwise, the blob is stored for the specified number of
