@@ -79,6 +79,7 @@ skip = [
 ]
 skip-tree = [
   # Mysten's libraries pull in several conflicting repo versions.
+  { name = "axum", depth = 4 },
   { name = "fastcrypto", depth = 4 },
   { name = "sui", depth = 6 },
   { name = "test-cluster", depth = 6 },
