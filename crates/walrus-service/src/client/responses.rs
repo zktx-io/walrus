@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow;
 use serde::{Deserialize, Serialize};
 use serde_with::{base64::Base64, serde_as, DisplayFromStr};
 use sui_types::{
@@ -35,7 +36,10 @@ use walrus_core::{
     PublicKey,
     ShardIndex,
 };
-use walrus_sdk::api::BlobStatus;
+use walrus_sdk::{
+    api::{BlobStatus, ServiceHealthInfo},
+    client::Client,
+};
 use walrus_sui::{
     client::ReadClient,
     types::{Blob, Committee, NetworkAddress, StakedWal, StorageNode},
@@ -45,7 +49,7 @@ use walrus_sui::{
 };
 
 use super::{
-    cli::{BlobIdDecimal, HumanReadableBytes},
+    cli::{BlobIdDecimal, HumanReadableBytes, NodeSelection},
     resource::RegisterBlobOp,
 };
 use crate::client::cli::{format_event_id, HumanReadableFrost};
@@ -636,4 +640,128 @@ pub struct FundSharedBlobOutput {
 pub struct ExtendBlobOutput {
     /// The number of epochs extended by.
     pub epochs_ahead: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// The health information of a storage node.
+pub(crate) struct NodeHealthOutput {
+    pub node_id: ObjectID,
+    pub node_url: String,
+    pub node_name: String,
+    /// The health information of the service.
+    pub health_info: Result<ServiceHealthInfo, String>,
+}
+
+impl NodeHealthOutput {
+    pub async fn new(node: StorageNode, detail: bool) -> Self {
+        let client = Client::for_storage_node(&node.network_address.0, &node.network_public_key);
+        let health_info = match client {
+            Ok(client) => client
+                .get_server_health_info(detail)
+                .await
+                .map_err(|err| format!("failed to get health info: {:?}", err)),
+            Err(err) => Err(format!("failed to build client: {:?}", err)),
+        };
+
+        Self {
+            node_id: node.node_id,
+            node_url: node.network_address.0.clone(),
+            node_name: node.name,
+            health_info,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// The output of the `walrus health` command.
+pub(crate) struct ServiceHealthInfoOutput {
+    pub health_info: Vec<NodeHealthOutput>,
+}
+
+impl ServiceHealthInfoOutput {
+    /// Collects the health information of the storage nodes.
+    /// Storage nodes are read from on-chain data, and the health information is collected from the
+    /// storage nodes themselves.
+    pub async fn get_health_info(
+        sui_read_client: &impl ReadClient,
+        node_selection: NodeSelection,
+        detail: bool,
+    ) -> anyhow::Result<Self> {
+        match node_selection {
+            NodeSelection {
+                node_id: Some(node_id),
+                node_url: None,
+                committee: false,
+                active_set: false,
+            } => {
+                let storage_node = sui_read_client.get_storage_node_by_id(node_id).await?;
+                let node_health = NodeHealthOutput::new(storage_node.clone(), detail).await;
+                Ok(Self {
+                    health_info: vec![node_health],
+                })
+            }
+            NodeSelection {
+                node_id: None,
+                node_url: Some(node_url),
+                committee: false,
+                active_set: false,
+            } => {
+                let storage_nodes = sui_read_client.get_storage_nodes_from_active_set().await?;
+                let Some(storage_node) = storage_nodes
+                    .iter()
+                    .find(|node| node.network_address.0 == node_url)
+                else {
+                    return Err(anyhow::anyhow!(
+                        "node url {node_url} not found in active set, try to query it with node id"
+                    ));
+                };
+                let node_health = NodeHealthOutput::new(storage_node.clone(), detail).await;
+                Ok(Self {
+                    health_info: vec![node_health],
+                })
+            }
+            NodeSelection {
+                node_id: None,
+                node_url: None,
+                committee: true,
+                active_set: false,
+            } => {
+                let storage_nodes = sui_read_client.get_storage_nodes_from_committee().await?;
+                use futures::stream::{self, StreamExt};
+
+                // Process up to 10 health checks concurrently
+                let health_info = stream::iter(storage_nodes)
+                    .map(|node| NodeHealthOutput::new(node, detail))
+                    .buffer_unordered(10)
+                    .collect::<Vec<_>>()
+                    .await;
+
+                Ok(Self { health_info })
+            }
+            NodeSelection {
+                node_id: None,
+                node_url: None,
+                committee: false,
+                active_set: true,
+            } => {
+                let storage_nodes = sui_read_client.get_storage_nodes_from_active_set().await?;
+                use futures::stream::{self, StreamExt};
+
+                // Process up to 10 health checks concurrently
+                let health_info = stream::iter(storage_nodes)
+                    .map(|node| NodeHealthOutput::new(node, detail))
+                    .buffer_unordered(10)
+                    .collect::<Vec<_>>()
+                    .await;
+
+                Ok(Self { health_info })
+            }
+            _ => Err(anyhow::anyhow!(
+                "exactly one of `node_id`, `node_url`, \
+                `committee`, or `active_set` must be specified"
+            )),
+        }
+    }
 }

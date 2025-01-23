@@ -267,6 +267,22 @@ pub enum CliCommands {
         #[command(subcommand)]
         command: Option<InfoCommands>,
     },
+    /// Print health information for the storage node.
+    /// Only one of `--node_id`, `--node_url`, `--committee`, or `--active_set` can be specified.
+    Health {
+        /// The URL of the Sui RPC node to use.
+        #[clap(flatten)]
+        #[serde(flatten)]
+        rpc_arg: RpcArg,
+        /// The node selector for the storage node to print health information for.
+        #[clap(flatten)]
+        #[serde(flatten)]
+        node_selection: NodeSelection,
+        /// Print detailed health information.
+        #[clap(long, action)]
+        #[serde(default)]
+        detail: bool,
+    },
     /// Encode the specified file to obtain its blob ID.
     BlobId {
         /// The file containing the blob for which to compute the blob ID.
@@ -830,6 +846,30 @@ impl BurnSelection {
     pub(super) fn is_all_expired(&self) -> bool {
         self.all_expired
     }
+}
+
+/// Selector for the storage nodes.
+#[serde_as]
+#[derive(Debug, Clone, Args, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[group(required = true, multiple = false)]
+pub struct NodeSelection {
+    /// The ID of the storage node to be selected.
+    #[clap(long)]
+    #[serde(default)]
+    pub node_id: Option<ObjectID>,
+    /// The URL of the storage node to be selected.
+    #[clap(long)]
+    #[serde(default)]
+    pub node_url: Option<String>,
+    /// Select all storage nodes in the current committee.
+    #[clap(long, action)]
+    #[serde(default)]
+    pub committee: bool,
+    /// Select all storage nodes in the active set.
+    #[clap(long, action)]
+    #[serde(default)]
+    pub active_set: bool,
 }
 
 /// The number of epochs to store the blob for.
