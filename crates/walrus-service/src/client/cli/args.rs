@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     num::{NonZeroU16, NonZeroU32},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{anyhow, Result};
@@ -16,7 +16,7 @@ use jsonwebtoken::Algorithm;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 use sui_types::base_types::ObjectID;
-use walrus_core::{encoding::EncodingConfig, ensure, BlobId, EpochCount};
+use walrus_core::{encoding::EncodingConfig, ensure, BlobId, Epoch, EpochCount};
 use walrus_sui::{
     client::{ExpirySelectionPolicy, SuiContractClient},
     utils::SuiNetwork,
@@ -174,13 +174,12 @@ pub enum CliCommands {
         #[clap(required = true, value_name = "FILES")]
         #[serde(deserialize_with = "crate::utils::resolve_home_dir_vec")]
         files: Vec<PathBuf>,
-        /// The number of epochs ahead for which to store the blob.
+        /// The epoch argument to specify either the number of epochs to store the blob, or the
+        /// end epoch, or the earliest expiry time in rfc3339 format.
         ///
-        /// If set to `max`, the blob is stored for the maximum number of epochs allowed by the
-        /// system object on chain. Otherwise, the blob is stored for the specified number of
-        /// epochs. The number of epochs must be greater than 0.
-        #[clap(short, long, value_parser = EpochCountOrMax::parse_epoch_count)]
-        epochs: EpochCountOrMax,
+        #[clap(flatten)]
+        #[serde(flatten)]
+        epoch_arg: EpochArg,
         /// Perform a dry-run of the store without performing any actions on chain.
         ///
         /// This assumes `--force`; i.e., it does not check the current status of the blob.
@@ -919,6 +918,45 @@ impl EpochCountOrMax {
     }
 }
 
+/// The number of epochs to store the blob for.
+#[serde_as]
+#[derive(Debug, Clone, Args, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[group(required = true, multiple = false)]
+pub struct EpochArg {
+    /// The number of epochs the blob is stored for.
+    ///
+    /// If set to `max`, the blob is stored for the maximum number of epochs allowed by the
+    /// system object on chain. Otherwise, the blob is stored for the specified number of
+    /// epochs. The number of epochs must be greater than 0.
+    #[clap(long, value_parser = EpochCountOrMax::parse_epoch_count)]
+    pub(crate) epochs: Option<EpochCountOrMax>,
+
+    /// The earliest time when the blob can expire, in RFC3339 format (e.g. "2024-03-20T15:00:00Z")
+    /// or a more relaxed format (e.g. "2024-03-20 15:00:00").
+    #[clap(long, value_parser = humantime::parse_rfc3339_weak)]
+    pub(crate) earliest_expiry_time: Option<SystemTime>,
+
+    /// The end epoch for the blob.
+    #[clap(long)]
+    pub(crate) end_epoch: Option<Epoch>,
+}
+
+impl EpochArg {
+    pub(crate) fn exactly_one_is_some(&self) -> Result<()> {
+        match (
+            self.epochs.is_some(),
+            self.earliest_expiry_time.is_some(),
+            self.end_epoch.is_some(),
+        ) {
+            (true, false, false) | (false, true, false) | (false, false, true) => Ok(()),
+            _ => Err(anyhow!(
+                "exactly one of `epochs`, `earliest-expiry-time`, or `end-epoch` must be specified"
+            )),
+        }
+    }
+}
+
 pub(crate) mod default {
     use std::{net::SocketAddr, time::Duration};
 
@@ -1030,7 +1068,11 @@ mod tests {
     fn store_command(epochs: EpochCountOrMax) -> Commands {
         Commands::Cli(CliCommands::Store {
             files: vec![PathBuf::from("README.md")],
-            epochs,
+            epoch_arg: EpochArg {
+                epochs: Some(epochs),
+                earliest_expiry_time: None,
+                end_epoch: None,
+            },
             dry_run: false,
             force: false,
             deletable: false,

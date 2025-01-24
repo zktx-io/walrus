@@ -128,7 +128,8 @@ impl CliOutput for BlobStoreResultWithPath {
                     Sui object ID: {}\n\
                     Unencoded size: {}\n\
                     Encoded size (including replicated metadata): {}\n\
-                    Cost (excluding gas): {} {}{}",
+                    Cost (excluding gas): {} {} \n\
+                    Expiry epoch (exclusive): {}{}\n",
                     success(),
                     if blob_object.deletable {
                         "Deletable"
@@ -142,8 +143,9 @@ impl CliOutput for BlobStoreResultWithPath {
                     HumanReadableBytes(resource_operation.encoded_length()),
                     HumanReadableFrost::from(*cost),
                     operation_str,
+                    blob_object.storage.end_epoch,
                     shared_blob_object
-                        .map_or_else(String::new, |id| format!("\nShared blob object ID: {}", id))
+                        .map_or_else(String::new, |id| format!("\nShared blob object ID: {}", id)),
                 )
             }
             BlobStoreResult::MarkedInvalid { blob_id, event } => {
@@ -208,6 +210,11 @@ impl CliOutput for DryRunOutput {
 impl CliOutput for BlobStatusOutput {
     fn print_cli_output(&self) {
         let blob_str = blob_and_file_str(&self.blob_id, &self.file);
+        let expiry_str = if let Some(expiry) = self.estimated_expiry_timestamp {
+            format!("Estimated expiry timestamp: {}\n", expiry.to_rfc3339())
+        } else {
+            "".to_string()
+        };
         match self.status {
             BlobStatus::Nonexistent => println!("Blob ID {blob_str} is not stored on Walrus."),
             BlobStatus::Deletable {
@@ -256,6 +263,7 @@ impl CliOutput for BlobStatusOutput {
                 println!(
                     "There is a {status} permanent Blob object for blob ID {blob_str}.\n\
                         Expiry epoch: {end_epoch}\n\
+                        {expiry_str}\
                         Related event: {}\
                         {initial_certified_str}",
                     format_event_id(&status_event)
