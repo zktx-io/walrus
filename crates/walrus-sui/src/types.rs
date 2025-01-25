@@ -45,7 +45,15 @@ pub use move_structs::{
 pub(crate) mod move_errors;
 
 use serde::{Deserialize, Serialize};
-use walrus_core::{bft, ensure, Epoch, NetworkPublicKey, PublicKey, ShardIndex};
+use walrus_core::{
+    bft,
+    ensure,
+    messages::ProofOfPossession,
+    Epoch,
+    NetworkPublicKey,
+    PublicKey,
+    ShardIndex,
+};
 
 /// The zero-th Epoch is special in that it's the genesis epoch.
 pub const GENESIS_EPOCH: Epoch = 0;
@@ -112,6 +120,47 @@ impl NodeMetadata {
             description,
             extra_fields: vec![],
         }
+    }
+}
+
+/// Update public key parameters
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatePublicKeyParams {
+    /// The next public key of the storage node.
+    pub next_public_key: PublicKey,
+    /// The proof of possession of the new public key.
+    pub proof_of_possession: ProofOfPossession,
+}
+
+/// Parameters for updating a node's configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NodeUpdateParams {
+    /// The name of the storage node.
+    pub name: Option<String>,
+    /// The network address of the storage node.
+    pub network_address: Option<NetworkAddress>,
+    /// The network public key of the storage node.
+    pub network_public_key: Option<NetworkPublicKey>,
+    /// The next public key parameters of the storage node.
+    pub next_public_key_params: Option<UpdatePublicKeyParams>,
+    /// The storage price to vote for
+    pub storage_price: Option<u64>,
+    /// The write price to vote for
+    pub write_price: Option<u64>,
+    /// The node capacity to vote for
+    pub node_capacity: Option<u64>,
+}
+
+impl NodeUpdateParams {
+    /// Returns true if any parameters need to be updated
+    pub fn needs_update(&self) -> bool {
+        self.name.is_some()
+            || self.network_address.is_some()
+            || self.network_public_key.is_some()
+            || self.next_public_key_params.is_some()
+            || self.storage_price.is_some()
+            || self.write_price.is_some()
+            || self.node_capacity.is_some()
     }
 }
 

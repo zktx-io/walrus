@@ -23,7 +23,10 @@ mod tests {
         client::{responses::BlobStoreResult, Client, ClientCommunicationConfig, StoreWhen},
         test_utils::{test_cluster, SimStorageNodeHandle},
     };
-    use walrus_sui::client::{BlobPersistence, PostStoreAction, ReadClient, SuiContractClient};
+    use walrus_sui::{
+        client::{BlobPersistence, PostStoreAction, ReadClient, SuiContractClient},
+        types::{move_structs::VotingParams, NetworkAddress},
+    };
     use walrus_test_utils::WithTempDir;
 
     const FAILURE_TRIGGER_PROBABILITY: f64 = 0.01;
@@ -859,5 +862,157 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+    }
+
+    #[walrus_simtest]
+    #[ignore = "ignore simtests by default"]
+    async fn test_registered_node_update_params() {
+        let (_sui_cluster, mut walrus_cluster, client) =
+            test_cluster::default_setup_with_epoch_duration_generic::<SimStorageNodeHandle>(
+                Duration::from_secs(30),
+                &[1, 2, 3, 3, 4, 0],
+                false,
+                ClientCommunicationConfig::default_for_test_with_reqwest_timeout(
+                    Duration::from_secs(2),
+                ),
+                None,
+                Some(10),
+            )
+            .await
+            .unwrap();
+
+        assert!(walrus_cluster.nodes[5].node_id.is_none());
+        let client_arc = Arc::new(client);
+
+        let new_address = walrus_service::test_utils::unused_socket_address(true);
+        let network_key_pair = walrus_core::keys::NetworkKeyPair::generate();
+        // Generate random voting params
+        let voting_params = VotingParams {
+            storage_price: rand::thread_rng().gen_range(1..1000),
+            write_price: rand::thread_rng().gen_range(1..100),
+            node_capacity: rand::thread_rng().gen_range(1_000_000..1_000_000_000),
+        };
+
+        // Check that the registered node has the original network address.
+        let pool = client_arc
+            .as_ref()
+            .as_ref()
+            .sui_client()
+            .read_client
+            .get_staking_pool(
+                walrus_cluster.nodes[5]
+                    .storage_node_capability
+                    .as_ref()
+                    .unwrap()
+                    .node_id,
+            )
+            .await
+            .expect("Failed to get staking pool");
+        assert_eq!(
+            pool.node_info.network_address,
+            walrus_cluster.nodes[5]
+                .storage_node_config
+                .rest_api_address
+                .into()
+        );
+
+        // Make sure the new params are different from the on-chain values.
+        assert_ne!(
+            NetworkAddress::from(new_address),
+            pool.node_info.network_address
+        );
+        assert_ne!(pool.voting_params, voting_params);
+        assert_ne!(
+            &pool.node_info.network_public_key,
+            network_key_pair.public()
+        );
+
+        // Update the node config with the new params.
+        walrus_cluster.nodes[5].storage_node_config.public_port = new_address.port();
+        walrus_cluster.nodes[5].storage_node_config.public_host = new_address.ip().to_string();
+        walrus_cluster.nodes[5].storage_node_config.rest_api_address = new_address;
+        walrus_cluster.nodes[5].storage_node_config.network_key_pair =
+            network_key_pair.clone().into();
+        walrus_cluster.nodes[5].storage_node_config.voting_params = voting_params.clone();
+        walrus_cluster.nodes[5].rest_api_address = new_address;
+        walrus_cluster.nodes[5].network_public_key = network_key_pair.public().clone();
+
+        walrus_cluster.nodes[5].node_id = Some(
+            SimStorageNodeHandle::spawn_node(
+                walrus_cluster.nodes[5].storage_node_config.clone(),
+                None,
+                walrus_cluster.nodes[5].cancel_token.clone(),
+            )
+            .await
+            .id(),
+        );
+
+        // Adding stake to the new node so that it can be in Active state.
+        client_arc
+            .as_ref()
+            .as_ref()
+            .stake_with_node_pool(
+                walrus_cluster.nodes[5]
+                    .storage_node_capability
+                    .as_ref()
+                    .unwrap()
+                    .node_id,
+                test_cluster::FROST_PER_NODE_WEIGHT * 3,
+            )
+            .await
+            .expect("stake with node pool should not fail");
+
+        tokio::time::sleep(Duration::from_secs(65)).await;
+
+        let committees = client_arc
+            .inner
+            .get_latest_committees_in_test()
+            .await
+            .expect("Should get committees");
+
+        assert!(committees
+            .current_committee()
+            .find(&walrus_cluster.nodes[5].public_key)
+            .is_some());
+
+        // Check that the new params are updated on-chain.
+        let pool = client_arc
+            .as_ref()
+            .as_ref()
+            .sui_client()
+            .read_client
+            .get_staking_pool(
+                walrus_cluster.nodes[5]
+                    .storage_node_capability
+                    .as_ref()
+                    .unwrap()
+                    .node_id,
+            )
+            .await
+            .expect("Should get staking pool");
+        assert_eq!(
+            pool.node_info.network_address,
+            walrus_cluster.nodes[5]
+                .storage_node_config
+                .rest_api_address
+                .into()
+        );
+        assert_eq!(
+            &pool.node_info.network_public_key,
+            walrus_cluster.nodes[5]
+                .storage_node_config
+                .network_key_pair()
+                .public()
+        );
+        assert_eq!(pool.voting_params, voting_params);
+
+        assert_eq!(
+            get_nodes_health_info(&[&walrus_cluster.nodes[5]])
+                .await
+                .get(0)
+                .unwrap()
+                .node_status,
+            "Active"
+        );
     }
 }

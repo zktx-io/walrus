@@ -91,6 +91,9 @@ enum Commands {
         /// Whether to cleanup the storage directory before starting the node.
         #[clap(long, action, default_value_t = false)]
         cleanup_storage: bool,
+        /// Whether to ignore the failures from node parameter synchronization with on-chain values.
+        #[clap(long, action, default_value_t = false)]
+        ignore_sync_failures: bool,
     },
 
     /// Generate a new key for use with the Walrus protocol, and writes it to a file.
@@ -312,7 +315,12 @@ fn main() -> anyhow::Result<()> {
         Commands::Run {
             config_path,
             cleanup_storage,
-        } => commands::run(StorageNodeConfig::load(config_path)?, cleanup_storage)?,
+            ignore_sync_failures,
+        } => commands::run(
+            StorageNodeConfig::load(config_path)?,
+            cleanup_storage,
+            ignore_sync_failures,
+        )?,
 
         Commands::KeyGen {
             out,
@@ -353,7 +361,11 @@ mod commands {
 
     use super::*;
 
-    pub(super) fn run(mut config: StorageNodeConfig, cleanup_storage: bool) -> anyhow::Result<()> {
+    pub(super) fn run(
+        mut config: StorageNodeConfig,
+        cleanup_storage: bool,
+        ignore_sync_failures: bool,
+    ) -> anyhow::Result<()> {
         if cleanup_storage {
             let storage_path = &config.storage_path;
 
@@ -447,6 +459,7 @@ mod commands {
             exit_notifier,
             event_manager,
             cancel_token.child_token(),
+            ignore_sync_failures,
         )?;
 
         monitor_runtimes(
@@ -831,6 +844,7 @@ impl StorageNodeRuntime {
         exit_notifier: oneshot::Sender<()>,
         event_manager: Box<dyn EventManager>,
         cancel_token: CancellationToken,
+        ignore_sync_failures: bool,
     ) -> anyhow::Result<Self> {
         let runtime = runtime::Builder::new_multi_thread()
             .thread_name("walrus-node-runtime")
@@ -843,6 +857,7 @@ impl StorageNodeRuntime {
             runtime.block_on(
                 StorageNode::builder()
                     .with_system_event_manager(event_manager)
+                    .with_ignore_sync_failures(ignore_sync_failures)
                     .build(node_config, metrics_registry.clone()),
             )?,
         );

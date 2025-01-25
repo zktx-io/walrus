@@ -75,7 +75,7 @@ use walrus_sdk::api::{
     StoredOnNodeStatus,
 };
 use walrus_sui::{
-    client::SuiReadClient,
+    client::{SuiClientError, SuiReadClient},
     types::{
         BlobCertified,
         BlobDeleted,
@@ -248,6 +248,7 @@ pub struct StorageNodeBuilder {
     committee_service: Option<Arc<dyn CommitteeService>>,
     contract_service: Option<Arc<dyn SystemContractService>>,
     num_checkpoints_per_blob: Option<u32>,
+    ignore_sync_failures: bool, // This will default to false due to bool's default implementation.
 }
 
 impl StorageNodeBuilder {
@@ -265,6 +266,12 @@ impl StorageNodeBuilder {
     /// Sets the [`EventManager`] to be used with the node.
     pub fn with_system_event_manager(mut self, event_manager: Box<dyn EventManager>) -> Self {
         self.event_manager = Some(event_manager);
+        self
+    }
+
+    /// Ignores node parameter sync failures if true.
+    pub fn with_ignore_sync_failures(mut self, ignore_sync_failures: bool) -> Self {
+        self.ignore_sync_failures = ignore_sync_failures;
         self
     }
 
@@ -393,6 +400,7 @@ impl StorageNodeBuilder {
         let node_params = NodeParameters {
             pre_created_storage: self.storage,
             num_checkpoints_per_blob: self.num_checkpoints_per_blob,
+            ignore_sync_failures: self.ignore_sync_failures,
         };
 
         StorageNode::new(
@@ -446,13 +454,69 @@ pub struct StorageNodeInner {
 ///
 /// This struct contains optional configuration parameters that can be used
 /// to customize the behavior of a node during its creation or runtime.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct NodeParameters {
     // For testing purposes. TODO(#703): remove.
     pre_created_storage: Option<Storage>,
     // Number of checkpoints per blob to use when creating event blobs.
     // If not provided, the default value will be used.
     num_checkpoints_per_blob: Option<u32>,
+    // Whether to ignore sync failures during node initialization
+    ignore_sync_failures: bool,
+}
+
+/// Check if the node parameters are in sync with the on-chain parameters.
+/// If not, update the node parameters on-chain.
+/// If the current node is not registered yet, error out.
+/// If the wallet is not present in the config, do nothing.
+async fn sync_node_params(config: &StorageNodeConfig) -> anyhow::Result<()> {
+    let Some(ref node_wallet_config) = config.sui else {
+        // Not failing here, since the wallet may be absent in tests.
+        // In production, an absence of the wallet will fail the node eventually.
+        tracing::error!("storage config does not contain Sui wallet configuration");
+        return Ok(());
+    };
+
+    let contract_client = node_wallet_config.new_contract_client().await?;
+    let address = contract_client.wallet().await.active_address()?;
+
+    let node_cap = contract_client
+        .read_client
+        .get_address_capability_object(address)
+        .await?
+        .ok_or(SuiClientError::StorageNodeCapabilityObjectNotSet)?;
+
+    let pool = contract_client
+        .read_client
+        .get_staking_pool(node_cap.node_id)
+        .await?;
+
+    let node_info = &pool.node_info;
+
+    let update_params = config.generate_update_params(
+        node_info.name.as_str(),
+        node_info.network_address.0.as_str(),
+        &node_info.network_public_key,
+        &pool.voting_params,
+    );
+
+    if update_params.needs_update() {
+        tracing::info!(
+            node_name = config.name,
+            node_id = ?node_info.node_id,
+            update_params = ?update_params,
+            "update node params"
+        );
+        contract_client.update_node_params(update_params).await?;
+    } else {
+        tracing::info!(
+            node_name = config.name,
+            node_id = ?node_info.node_id,
+            "node parameters are in sync with on-chain values"
+        );
+    }
+
+    Ok(())
 }
 
 impl StorageNode {
@@ -466,6 +530,14 @@ impl StorageNode {
         node_params: NodeParameters,
     ) -> Result<Self, anyhow::Error> {
         let start_time = Instant::now();
+        sync_node_params(config).await.or_else(|e| {
+            node_params
+                .ignore_sync_failures
+                .then(|| {
+                    tracing::warn!("Failed to sync node params: {}", e);
+                })
+                .ok_or(e)
+        })?;
         let encoding_config = committee_service.encoding_config().clone();
 
         let storage = if let Some(storage) = node_params.pre_created_storage {
