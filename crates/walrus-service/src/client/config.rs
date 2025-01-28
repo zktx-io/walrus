@@ -58,7 +58,7 @@ impl Config {
     pub async fn new_contract_client(
         &self,
         wallet: WalletContext,
-        gas_budget: u64,
+        gas_budget: Option<u64>,
     ) -> Result<SuiContractClient, SuiClientError> {
         SuiContractClient::new(
             wallet,
@@ -75,7 +75,7 @@ impl Config {
     /// configuration.
     pub async fn new_contract_client_with_wallet_in_config(
         &self,
-        gas_budget: u64,
+        gas_budget: Option<u64>,
     ) -> anyhow::Result<SuiContractClient> {
         let Some(wallet_config) = self.wallet_config.as_ref() else {
             bail!(
