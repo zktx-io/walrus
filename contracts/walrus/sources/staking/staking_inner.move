@@ -35,7 +35,7 @@ const MIN_STAKE: u64 = 0;
 
 /// Temporary upper limit for the number of storage nodes.
 /// TODO: Remove once solutions are in place to prevent hitting move execution limits (#935).
-const TEMP_ACTIVE_SET_SIZE_LIMIT: u16 = 100;
+const TEMP_ACTIVE_SET_SIZE_LIMIT: u16 = 111;
 
 /// The number of nodes from which a flat shards limit is applied.
 const MIN_NODES_FOR_SHARDS_LIMIT: u8 = 20;
@@ -466,14 +466,20 @@ public(package) fun request_withdraw_stake(
 ) {
     let wctx = &self.new_walrus_context();
     let node_id = staked_wal.node_id();
-    self
-        .pools[node_id]
-        .request_withdraw_stake(
-            staked_wal,
-            self.committee.contains(&node_id),
-            self.next_committee.is_some_and!(|cmt| cmt.contains(&node_id)),
-            wctx,
-        );
+    let pool = &mut self.pools[node_id];
+
+    pool.request_withdraw_stake(
+        staked_wal,
+        self.committee.contains(&node_id),
+        self.next_committee.is_some_and!(|cmt| cmt.contains(&node_id)),
+        wctx,
+    );
+
+    let balance = match (self.epoch_state) {
+        EpochState::NextParamsSelected(_) => pool.wal_balance_at_epoch(wctx.epoch() + 2),
+        _ => pool.wal_balance_at_epoch(wctx.epoch() + 1),
+    };
+    self.active_set.borrow_mut().insert_or_update(node_id, balance);
 }
 
 /// Perform the withdrawal of the staked WAL, returning the amount to the caller.
@@ -486,15 +492,20 @@ public(package) fun withdraw_stake(
 ): Coin<WAL> {
     let wctx = &self.new_walrus_context();
     let node_id = staked_wal.node_id();
-    self
-        .pools[node_id]
-        .withdraw_stake(
-            staked_wal,
-            self.committee.contains(&node_id),
-            self.next_committee.is_some_and!(|cmt| cmt.contains(&node_id)),
-            wctx,
-        )
-        .into_coin(ctx)
+    let pool = &mut self.pools[node_id];
+    let wal_balance = pool.withdraw_stake(
+        staked_wal,
+        self.committee.contains(&node_id),
+        self.next_committee.is_some_and!(|cmt| cmt.contains(&node_id)),
+        wctx,
+    );
+
+    let balance = match (self.epoch_state) {
+        EpochState::NextParamsSelected(_) => pool.wal_balance_at_epoch(wctx.epoch() + 2),
+        _ => pool.wal_balance_at_epoch(wctx.epoch() + 1),
+    };
+    self.active_set.borrow_mut().insert_or_update(node_id, balance);
+    wal_balance.into_coin(ctx)
 }
 
 // === System ===
