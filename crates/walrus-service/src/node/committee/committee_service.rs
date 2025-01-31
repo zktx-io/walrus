@@ -35,7 +35,12 @@ use walrus_sui::types::Committee;
 
 use super::{
     node_service::{NodeService, NodeServiceError, RemoteStorageNode, Request, Response},
-    request_futures::{GetAndVerifyMetadata, GetInvalidBlobCertificate, RecoverSliver},
+    request_futures::{
+        GetAndVerifyMetadata,
+        GetInvalidBlobCertificate,
+        LegacyRecoverSliver,
+        RecoverSliver,
+    },
     BeginCommitteeChangeError,
     CommitteeLookupService,
     CommitteeService,
@@ -57,6 +62,11 @@ use crate::{
         metrics::CommitteeServiceMetricSet,
     },
 };
+
+// TODO(jsmith): Set to false before merging to code base.
+// TODO(jsmith): Remove once all storage nodes have deployed this version, along with legacy code.
+// Avoids using [allow(unused)] for code that is currently deactivated.
+const USE_BATCHED_RECOVERY: bool = true;
 
 pub(crate) struct NodeCommitteeServiceBuilder<T> {
     service_factory: Box<dyn NodeServiceFactory<Service = T>>,
@@ -501,7 +511,16 @@ where
             .await
     }
 
-    #[tracing::instrument(name = "recover_sliver committee", skip_all)]
+    #[tracing::instrument(
+        name = "recover_sliver__committee",
+        skip_all,
+        fields(
+            walrus.blob_id = %metadata.blob_id(),
+            walrus.sliver.pair_index = %sliver_id,
+            walrus.sliver.type = %sliver_type,
+            walrus.blob.certified_epoch = certified_epoch,
+        )
+    )]
     async fn recover_sliver(
         &self,
         metadata: Arc<VerifiedBlobMetadataWithId>,
@@ -509,15 +528,27 @@ where
         sliver_type: SliverType,
         certified_epoch: Epoch,
     ) -> Result<Sliver, InconsistencyProofEnum<MerkleProof>> {
-        RecoverSliver::new(
-            metadata,
-            sliver_id,
-            sliver_type,
-            certified_epoch,
-            &self.inner,
-        )
-        .run()
-        .await
+        if USE_BATCHED_RECOVERY {
+            RecoverSliver::new(
+                metadata,
+                sliver_id,
+                sliver_type,
+                certified_epoch,
+                &self.inner,
+            )
+            .run()
+            .await
+        } else {
+            LegacyRecoverSliver::new(
+                metadata,
+                sliver_id,
+                sliver_type,
+                certified_epoch,
+                &self.inner,
+            )
+            .run()
+            .await
+        }
     }
 
     #[tracing::instrument(name = "get_invalid_blob_certificate committee", skip_all)]

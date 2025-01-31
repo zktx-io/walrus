@@ -16,9 +16,11 @@ use std::{
 use anyhow::{anyhow, bail, Context};
 use committee::{BeginCommitteeChangeError, EndCommitteeChangeError};
 use epoch_change_driver::EpochChangeDriver;
+use errors::ListSymbolsError;
 use events::event_blob_writer::EventBlobWriter;
 use fastcrypto::traits::KeyPair;
 use futures::{stream, Stream, StreamExt, TryFutureExt as _};
+use itertools::Either;
 use node_recovery::NodeRecoveryHandler;
 use prometheus::Registry;
 use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
@@ -71,14 +73,17 @@ use walrus_core::{
     SliverType,
     SymbolId,
 };
-use walrus_sdk::api::{
-    BlobStatus,
-    ServiceHealthInfo,
-    ShardHealthInfo,
-    ShardStatus as ApiShardStatus,
-    ShardStatusDetail,
-    ShardStatusSummary,
-    StoredOnNodeStatus,
+use walrus_sdk::{
+    api::{
+        BlobStatus,
+        ServiceHealthInfo,
+        ShardHealthInfo,
+        ShardStatus as ApiShardStatus,
+        ShardStatusDetail,
+        ShardStatusSummary,
+        StoredOnNodeStatus,
+    },
+    client::{RecoverySymbolsFilter, SymbolIdFilter},
 };
 use walrus_sui::{
     client::{SuiClientError, SuiReadClient},
@@ -218,6 +223,16 @@ pub trait ServiceState {
         symbol_id: SymbolId,
         sliver_type: Option<SliverType>,
     ) -> Result<GeneralRecoverySymbol, RetrieveSymbolError>;
+
+    /// Retrieves multiple recovery symbols.
+    ///
+    /// Attempts to retrieve multiple recovery symbols, skipping any failures that occur. Returns an
+    /// error if none of the requested symbols can be retrieved.
+    fn retrieve_multiple_recovery_symbols(
+        &self,
+        blob_id: &BlobId,
+        filter: RecoverySymbolsFilter,
+    ) -> Result<Vec<GeneralRecoverySymbol>, ListSymbolsError>;
 
     /// Retrieves the blob status for the given `blob_id`.
     fn blob_status(&self, blob_id: &BlobId) -> Result<BlobStatus, BlobStatusError>;
@@ -1850,6 +1865,15 @@ impl ServiceState for StorageNode {
             .retrieve_recovery_symbol(blob_id, symbol_id, sliver_type)
     }
 
+    fn retrieve_multiple_recovery_symbols(
+        &self,
+        blob_id: &BlobId,
+        filter: RecoverySymbolsFilter,
+    ) -> Result<Vec<GeneralRecoverySymbol>, ListSymbolsError> {
+        self.inner
+            .retrieve_multiple_recovery_symbols(blob_id, filter)
+    }
+
     fn blob_status(&self, blob_id: &BlobId) -> Result<BlobStatus, BlobStatusError> {
         self.inner.blob_status(blob_id)
     }
@@ -2047,7 +2071,7 @@ impl ServiceState for StorageNodeInner {
         Ok(sign_message(message, self.protocol_key_pair.clone()).await?)
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip(self))]
     fn retrieve_recovery_symbol(
         &self,
         blob_id: &BlobId,
@@ -2105,6 +2129,60 @@ impl ServiceState for StorageNodeInner {
         }
 
         Err(final_error)
+    }
+
+    #[tracing::instrument(skip_all)]
+    fn retrieve_multiple_recovery_symbols(
+        &self,
+        blob_id: &BlobId,
+        filter: RecoverySymbolsFilter,
+    ) -> Result<Vec<GeneralRecoverySymbol>, ListSymbolsError> {
+        let n_shards = self.n_shards();
+
+        let symbol_id_iter = match filter.id_filter() {
+            SymbolIdFilter::Ids(symbol_ids) => Either::Left(symbol_ids.iter().copied()),
+
+            SymbolIdFilter::Recovers {
+                target_sliver: target,
+                target_type,
+            } => Either::Right(self.owned_shards().into_iter().map(|shard_id| {
+                let pair_stored = shard_id.to_pair_index(n_shards, blob_id);
+                match *target_type {
+                    SliverType::Primary => {
+                        SymbolId::new(*target, pair_stored.to_sliver_index::<Secondary>(n_shards))
+                    }
+                    SliverType::Secondary => {
+                        SymbolId::new(pair_stored.to_sliver_index::<Primary>(n_shards), *target)
+                    }
+                }
+            })),
+        };
+
+        let mut output = vec![];
+        let mut last_error = ListSymbolsError::NoSymbolsSpecified;
+
+        // If a specific proof axis is requested, then specify the target-type to the retrieve
+        // function, otherwise, specify only the symbol IDs.
+        let target_type_from_proof = filter.proof_axis().map(|axis| axis.orthogonal());
+
+        for symbol_id in symbol_id_iter {
+            match self.retrieve_recovery_symbol(blob_id, symbol_id, target_type_from_proof) {
+                Ok(symbol) => output.push(symbol),
+
+                // Callers may request symbols that are not stored with this shard, or
+                // completely invalid symbols. These are ignored unless there are no successes.
+                Err(error) => {
+                    tracing::debug!(%error, %symbol_id, "failed to get requested symbol");
+                    last_error = error.into();
+                }
+            }
+        }
+
+        if output.is_empty() {
+            Err(last_error)
+        } else {
+            Ok(output)
+        }
     }
 
     fn n_shards(&self) -> NonZeroU16 {

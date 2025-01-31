@@ -72,7 +72,7 @@ axum = { workspace = true, features = [
   "tower-log",
   "tracing",
 ] }
-axum-extra = { workspace = true, features = ["typed-header"] }
+axum-extra = { workspace = true, features = ["query", "typed-header"] }
 axum-server = { workspace = true, features = ["tls-rustls-no-provider"] }
 bcs.workspace = true
 bincode = { workspace = true, optional = true }
