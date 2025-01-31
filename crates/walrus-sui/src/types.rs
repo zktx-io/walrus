@@ -5,6 +5,7 @@
 //! structs to use with the SDK.
 
 use std::{
+    collections::HashMap,
     fmt::Display,
     net::SocketAddr,
     num::{NonZeroU16, ParseIntError},
@@ -392,5 +393,72 @@ impl Committee {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn members_mut(&mut self) -> &mut Vec<StorageNode> {
         &mut self.members
+    }
+
+    /// Compares two committees based only on epoch, n_shards, and storage node ids/shards
+    pub fn compare_essential(&self, other: &Committee) -> anyhow::Result<()> {
+        let mut error_msgs = Vec::new();
+
+        // Compare epoch
+        if self.epoch != other.epoch {
+            error_msgs.push(format!(
+                "Epoch mismatch: existing {}, new {}",
+                self.epoch, other.epoch
+            ));
+        }
+
+        // Compare n_shards
+        if self.n_shards != other.n_shards {
+            error_msgs.push(format!(
+                "Number of shards mismatch: existing {}, new {}",
+                self.n_shards, other.n_shards
+            ));
+        }
+
+        // Create HashMaps of node_id -> shard_ids for both committees
+        let self_nodes: HashMap<_, _> = self
+            .members
+            .iter()
+            .map(|node| (&node.node_id, &node.shard_ids))
+            .collect();
+
+        let other_nodes: HashMap<_, _> = other
+            .members
+            .iter()
+            .map(|node| (&node.node_id, &node.shard_ids))
+            .collect();
+
+        // Check each node in left committee exists in right with matching shards
+        for (node_id, left_shards) in self_nodes.iter() {
+            if let Some(right_shards) = other_nodes.get(node_id) {
+                if left_shards != right_shards {
+                    error_msgs.push(format!(
+                        "Shard assignment mismatch for node {:?}: left {:?}, right {:?}",
+                        node_id, left_shards, right_shards
+                    ));
+                }
+            } else {
+                error_msgs.push(format!(
+                    "Node {:?} exists in left but not in right",
+                    node_id
+                ));
+            }
+        }
+
+        // Check each node in right committee exists in left
+        for node_id in other_nodes.keys() {
+            if !self_nodes.contains_key(node_id) {
+                error_msgs.push(format!(
+                    "Node {:?} exists in right but not in left",
+                    node_id
+                ));
+            }
+        }
+
+        if error_msgs.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(error_msgs.join("\n")))
+        }
     }
 }
