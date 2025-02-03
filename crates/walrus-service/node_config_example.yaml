@@ -113,3 +113,4 @@ metadata:
   description: ''
   extra_fields: []
 metrics_push: null
+storage_node_cap: null
