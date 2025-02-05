@@ -144,7 +144,7 @@ pub struct NodeUpdateParams {
     /// The network public key of the storage node.
     pub network_public_key: Option<NetworkPublicKey>,
     /// The next public key parameters of the storage node.
-    pub next_public_key_params: Option<UpdatePublicKeyParams>,
+    pub update_public_key: Option<UpdatePublicKeyParams>,
     /// The storage price to vote for
     pub storage_price: Option<u64>,
     /// The write price to vote for
@@ -159,10 +159,15 @@ impl NodeUpdateParams {
         self.name.is_some()
             || self.network_address.is_some()
             || self.network_public_key.is_some()
-            || self.next_public_key_params.is_some()
+            || self.update_public_key.is_some()
             || self.storage_price.is_some()
             || self.write_price.is_some()
             || self.node_capacity.is_some()
+    }
+
+    /// Returns true if the node needs a reboot due to the proposed changes.
+    pub fn needs_reboot(&self) -> bool {
+        self.network_public_key.is_some() || self.network_address.is_some()
     }
 }
 

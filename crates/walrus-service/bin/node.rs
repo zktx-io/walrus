@@ -50,6 +50,7 @@ use walrus_service::{
         MetricPushRuntime,
         MetricsAndLoggingRuntime,
     },
+    SyncNodeConfigError,
 };
 use walrus_sui::{client::SuiContractClient, types::move_structs::VotingParams, utils::SuiNetwork};
 
@@ -333,11 +334,37 @@ fn main() -> anyhow::Result<()> {
             config_path,
             cleanup_storage,
             ignore_sync_failures,
-        } => commands::run(
-            load_from_yaml(config_path)?,
-            cleanup_storage,
-            ignore_sync_failures,
-        )?,
+        } => loop {
+            let result = commands::run(
+                load_from_yaml(&config_path)?,
+                cleanup_storage,
+                ignore_sync_failures,
+            );
+
+            match result {
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<SyncNodeConfigError>(),
+                        Some(SyncNodeConfigError::ProtocolKeyPairRotationRequired)
+                    ) =>
+                {
+                    tracing::info!("protocol key pair rotation required, rotating key pair...");
+                    StorageNodeConfig::rotate_protocol_key_pair_persist(&config_path)?;
+                    continue;
+                }
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<SyncNodeConfigError>(),
+                        Some(SyncNodeConfigError::NodeNeedsReboot)
+                    ) =>
+                {
+                    tracing::info!("node needs reboot, restarting...");
+                    continue;
+                }
+                Err(e) => return Err(e),
+                Ok(()) => return Ok(()),
+            }
+        },
 
         Commands::KeyGen {
             out,

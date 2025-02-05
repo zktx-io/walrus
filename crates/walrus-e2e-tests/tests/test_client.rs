@@ -46,7 +46,7 @@ use walrus_service::{
         },
         StoreWhen,
     },
-    test_utils::{test_cluster, StorageNodeHandle},
+    test_utils::{test_cluster, StorageNodeHandle, TestNodesConfig},
 };
 use walrus_sui::{
     client::{BlobPersistence, ExpirySelectionPolicy, PostStoreAction, ReadClient},
@@ -578,11 +578,15 @@ async fn test_blocklist() -> TestResult {
     let (_sui_cluster_handle, _cluster, client) =
         test_cluster::default_setup_with_epoch_duration_generic::<StorageNodeHandle>(
             Duration::from_secs(60 * 60),
-            &[1, 2, 3, 3, 4],
-            true,
-            ClientCommunicationConfig::default_for_test(),
-            Some(blocklist_dir.path().to_path_buf()),
+            TestNodesConfig {
+                node_weights: vec![1, 2, 3, 3, 4],
+                use_legacy_event_processor: true,
+                disable_event_blob_writer: false,
+                blocklist_dir: Some(blocklist_dir.path().to_path_buf()),
+                enable_node_config_synchronizer: false,
+            },
             None,
+            ClientCommunicationConfig::default_for_test(),
         )
         .await?;
     let client = client.as_ref();
@@ -726,11 +730,15 @@ async fn test_repeated_shard_move() -> TestResult {
     let (_sui_cluster_handle, walrus_cluster, client) =
         test_cluster::default_setup_with_epoch_duration_generic::<StorageNodeHandle>(
             Duration::from_secs(20),
-            &[1, 1],
-            true,
+            TestNodesConfig {
+                node_weights: vec![1, 1],
+                use_legacy_event_processor: true,
+                disable_event_blob_writer: false,
+                blocklist_dir: None,
+                enable_node_config_synchronizer: false,
+            },
+            None,
             ClientCommunicationConfig::default_for_test(),
-            None,
-            None,
         )
         .await?;
 

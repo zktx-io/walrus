@@ -39,6 +39,7 @@ db_config:
   pending_recover_slivers: null
 protocol_key_pair:
   path: /opt/walrus/config/protocol.key
+next_protocol_key_pair: null
 network_key_pair:
   path: /opt/walrus/config/network.key
 public_host: 0.0.0.0
@@ -113,4 +114,7 @@ metadata:
   description: ''
   extra_fields: []
 metrics_push: null
+config_synchronizer:
+  interval_secs: 900
+  enabled: true
 storage_node_cap: null
