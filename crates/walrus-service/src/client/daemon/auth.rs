@@ -9,9 +9,10 @@ use jsonwebtoken::{
     DecodingKey,
     Validation,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sui_types::base_types::SuiAddress;
 use tracing::error;
+use walrus_core::EpochCount;
 use walrus_proc_macros::RestApiError;
 
 use super::routes::PublisherQuery;
@@ -19,10 +20,9 @@ use crate::{client::config::AuthConfig, common::api::RestApiError};
 
 pub const PUBLISHER_AUTH_DOMAIN: &str = "auth.publisher.walrus.space";
 
-/// Claim follows RFC7519 with extra storage parameters: send_object_to, epochs.
-#[derive(Clone, Deserialize, Debug)]
-#[cfg_attr(test, derive(serde::Serialize))]
-struct Claim {
+/// Claim follow RFC7519 with extra storage parameters: send_object_to, epochs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Claim {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Token is issued at (timestamp).
     pub iat: Option<u64>,
@@ -35,8 +35,23 @@ struct Claim {
     pub send_object_to: Option<SuiAddress>,
 
     /// The number of epochs the blob should be stored for.
+    ///
+    /// This is an exact number of epochs the blob should be stored for, no more, no less.
+    /// If both `epochs` and `max_epochs` are present, this is considered a configuration mistake
+    /// and the claim is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epochs: Option<u32>,
+
+    /// The maximum number of epochs the blob can be stored for (inclusive).
+    ///
+    /// If both `epochs` and `max_epochs` are present, this is considered a configuration mistake
+    /// and the claim is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_epochs: Option<u32>,
+
+    /// The maximum size of the blob that can be stored, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<u64>,
 }
 
 impl Claim {
@@ -79,12 +94,128 @@ impl Claim {
 
         Ok(claim)
     }
+
+    /// Checks that the query matches the claim.
+    pub fn check_valid_upload(
+        &self,
+        query: &PublisherQuery,
+        auth_config: &AuthConfig,
+        body_size_hint: u64,
+    ) -> Result<(), PublisherAuthError> {
+        // The expiration check is always performed.
+        if self.check_expiring_sec(auth_config) {
+            return Err(PublisherAuthError::InvalidExpiration);
+        }
+
+        // If verify_upload is disabled, skip the rest of the checks.
+        if !auth_config.verify_upload {
+            return Ok(());
+        }
+
+        if let Some(max_size) = self.max_size {
+            if body_size_hint > max_size {
+                tracing::debug!(
+                    max_size = max_size,
+                    body_size_hint = body_size_hint,
+                    "upload with body size greater than max_size"
+                );
+                return Err(PublisherAuthError::MaxSizeExceeded);
+            }
+        }
+
+        if let Err(error) = self.check_epochs(query.epochs) {
+            tracing::debug!(
+                epochs = self.epochs,
+                max_epochs = self.max_epochs,
+                query = query.epochs,
+                "upload with invalid number of epochs"
+            );
+            return Err(error);
+        }
+
+        self.check_send_object_to(query.send_object_to)?;
+
+        Ok(())
+    }
+
+    /// Checks if the claim has the correct `exp` and `iat` fields.
+    fn check_expiring_sec(&self, auth_config: &AuthConfig) -> bool {
+        if auth_config.expiring_sec == 0 {
+            return false;
+        }
+
+        // Check that the difference between `exp` and `iat` is equal to the configured
+        if (self.exp - self.iat.unwrap_or_default()) != auth_config.expiring_sec {
+            tracing::error!(
+                exp = self.exp,
+                iat = self.iat.unwrap_or(0),
+                expiring_sec = auth_config.expiring_sec,
+                "expiring_sec does not match the difference between exp and iat"
+            );
+            return true;
+        }
+
+        false
+    }
+
+    /// Checks if the number of epochs requested in the query is allowed by the claim.
+    ///
+    /// If both `epochs` and `max_epochs` are present, this is considered a configuration mistake
+    /// and the claim is rejected.
+    fn check_epochs(&self, query_epochs: EpochCount) -> Result<(), PublisherAuthError> {
+        match (self.epochs, self.max_epochs) {
+            (Some(epochs), None) => {
+                if query_epochs == epochs {
+                    Ok(())
+                } else {
+                    Err(PublisherAuthError::InvalidEpochs)
+                }
+            }
+            (None, Some(max_epochs)) => {
+                if query_epochs <= max_epochs {
+                    Ok(())
+                } else {
+                    Err(PublisherAuthError::EpochsAboveMax)
+                }
+            }
+            (Some(_), Some(_)) => Err(PublisherAuthError::InvalidEpochs),
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Checks if the `send_object_to` field is valid.
+    fn check_send_object_to(
+        &self,
+
+        query_send_object_to: Option<SuiAddress>,
+    ) -> Result<(), PublisherAuthError> {
+        match (self.send_object_to, query_send_object_to) {
+            (Some(expected), Some(actual)) if expected != actual => {
+                tracing::error!(
+                    expected = %expected,
+                    actual = %actual,
+                    "upload with invalid send_object_to field"
+                );
+                Err(PublisherAuthError::InvalidSendObjectTo)
+            }
+            (Some(expected), None) => {
+                tracing::error!(
+                    expected = %expected,
+                    "send_object_to field is missing"
+                );
+
+                Err(PublisherAuthError::MissingSendObjectTo)
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
-pub(crate) fn verify_jwt_claim(
+pub fn verify_jwt_claim(
     query: Query<PublisherQuery>,
     bearer: Authorization<Bearer>,
     auth_config: &AuthConfig,
+    body_size_hint: u64,
 ) -> Result<(), Response<Body>> {
     let mut validation = if auth_config.decoding_key.is_some() {
         auth_config
@@ -108,50 +239,8 @@ pub(crate) fn verify_jwt_claim(
 
     match Claim::from_token(bearer.token().trim(), decode_key, &validation) {
         Ok(claim) => {
-            let mut publisher_auth_error = None;
-
-            if auth_config.expiring_sec > 0
-                && (claim.exp - claim.iat.unwrap_or_default()) != auth_config.expiring_sec
-            {
-                error!(toker = bearer.token(), "token with invalid expiration");
-                publisher_auth_error = Some(PublisherAuthError::InvalidExpiration);
-            }
-
-            if auth_config.verify_upload {
-                if let Some(epochs) = claim.epochs {
-                    if query.epochs != epochs {
-                        tracing::debug!(
-                            expected = claim.epochs,
-                            actual = query.epochs,
-                            "upload with invalid epochs"
-                        );
-                        publisher_auth_error = Some(PublisherAuthError::InvalidEpochs);
-                    }
-                }
-
-                match (claim.send_object_to, query.send_object_to) {
-                    (Some(expected), Some(actual)) if expected != actual => {
-                        tracing::debug!(
-                            expected = %expected,
-                            actual = %actual,
-                            "upload with invalid send_object_to field"
-                        );
-                        publisher_auth_error = Some(PublisherAuthError::InvalidSendObjectTo);
-                    }
-                    (Some(expected), None) => {
-                        tracing::debug!(
-                            expected = %expected,
-                            "send_object_to field is missing"
-                        );
-
-                        publisher_auth_error = Some(PublisherAuthError::MissingSendObjectTo);
-                    }
-                    _ => {}
-                }
-            }
-
-            if let Some(publisher_auth_error) = publisher_auth_error {
-                Err(publisher_auth_error.to_response())
+            if let Err(error) = claim.check_valid_upload(&query.0, auth_config, body_size_hint) {
+                Err(error.to_response())
             } else {
                 Ok(())
             }
@@ -163,7 +252,7 @@ pub(crate) fn verify_jwt_claim(
 /// Type representing the possible errors that can occur during the authentication process.
 #[derive(Debug, thiserror::Error, RestApiError)]
 #[rest_api_error(domain = PUBLISHER_AUTH_DOMAIN)]
-enum PublisherAuthError {
+pub enum PublisherAuthError {
     /// The expiration in the query does not match the token.
     #[error("the expiration in the query does not match the token")]
     #[rest_api_error(reason = "INVALID_EXPIRATION", status = ApiStatusCode::FailedPrecondition)]
@@ -174,6 +263,11 @@ enum PublisherAuthError {
     #[rest_api_error(reason = "INVALID_EPOCHS", status = ApiStatusCode::FailedPrecondition)]
     InvalidEpochs,
 
+    /// Epochs is above the maximum allowed.
+    #[error("the epochs field in the query is above the maximum allowed")]
+    #[rest_api_error(reason = "EPOCHS_ABOVE_MAX", status = ApiStatusCode::FailedPrecondition)]
+    EpochsAboveMax,
+
     /// The send_object_to field in the query does not match the token, or is missing.
     #[error("the send_object_to field in the query does not match the token, or is missing")]
     #[rest_api_error(reason = "INVALID_SEND_OBJECT_TO", status = ApiStatusCode::FailedPrecondition)]
@@ -183,6 +277,11 @@ enum PublisherAuthError {
     #[error("the send_object_to field is missing from the query, but it is required")]
     #[rest_api_error(reason = "MISSING_SEND_OBJECT_TO", status = ApiStatusCode::FailedPrecondition)]
     MissingSendObjectTo,
+
+    /// The size of the body is above the maximum allowed.
+    #[error("the size of the body is above the maximum allowed.")]
+    #[rest_api_error(reason = "MAX_SIZE_EXCEEDED", status = ApiStatusCode::FailedPrecondition)]
+    MaxSizeExceeded,
 
     /// The signature on the token has expired.
     #[error("the signature on the token has expired: {0}")]
@@ -256,8 +355,7 @@ mod tests {
         let claim = Claim {
             iat: None,
             exp: u64::MAX,
-            send_object_to: None,
-            epochs: None,
+            ..Default::default()
         };
         let encode_key = EncodingKey::from_secret(secret.as_bytes());
         let token = encode(&Header::default(), &claim, &encode_key).unwrap();
@@ -319,6 +417,7 @@ mod tests {
             exp: u64::MAX,
             send_object_to: Some(SuiAddress::from_bytes(ADDRESS).expect("valid address")),
             epochs: Some(1),
+            ..Default::default()
         };
         let encode_key = EncodingKey::from_secret(secret.as_bytes());
         let token = encode(&Header::default(), &claim, &encode_key).unwrap();
@@ -393,6 +492,7 @@ mod tests {
             exp: u64::MAX,
             send_object_to: Some(SuiAddress::from_bytes(ADDRESS).expect("valid address")),
             epochs: Some(1),
+            ..Default::default()
         };
         let encode_key = EncodingKey::from_secret(secret.as_bytes());
         let token = encode(&Header::default(), &claim, &encode_key).unwrap();
@@ -465,20 +565,17 @@ mod tests {
         let valid_claim = Claim {
             iat: Some(0),
             exp: u64::MAX - 1,
-            send_object_to: None,
-            epochs: None,
+            ..Default::default()
         };
         let invalid_claim = Claim {
             iat: Some(0),
             exp: u64::MAX,
-            send_object_to: None,
-            epochs: None,
+            ..Default::default()
         };
         let invalid_claim2 = Claim {
             iat: None,
             exp: u64::MAX,
-            send_object_to: None,
-            epochs: None,
+            ..Default::default()
         };
 
         let encode_key = EncodingKey::from_secret(secret.as_bytes());
@@ -558,8 +655,7 @@ mod tests {
         let claim = Claim {
             iat: None,
             exp: u64::MAX,
-            send_object_to: None,
-            epochs: None,
+            ..Default::default()
         };
         let encode_key = EncodingKey::from_ed_der(doc.as_ref());
         let token = encode(
@@ -608,6 +704,67 @@ mod tests {
                     .uri("/")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Empty::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn verify_body_size() {
+        let secret = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+        let auth_config = auth_config_for_tests(Some(&secret), None, 0, true);
+
+        let claim = Claim {
+            iat: None,
+            exp: u64::MAX,
+            send_object_to: Some(SuiAddress::from_bytes(ADDRESS).expect("valid address")),
+            epochs: Some(1),
+            max_size: Some(10),
+            ..Default::default()
+        };
+        let encode_key = EncodingKey::from_secret(secret.as_bytes());
+        let token = encode(&Header::default(), &claim, &encode_key).unwrap();
+
+        let publisher_layers = ServiceBuilder::new().layer(axum::middleware::from_fn_with_state(
+            Arc::new(auth_config),
+            auth_layer,
+        ));
+
+        let router =
+            Router::new().route("/v1/blobs", get(|| async {}).route_layer(publisher_layers));
+
+        // Test invalid, body is too big
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/blobs?epochs=1&send_object_to={}",
+                        SuiAddress::from_bytes(ADDRESS).expect("valid address")
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(vec![42u8; 100]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Test valid
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/blobs?epochs=1&send_object_to={}",
+                        SuiAddress::from_bytes(ADDRESS).expect("valid address")
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(vec![42u8; 10]))
                     .unwrap(),
             )
             .await
