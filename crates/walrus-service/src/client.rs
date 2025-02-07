@@ -108,29 +108,38 @@ pub enum StoreWhen {
     /// storage space. This is useful when using the publisher, to avoid wasting multiple round
     /// trips to the fullnode.
     NotStoredIgnoreResources,
-    /// Store the blob always, without checking the status.
-    Always,
     /// Check the status of the blob before storing it, and store it only if it is not already.
     NotStored,
+    /// Store the blob always, without checking the status.
+    Always,
+    /// Store the blob always, without checking the status, and ignore the resources in the wallet.
+    AlwaysIgnoreResources,
 }
 
 impl StoreWhen {
-    /// Returns `true` if the operation is [`Self::Always`].
-    pub fn is_store_always(&self) -> bool {
-        matches!(self, Self::Always)
+    /// Returns `true` if the operation ignore the blob status.
+    ///
+    /// If `true`, the client should store the blob, even if the blob is already stored on Walrus
+    /// for a sufficient number of epochs.
+    pub fn is_ignore_status(&self) -> bool {
+        matches!(self, Self::Always | Self::AlwaysIgnoreResources)
     }
 
-    /// Returns `true` if the operation is [`Self::NotStoredIgnoreResources`].
+    /// Returns `true` if the operation should ignore the resources in the wallet.
     pub fn is_ignore_resources(&self) -> bool {
-        matches!(self, Self::NotStoredIgnoreResources)
+        matches!(
+            self,
+            Self::NotStoredIgnoreResources | Self::AlwaysIgnoreResources
+        )
     }
 
-    /// Returns [`Self`] based on the value of a `force` flag.
-    pub fn always(force: bool) -> Self {
-        if force {
-            Self::Always
-        } else {
-            Self::NotStored
+    /// Returns [`Self`] based on the value of the `force` and `ignore-resources` flags.
+    pub fn from_flags(force: bool, ignore_resources: bool) -> Self {
+        match (force, ignore_resources) {
+            (true, true) => Self::AlwaysIgnoreResources,
+            (true, false) => Self::Always,
+            (false, true) => Self::NotStoredIgnoreResources,
+            (false, false) => Self::NotStored,
         }
     }
 }
