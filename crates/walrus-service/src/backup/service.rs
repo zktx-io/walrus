@@ -365,10 +365,12 @@ async fn backup_fetcher(backup_config: BackupConfig) -> Result<()> {
         exchange_objects: vec![],
         wallet_config: None,
         communication_config: ClientCommunicationConfig::default(),
+        refresh_config: Default::default(),
     };
 
     let read_client =
-        Client::new_read_client(walrus_client_config, sui_read_client.clone()).await?;
+        Client::new_read_client_with_refresher(walrus_client_config, sui_read_client.clone())
+            .await?;
 
     let mut consecutive_fetch_errors = 0;
     loop {

@@ -50,7 +50,6 @@ pub trait WalrusReadClient {
         &self,
         blob_id: &BlobId,
     ) -> impl std::future::Future<Output = ClientResult<Vec<u8>>> + Send;
-    fn set_metric_registry(&mut self, registry: &Registry);
 }
 
 /// Trait representing a client that can write blobs to Walrus.
@@ -71,11 +70,7 @@ pub trait WalrusWriteClient: WalrusReadClient {
 
 impl<T: ReadClient> WalrusReadClient for Client<T> {
     async fn read_blob(&self, blob_id: &BlobId) -> ClientResult<Vec<u8>> {
-        self.read_blob_retry_epoch::<Primary>(blob_id).await
-    }
-
-    fn set_metric_registry(&mut self, registry: &Registry) {
-        self.set_metric_registry(registry);
+        self.read_blob_retry_committees::<Primary>(blob_id).await
     }
 }
 
@@ -89,7 +84,7 @@ impl WalrusWriteClient for Client<SuiContractClient> {
         post_store: PostStoreAction,
     ) -> ClientResult<BlobStoreResult> {
         let result = self
-            .reserve_and_store_blobs_retry_epoch(
+            .reserve_and_store_blobs_retry_committees(
                 &[blob],
                 epochs_ahead,
                 store_when,
@@ -132,8 +127,7 @@ impl<T: WalrusReadClient + Send + Sync + 'static> ClientDaemon<T> {
     ///
     /// The exposed APIs can be defined by calling a subset of the functions `with_*`. The daemon is
     /// started through [`Self::run()`].
-    fn new<A: OpenApi>(mut client: T, network_address: SocketAddr, registry: &Registry) -> Self {
-        client.set_metric_registry(registry);
+    fn new<A: OpenApi>(client: T, network_address: SocketAddr, registry: &Registry) -> Self {
         ClientDaemon {
             client: Arc::new(client),
             network_address,

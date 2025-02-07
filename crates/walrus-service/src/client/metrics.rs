@@ -15,8 +15,6 @@ use prometheus::{
     Registry,
 };
 
-use crate::common::telemetry::{self, CurrentEpochMetric, CurrentEpochStateMetric};
-
 const LATENCY_SEC_BUCKETS: &[f64] = &[
     1., 1.5, 2., 2.5, 3., 4., 5., 6., 7., 8., 9., 10., 20., 40., 80., 160.,
 ];
@@ -26,14 +24,6 @@ const LATENCY_SEC_BUCKETS: &[f64] = &[
 pub const WRITE_WORKLOAD: &str = "write";
 /// The name of the read workload.
 pub const READ_WORKLOAD: &str = "read";
-
-telemetry::define_metric_set! {
-    /// Metrics exported by the client daemon.
-    struct ClientMetricSet {
-        current_epoch: CurrentEpochMetric,
-        current_epoch_state: CurrentEpochStateMetric,
-    }
-}
 
 /// Container for the client metrics.
 #[derive(Debug)]

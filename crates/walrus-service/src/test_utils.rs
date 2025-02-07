@@ -2379,11 +2379,12 @@ pub mod test_cluster {
             exchange_objects: vec![],
             wallet_config: None,
             communication_config,
+            refresh_config: Default::default(),
         };
 
         let client = admin_contract_client
             .and_then_async(|contract_client| {
-                client::Client::new_contract_client(config, contract_client)
+                client::Client::new_contract_client_with_refresher(config, contract_client)
             })
             .await?;
 
