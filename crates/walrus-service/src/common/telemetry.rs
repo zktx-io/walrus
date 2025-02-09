@@ -289,9 +289,7 @@ pub(crate) async fn metrics_middleware(
     let (parts, body) = request.into_parts();
     let counted_body = Body::from_stream(body.into_data_stream().map(move |chunk| {
         chunk.inspect(|c| {
-            metrics
-                .request_size
-                .with_label_values(&[method_clone.as_str(), &route_clone])
+            walrus_utils::with_label!(metrics.request_size, method_clone.as_str(), &route_clone)
                 .observe(c.len() as f64);
         })
     }));
@@ -306,17 +304,18 @@ pub(crate) async fn metrics_middleware(
     let (parts, body) = response.into_parts();
     let counted_body = Body::from_stream(body.into_data_stream().map(move |chunk| {
         chunk.inspect(|c| {
-            metrics
-                .response_size
-                .with_label_values(&[method_clone.as_str(), &route_clone, status.as_str()])
-                .observe(c.len() as f64);
+            walrus_utils::with_label!(
+                metrics.response_size,
+                method_clone.as_str(),
+                &route_clone,
+                status.as_str()
+            )
+            .observe(c.len() as f64);
         })
     }));
     let response = http::Response::from_parts(parts, counted_body);
 
-    metrics
-        .duration
-        .with_label_values(&[method.as_str(), &route, status.as_str()])
+    walrus_utils::with_label!(metrics.duration, method.as_str(), &route, status.as_str())
         .observe(start.elapsed().as_secs_f64());
 
     response
@@ -369,17 +368,6 @@ pub(crate) fn register_http_metrics(registry: &Registry) -> HttpMetrics {
         response_size_histogram,
     )
 }
-
-macro_rules! with_label {
-    ($metric:expr, $label:expr) => {
-        $metric.with_label_values(&[$label.as_ref()])
-    };
-    ($metric:expr, $label1:expr, $label2:expr) => {
-        $metric.with_label_values(&[$label1.as_ref(), $label2.as_ref()])
-    };
-}
-
-pub(crate) use with_label;
 
 /// Defines a set of prometheus metrics.
 ///
@@ -568,25 +556,25 @@ impl CurrentEpochStateMetric {
     /// Record the current state as being `EpochState::EpochChangeSync`.
     pub fn set_change_sync_state(&self) {
         self.clear_state();
-        with_label!(self.0, Self::CHANGE_SYNC).set(true.into());
+        walrus_utils::with_label!(self.0, Self::CHANGE_SYNC).set(true.into());
     }
 
     /// Record the current state as being `EpochState::EpochChangeDone`.
     pub fn set_change_done_state(&self) {
         self.clear_state();
-        with_label!(self.0, Self::CHANGE_DONE).set(true.into());
+        walrus_utils::with_label!(self.0, Self::CHANGE_DONE).set(true.into());
     }
 
     /// Record the current state as being `EpochState::NextParamsSelected`.
     pub fn set_next_params_selected_state(&self) {
         self.clear_state();
-        with_label!(self.0, Self::NEXT_PARAMS_SELECTED).set(true.into());
+        walrus_utils::with_label!(self.0, Self::NEXT_PARAMS_SELECTED).set(true.into());
     }
 
     fn clear_state(&self) {
-        with_label!(self.0, Self::CHANGE_SYNC).set(false.into());
-        with_label!(self.0, Self::CHANGE_DONE).set(false.into());
-        with_label!(self.0, Self::NEXT_PARAMS_SELECTED).set(false.into());
+        walrus_utils::with_label!(self.0, Self::CHANGE_SYNC).set(false.into());
+        walrus_utils::with_label!(self.0, Self::CHANGE_DONE).set(false.into());
+        walrus_utils::with_label!(self.0, Self::NEXT_PARAMS_SELECTED).set(false.into());
     }
 }
 
