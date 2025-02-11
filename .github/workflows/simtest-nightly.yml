@@ -1,9 +1,11 @@
-name: Simulator Tests
+name: Simtest Nightly
 
 concurrency:
   group: ${{ github.workflow }}
 
 on:
+  schedule:
+    - cron: "0 21 * * *" # equivalent to 1pm PST
   workflow_dispatch:
     inputs:
       walrus_ref:
@@ -36,7 +38,7 @@ jobs:
       - name: Install Teleport
         uses: teleport-actions/setup@176c25dfcd19cd31a252f275d579822b243e7b9c # pin@v1.0.6
         with:
-          version: 11.3.1
+          version: 12.1.0
       - name: Authorize against Teleport
         id: auth
         uses: teleport-actions/auth@9091dad16a564f3c5b9c2ec520b234a4872b6879 # pin@v1
@@ -50,19 +52,27 @@ jobs:
           certificate-ttl: 2h
 
       # Cargo clean and git restore on any left over files from git checkout, and deletes all remote tracking branches
+      # Note that we need to clear the ~/walrus_simtest_tmp directory because it is a tmpfs and will fill up pretty quickly
       - name: Environment clean
         run: |
-          tsh -i ${{ steps.auth.outputs.identity-file }} --ttl 5 ssh ubuntu@simtest-01 "source ~/.bashrc && source ~/.cargo/env && rm -rf ~/walrus"
+          tsh -i ${{ steps.auth.outputs.identity-file }} --ttl 5 ssh ubuntu@simtest-01 \
+            "source ~/.bashrc && \
+            source ~/.cargo/env && \
+            rm -rf ~/walrus && \
+            rm -rf ~/walrus_simtest_tmp"
           tsh -i ${{ steps.auth.outputs.identity-file }} --ttl 5 ssh ubuntu@simtest-01 \
             "source ~/.bashrc && \
             source ~/.cargo/env && \
             cd ~/ && \
-            git clone https://x-access-token:${GITHUB_TOKEN}@github.com:MystenLabs/walrus.git"
+            git clone https://x-access-token:${{secrets.GITHUB_TOKEN}}@github.com/MystenLabs/walrus.git"
 
-      # Deleting files in tmpfs that usually fill up pretty quickly after each run. Cargo clean to free up space as well.
-      - name: Tmpfs and cargo clean
+      # Creating the ~/walrus_simtest_tmp directory to ensure that it exists.
+      # It is the tmpfs directory that is used for the simulator tests. When publishing contracts,
+      # it requires that the contracts must exist in the same file system as the simulator tests.
+      # Therefore, we cannot simply use the /tmp directory for the simulator tests.
+      - name: Creating the tmpfs directory and cleaning the cargo cache
         run: |
-          tsh -i ${{ steps.auth.outputs.identity-file }} --ttl 5 ssh ubuntu@simtest-01 "sudo rm -rf /tmp/*"
+          tsh -i ${{ steps.auth.outputs.identity-file }} --ttl 5 ssh ubuntu@simtest-01 "mkdir -p ~/walrus_simtest_tmp"
           tsh -i ${{ steps.auth.outputs.identity-file }} --ttl 5 ssh ubuntu@simtest-01 \
             "source ~/.bashrc && \
             source ~/.cargo/env && \
