@@ -37,6 +37,7 @@ use crate::client::{
         ExchangeOutput,
         ExtendBlobOutput,
         FundSharedBlobOutput,
+        GetBlobAttributeOutput,
         InfoBftOutput,
         InfoCommitteeOutput,
         InfoEpochOutput,
@@ -999,6 +1000,19 @@ fn add_node_health_to_table(table: &mut Table, node: &NodeHealthOutput, node_idx
                 r->"N/A",
                 Fr->truncated_error,
             ]);
+        }
+    }
+}
+
+impl CliOutput for GetBlobAttributeOutput {
+    fn print_cli_output(&self) {
+        if let Some(attribute) = &self.attribute {
+            println!("\n{}", "Attribute".bold().walrus_purple());
+            for (key, value) in attribute.iter() {
+                println!("{}: {}", key, value);
+            }
+        } else {
+            println!("No attribute found");
         }
     }
 }
