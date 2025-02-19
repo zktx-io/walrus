@@ -552,6 +552,10 @@ pub enum DaemonCommands {
         #[serde(flatten)]
         /// The daemon args.
         daemon_args: DaemonArgs,
+        #[clap(flatten)]
+        #[serde(flatten, default)]
+        /// The aggregator args.
+        aggregator_args: AggregatorArgs,
     },
     /// Run a client daemon at the provided network address, combining the functionality of an
     /// aggregator and a publisher.
@@ -560,6 +564,10 @@ pub enum DaemonCommands {
         #[serde(flatten)]
         /// The publisher args.
         args: PublisherArgs,
+        #[clap(flatten)]
+        #[serde(flatten, default)]
+        /// The aggregator args.
+        aggregator_args: AggregatorArgs,
     },
 }
 
@@ -569,9 +577,24 @@ impl DaemonCommands {
         match &self {
             DaemonCommands::Publisher { args } => args.daemon_args.metrics_address,
             DaemonCommands::Aggregator { daemon_args, .. } => daemon_args.metrics_address,
-            DaemonCommands::Daemon { args } => args.daemon_args.metrics_address,
+            DaemonCommands::Daemon { args, .. } => args.daemon_args.metrics_address,
         }
     }
+}
+
+/// The arguments for the aggregator service.
+#[derive(Debug, Clone, Args, Deserialize, PartialEq, Default, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregatorArgs {
+    /// Allowed headers for the daemon.
+    ///
+    /// This defines the allow-list of headers. It is currently used for the
+    /// /v1/blobs/by-object-id/{blob_object_id} aggregator endpoint. The response will include the
+    /// allowed headers if the specified header names are present in the BlobAttribute associated
+    /// with the requested blob.
+    #[clap(long, num_args = 1.., default_values_t = default::allowed_headers())]
+    #[serde(default = "default::allowed_headers")]
+    pub(crate) allowed_headers: Vec<String>,
 }
 
 /// The arguments for the publisher service.
@@ -1159,6 +1182,18 @@ pub(crate) mod default {
     pub(crate) fn faucet_timeout() -> Duration {
         Duration::from_secs(60)
     }
+
+    pub(crate) fn allowed_headers() -> Vec<String> {
+        vec![
+            "content-type".to_string(),
+            "authorization".to_string(),
+            "content-disposition".to_string(),
+            "content-encoding".to_string(),
+            "content-language".to_string(),
+            "content-location".to_string(),
+            "link".to_string(),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -1237,6 +1272,9 @@ mod tests {
                 jwt_expiring_sec: 0,
                 jwt_verify_upload: false,
                 replay_suppression_config: Default::default(),
+            },
+            aggregator_args: AggregatorArgs {
+                allowed_headers: default::allowed_headers(),
             },
         })
     }

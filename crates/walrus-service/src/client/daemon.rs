@@ -3,7 +3,7 @@
 
 //! A client daemon who serves a set of simple HTTP endpoints to store, encode, or read blobs.
 
-use std::{fmt::Debug, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use axum::{
     body::HttpBody,
@@ -22,7 +22,14 @@ use axum_extra::{
 use openapi::{AggregatorApiDoc, DaemonApiDoc, PublisherApiDoc};
 use prometheus::Registry;
 use reqwest::StatusCode;
-use routes::{PublisherQuery, BLOB_GET_ENDPOINT, BLOB_PUT_ENDPOINT, STATUS_ENDPOINT};
+use routes::{
+    PublisherQuery,
+    BLOB_GET_ENDPOINT,
+    BLOB_OBJECT_GET_ENDPOINT,
+    BLOB_PUT_ENDPOINT,
+    STATUS_ENDPOINT,
+};
+use sui_types::base_types::ObjectID;
 use tower::{
     buffer::BufferLayer,
     limit::ConcurrencyLimitLayer,
@@ -33,11 +40,18 @@ use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_redoc::{Redoc, Servable};
 use walrus_core::{encoding::Primary, BlobId, EpochCount};
-use walrus_sui::client::{BlobPersistence, PostStoreAction, ReadClient, SuiContractClient};
+use walrus_sui::{
+    client::{BlobPersistence, PostStoreAction, ReadClient, SuiContractClient},
+    types::move_structs::BlobWithAttribute,
+};
 
 use super::{responses::BlobStoreResult, Client, ClientResult, StoreWhen};
 use crate::{
-    client::{config::AuthConfig, daemon::auth::verify_jwt_claim},
+    client::{
+        cli::{AggregatorArgs, PublisherArgs},
+        config::AuthConfig,
+        daemon::auth::verify_jwt_claim,
+    },
     common::telemetry::{metrics_middleware, register_http_metrics, HttpMetrics, MakeHttpSpan},
 };
 
@@ -52,6 +66,11 @@ pub trait WalrusReadClient {
         &self,
         blob_id: &BlobId,
     ) -> impl std::future::Future<Output = ClientResult<Vec<u8>>> + Send;
+
+    fn get_blob_by_object_id(
+        &self,
+        blob_object_id: &ObjectID,
+    ) -> impl std::future::Future<Output = ClientResult<BlobWithAttribute>> + Send;
 }
 
 /// Trait representing a client that can write blobs to Walrus.
@@ -73,6 +92,13 @@ pub trait WalrusWriteClient: WalrusReadClient {
 impl<T: ReadClient> WalrusReadClient for Client<T> {
     async fn read_blob(&self, blob_id: &BlobId) -> ClientResult<Vec<u8>> {
         self.read_blob_retry_committees::<Primary>(blob_id).await
+    }
+
+    async fn get_blob_by_object_id(
+        &self,
+        blob_object_id: &ObjectID,
+    ) -> ClientResult<BlobWithAttribute> {
+        self.get_blob_by_object_id(blob_object_id).await
     }
 }
 
@@ -116,12 +142,19 @@ pub struct ClientDaemon<T> {
     network_address: SocketAddr,
     metrics: HttpMetrics,
     router: Router<Arc<T>>,
+    allowed_headers: Arc<HashSet<String>>,
 }
 
 impl<T: WalrusReadClient + Send + Sync + 'static> ClientDaemon<T> {
     /// Constructs a new [`ClientDaemon`] with aggregator functionality.
-    pub fn new_aggregator(client: T, network_address: SocketAddr, registry: &Registry) -> Self {
-        Self::new::<AggregatorApiDoc>(client, network_address, registry).with_aggregator()
+    pub fn new_aggregator(
+        client: T,
+        network_address: SocketAddr,
+        registry: &Registry,
+        allowed_headers: Vec<String>,
+    ) -> Self {
+        Self::new::<AggregatorApiDoc>(client, network_address, registry)
+            .with_aggregator(allowed_headers)
     }
 
     /// Creates a new [`ClientDaemon`], which serves requests at the provided `network_address` and
@@ -137,12 +170,22 @@ impl<T: WalrusReadClient + Send + Sync + 'static> ClientDaemon<T> {
             router: Router::new()
                 .merge(Redoc::with_url(routes::API_DOCS, A::openapi()))
                 .route(STATUS_ENDPOINT, get(routes::status)),
+            allowed_headers: Arc::new(HashSet::new()),
         }
     }
 
     /// Specifies that the daemon should expose the aggregator interface (read blobs).
-    fn with_aggregator(mut self) -> Self {
-        self.router = self.router.route(BLOB_GET_ENDPOINT, get(routes::get_blob));
+    fn with_aggregator(mut self, allowed_headers: Vec<String>) -> Self {
+        self.with_allowed_headers(allowed_headers);
+        tracing::info!("Aggregator allowed headers: {:?}", self.allowed_headers);
+        self.router = self
+            .router
+            .route(BLOB_GET_ENDPOINT, get(routes::get_blob))
+            .route(
+                BLOB_OBJECT_GET_ENDPOINT,
+                get(routes::get_blob_by_object_id)
+                    .with_state((self.client.clone(), self.allowed_headers.clone())),
+            );
         self
     }
 
@@ -196,19 +239,17 @@ impl<T: WalrusWriteClient + Send + Sync + 'static> ClientDaemon<T> {
     pub fn new_daemon(
         client: T,
         auth_config: Option<AuthConfig>,
-        network_address: SocketAddr,
-        max_body_limit: usize,
         registry: &Registry,
-        max_request_buffer_size: usize,
-        max_concurrent_requests: usize,
+        publisher_args: &PublisherArgs,
+        aggregator_args: &AggregatorArgs,
     ) -> Self {
-        Self::new::<DaemonApiDoc>(client, network_address, registry)
-            .with_aggregator()
+        Self::new::<DaemonApiDoc>(client, publisher_args.daemon_args.bind_address, registry)
+            .with_aggregator(aggregator_args.allowed_headers.clone())
             .with_publisher(
                 auth_config,
-                max_body_limit,
-                max_request_buffer_size,
-                max_concurrent_requests,
+                publisher_args.max_body_size_kib,
+                publisher_args.max_request_buffer_size,
+                publisher_args.max_concurrent_requests,
             )
     }
 
@@ -259,6 +300,12 @@ impl<T: WalrusWriteClient + Send + Sync + 'static> ClientDaemon<T> {
             );
         }
         self
+    }
+}
+
+impl<T> ClientDaemon<T> {
+    fn with_allowed_headers(&mut self, allowed_headers: Vec<String>) {
+        self.allowed_headers = Arc::new(allowed_headers.into_iter().collect());
     }
 }
 

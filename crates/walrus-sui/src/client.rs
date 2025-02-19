@@ -885,7 +885,7 @@ impl SuiContractClient {
         // Check if attribute exists first
         let attribute_exists = inner
             .read_client
-            .get_blob_attribute(blob_obj_id)
+            .get_blob_attribute(&blob_obj_id)
             .await?
             .is_some();
 
@@ -2057,16 +2057,16 @@ impl ReadClient for SuiContractClient {
 
     async fn get_blob_attribute(
         &self,
-        blob_obj_id: ObjectID,
+        blob_obj_id: &ObjectID,
     ) -> SuiClientResult<Option<BlobAttribute>> {
         self.read_client.get_blob_attribute(blob_obj_id).await
     }
 
-    async fn get_blob_with_attribute(
+    async fn get_blob_by_object_id(
         &self,
-        blob_obj_id: ObjectID,
+        blob_obj_id: &ObjectID,
     ) -> SuiClientResult<BlobWithAttribute> {
-        self.read_client.get_blob_with_attribute(blob_obj_id).await
+        self.read_client.get_blob_by_object_id(blob_obj_id).await
     }
 
     async fn epoch_state(&self) -> SuiClientResult<EpochState> {
