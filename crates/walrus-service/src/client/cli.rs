@@ -32,8 +32,11 @@ pub use args::{
     CliCommands,
     Commands,
     DaemonCommands,
+    HealthSortBy,
     NodeSelection,
+    NodeSortBy,
     PublisherArgs,
+    SortBy,
 };
 pub use cli_output::CliOutput;
 pub use runner::ClientCommandRunner;

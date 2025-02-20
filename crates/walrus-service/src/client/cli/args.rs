@@ -13,7 +13,7 @@ use std::{
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use jsonwebtoken::Algorithm;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use sui_types::base_types::ObjectID;
 use walrus_core::{encoding::EncodingConfig, ensure, BlobId, Epoch, EpochCount};
@@ -295,6 +295,10 @@ pub enum CliCommands {
         #[clap(long, action)]
         #[serde(default)]
         detail: bool,
+        /// Sort configuration
+        #[clap(flatten)]
+        #[serde(flatten)]
+        sort: SortBy<HealthSortBy>,
     },
     /// Encode the specified file to obtain its blob ID.
     BlobId {
@@ -511,7 +515,12 @@ pub enum CliCommands {
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum InfoCommands {
     /// Print all information listed below.
-    All,
+    All {
+        /// Sort configuration for committee information
+        #[clap(flatten)]
+        #[serde(flatten)]
+        sort: SortBy<NodeSortBy>,
+    },
     /// Print epoch information.
     Epoch,
     /// Print storage information.
@@ -523,7 +532,12 @@ pub enum InfoCommands {
     /// Print byzantine fault tolerance (BFT) information.
     Bft,
     /// Print committee information.
-    Committee,
+    Committee {
+        /// Sort configuration
+        #[clap(flatten)]
+        #[serde(flatten)]
+        sort: SortBy<NodeSortBy>,
+    },
 }
 
 /// The daemon commands for the Walrus client.
@@ -1337,5 +1351,57 @@ impl UserConfirmation {
     /// Checks if the user confirmation is required.
     pub fn is_required(&self) -> bool {
         matches!(self, UserConfirmation::Required)
+    }
+}
+
+/// Sort options for node information display
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeSortBy {
+    /// Sort by node ID
+    Id,
+    /// Sort by node name
+    #[default]
+    Name,
+    /// Sort by node URL
+    Url,
+}
+
+/// Sort options for health information display
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HealthSortBy {
+    /// Sort by node status
+    #[default]
+    Status,
+    /// Sort by node ID
+    Id,
+    /// Sort by node name
+    Name,
+    /// Sort by node URL
+    Url,
+}
+
+/// Generic sort configuration that can be used with any ValueEnum type
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, clap::Args)]
+#[serde(rename_all = "camelCase")]
+pub struct SortBy<T: clap::ValueEnum + Send + Sync + Default + 'static> {
+    /// Field to sort by
+    #[clap(long, value_enum)]
+    #[serde(default)]
+    pub sort_by: Option<T>,
+
+    /// Sort in descending order
+    #[clap(long, action)]
+    #[serde(default)]
+    pub desc: bool,
+}
+
+impl<T: clap::ValueEnum + Send + Sync + Default + 'static> Default for SortBy<T> {
+    fn default() -> Self {
+        Self {
+            sort_by: Some(T::default()),
+            desc: false,
+        }
     }
 }

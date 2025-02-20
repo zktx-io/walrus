@@ -865,18 +865,15 @@ impl CliOutput for ServiceHealthInfoOutput {
         let mut owned_shards = 0;
         let mut read_only_shards = 0;
         let mut node_statuses = std::collections::HashMap::new();
-        let mut error_nodes = Vec::new();
-
         let mut table = create_node_health_table();
+
         // Collect summary information while building the table
-        for (node_idx, node) in self.health_info.iter().enumerate() {
+        for (idx, node) in self.health_info.iter().enumerate() {
             match &node.health_info {
                 Err(_) => {
                     *node_statuses.entry("Error".to_string()).or_insert(0) += 1;
-                    error_nodes.push(node);
                 }
                 Ok(health_info) => {
-                    node.print_cli_output();
                     owned_shards += health_info.shard_summary.owned;
                     read_only_shards += health_info.shard_summary.read_only;
                     *node_statuses
@@ -884,7 +881,8 @@ impl CliOutput for ServiceHealthInfoOutput {
                         .or_insert(0) += 1;
                 }
             }
-            add_node_health_to_table(&mut table, node, node_idx);
+            node.print_cli_output();
+            add_node_health_to_table(&mut table, node, idx);
         }
         if table.len() > 3 {
             println!("\n{}\n", "Summary".bold().walrus_purple());
@@ -896,14 +894,6 @@ impl CliOutput for ServiceHealthInfoOutput {
             println!("\n{}", "Node Status Breakdown".bold().walrus_purple());
             for (status, count) in &node_statuses {
                 println!("{}: {}", status, count);
-            }
-        }
-
-        // Print error nodes summary if there are any errors
-        if !error_nodes.is_empty() {
-            println!("\n{}", "Nodes with Errors".bold().walrus_purple());
-            for node in error_nodes {
-                node.print_cli_output();
             }
         }
     }
