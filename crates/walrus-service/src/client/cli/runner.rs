@@ -21,7 +21,12 @@ use sui_config::{sui_config_dir, SUI_CLIENT_CONFIG};
 use sui_sdk::wallet_context::WalletContext;
 use sui_types::base_types::ObjectID;
 use walrus_core::{
-    encoding::{encoded_blob_length_for_n_shards, EncodingConfig, Primary},
+    encoding::{
+        encoded_blob_length_for_n_shards,
+        EncodingConfig,
+        EncodingConfigTrait as _,
+        Primary,
+    },
     ensure,
     metadata::BlobMetadataApi as _,
     BlobId,
@@ -100,6 +105,7 @@ use crate::{
         ClientDaemon,
         Config,
         StoreWhen,
+        ENCODING_TYPE,
     },
     utils::{self, generate_sui_wallet, MetricsAndLoggingRuntime},
 };
@@ -561,9 +567,12 @@ impl ClientCommandRunner {
                 .encode_pairs_and_metadata(&blob, &MultiProgress::new())
                 .await?;
             let unencoded_size = metadata.metadata().unencoded_length();
-            let encoded_size =
-                encoded_blob_length_for_n_shards(encoding_config.n_shards(), unencoded_size)
-                    .expect("must be valid as the encoding succeeded");
+            let encoded_size = encoded_blob_length_for_n_shards(
+                encoding_config.n_shards(),
+                unencoded_size,
+                ENCODING_TYPE,
+            )
+            .expect("must be valid as the encoding succeeded");
             let storage_cost = client.get_price_computation().await?.operation_cost(
                 &crate::client::resource::RegisterBlobOp::RegisterFromScratch {
                     encoded_length: encoded_size,
@@ -737,8 +746,8 @@ impl ClientCommandRunner {
         let spinner = styled_spinner();
         spinner.set_message("computing the blob ID");
         let metadata = EncodingConfig::new(n_shards)
-            .get_blob_encoder(&read_blob_from_file(&file)?)?
-            .compute_metadata();
+            .get_for_type(ENCODING_TYPE)
+            .compute_metadata(&read_blob_from_file(&file)?)?;
         spinner.finish_with_message(format!("blob ID computed: {}", metadata.blob_id()));
 
         BlobIdOutput::new(&file, &metadata).print_output(self.json)
