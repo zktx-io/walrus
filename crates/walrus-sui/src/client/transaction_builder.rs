@@ -44,9 +44,8 @@ use super::{
 use crate::{
     contracts::{self, FunctionTag},
     types::{
-        move_structs::{Authorized, BlobAttribute, WalExchange},
+        move_structs::{Authorized, BlobAttribute, NodeMetadata, WalExchange},
         NetworkAddress,
-        NodeMetadata,
         NodeRegistrationParams,
         NodeUpdateParams,
         SystemObject,
@@ -947,13 +946,13 @@ impl WalrusPtbBuilder {
     /// `set_node_metadata` with the metadata argument.
     pub async fn set_node_metadata(
         &mut self,
-        storage_node_cap: ArgumentOrOwnedObject,
+        storage_node_cap: &ArgumentOrOwnedObject,
         node_metadata: &NodeMetadata,
     ) -> SuiClientResult<()> {
         let metadata_arg = self.create_node_metadata(node_metadata).await?;
         let args = vec![
             self.staking_arg(Mutability::Mutable).await?,
-            self.argument_from_arg_or_obj(storage_node_cap).await?,
+            self.argument_from_arg_or_obj(*storage_node_cap).await?,
             metadata_arg,
         ];
         self.walrus_move_call(contracts::staking::set_node_metadata, args)?;
@@ -1115,6 +1114,10 @@ impl WalrusPtbBuilder {
         if let Some(node_capacity) = params.node_capacity {
             self.update_node_capacity(&storage_node_cap, node_capacity)
                 .await?;
+        }
+
+        if let Some(metadata) = params.metadata {
+            self.set_node_metadata(&storage_node_cap, &metadata).await?;
         }
 
         Ok(())

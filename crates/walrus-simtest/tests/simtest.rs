@@ -33,7 +33,7 @@ mod tests {
     };
     use walrus_sui::{
         client::{BlobPersistence, PostStoreAction, ReadClient, SuiContractClient},
-        types::{move_structs::VotingParams, NetworkAddress},
+        types::{move_structs::VotingParams, NetworkAddress, NodeMetadata},
     };
     use walrus_test_utils::WithTempDir;
 
@@ -968,7 +968,7 @@ mod tests {
 
     #[walrus_simtest]
     #[ignore = "ignore simtests by default"]
-    async fn test_registered_node_update_params() {
+    async fn test_sync_node_config_params_basic() {
         let (_sui_cluster, mut walrus_cluster, client) =
             test_cluster::default_setup_with_epoch_duration_generic::<SimStorageNodeHandle>(
                 Duration::from_secs(30),
@@ -999,6 +999,11 @@ mod tests {
             write_price: rand::thread_rng().gen_range(1..100),
             node_capacity: rand::thread_rng().gen_range(1_000_000..1_000_000_000),
         };
+        let metadata = NodeMetadata::new(
+            "https://walrus.io/images/walrus.jpg".to_string(),
+            "https://walrus.io".to_string(),
+            "Alias for walrus is sea elephant".to_string(),
+        );
 
         // Check that the registered node has the original network address.
         let pool = client_arc
@@ -1033,6 +1038,15 @@ mod tests {
             &pool.node_info.network_public_key,
             network_key_pair.public()
         );
+        let metadata_on_chain = client_arc
+            .as_ref()
+            .as_ref()
+            .sui_client()
+            .read_client
+            .get_node_metadata(pool.node_info.metadata)
+            .await
+            .expect("Failed to get node metadata");
+        assert_ne!(metadata, metadata_on_chain);
 
         // Update the node config with the new params.
         walrus_cluster.nodes[5].storage_node_config.public_port = new_address.port();
@@ -1043,6 +1057,7 @@ mod tests {
         walrus_cluster.nodes[5].storage_node_config.voting_params = voting_params.clone();
         walrus_cluster.nodes[5].rest_api_address = new_address;
         walrus_cluster.nodes[5].network_public_key = network_key_pair.public().clone();
+        walrus_cluster.nodes[5].storage_node_config.metadata = metadata.clone();
 
         walrus_cluster.nodes[5].node_id = Some(
             SimStorageNodeHandle::spawn_node(
@@ -1114,6 +1129,16 @@ mod tests {
                 .public()
         );
         assert_eq!(pool.voting_params, voting_params);
+
+        let metadata_on_chain = client_arc
+            .as_ref()
+            .as_ref()
+            .sui_client()
+            .read_client
+            .get_node_metadata(pool.node_info.metadata)
+            .await
+            .expect("Failed to get node metadata");
+        assert_eq!(metadata, metadata_on_chain);
 
         assert_eq!(
             get_nodes_health_info(&[&walrus_cluster.nodes[5]])

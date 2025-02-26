@@ -27,7 +27,11 @@ use walrus_sui::{
 };
 use walrus_utils::backoff::{self, ExponentialBackoff};
 
-use super::{committee::CommitteeService, config::StorageNodeConfig, errors::SyncNodeConfigError};
+use super::{
+    committee::CommitteeService,
+    config::{StorageNodeConfig, SyncedNodeConfigSet},
+    errors::SyncNodeConfigError,
+};
 use crate::common::config::SuiConfig;
 
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -144,6 +148,38 @@ impl SuiSystemContractService {
             committee_service,
         ))
     }
+
+    /// Fetches the synced node config set from the contract.
+    pub async fn get_synced_node_config_set(
+        &self,
+        node_capability_object_id: ObjectID,
+    ) -> Result<SyncedNodeConfigSet, anyhow::Error> {
+        let node_capability = self
+            .get_node_capability_object(Some(node_capability_object_id))
+            .await?;
+        let contract_client: tokio::sync::MutexGuard<'_, SuiContractClient> =
+            self.contract_client.lock().await;
+        let pool = contract_client
+            .read_client
+            .get_staking_pool(node_capability.node_id)
+            .await?;
+
+        let node_info = pool.node_info.clone();
+        let metadata = contract_client
+            .read_client
+            .get_node_metadata(node_info.metadata)
+            .await?;
+
+        Ok(SyncedNodeConfigSet {
+            name: node_info.name,
+            network_address: node_info.network_address,
+            network_public_key: node_info.network_public_key,
+            public_key: node_info.public_key,
+            next_public_key: node_info.next_epoch_public_key,
+            voting_params: pool.voting_params,
+            metadata,
+        })
+    }
 }
 
 #[async_trait]
@@ -157,33 +193,23 @@ impl SystemContractService for SuiSystemContractService {
         config: &StorageNodeConfig,
         node_capability_object_id: ObjectID,
     ) -> Result<(), SyncNodeConfigError> {
-        let node_capability = self
-            .get_node_capability_object(Some(node_capability_object_id))
-            .await?;
-        let contract_client: tokio::sync::MutexGuard<'_, SuiContractClient> =
-            self.contract_client.lock().await;
-        let pool = contract_client
-            .read_client
-            .get_staking_pool(node_capability.node_id)
+        let synced_config = self
+            .get_synced_node_config_set(node_capability_object_id)
             .await?;
 
-        let node_info = &pool.node_info;
+        tracing::debug!("on-chain synced config: {:?}", synced_config);
 
-        let mut update_params = config.generate_update_params(
-            node_info.name.as_str(),
-            node_info.network_address.0.as_str(),
-            &node_info.network_public_key,
-            &pool.voting_params,
-        );
-
+        let mut update_params = config.generate_update_params(&synced_config);
         let action = calculate_protocol_key_action(
             config.protocol_key_pair().public().clone(),
             config
                 .next_protocol_key_pair()
                 .map(|kp| kp.public().clone()),
-            node_info.public_key.clone(),
-            node_info.next_epoch_public_key.clone(),
+            synced_config.public_key.clone(),
+            synced_config.next_public_key.clone(),
         )?;
+        let contract_client: tokio::sync::MutexGuard<'_, SuiContractClient> =
+            self.contract_client.lock().await;
         match action {
             ProtocolKeyAction::UpdateRemoteNextPublicKey(next_public_key) => {
                 tracing::info!(
@@ -211,7 +237,6 @@ impl SystemContractService for SuiSystemContractService {
         if update_params.needs_update() {
             tracing::info!(
                 node_name = config.name,
-                node_id = ?node_info.node_id,
                 update_params = ?update_params,
                 "update node params"
             );
@@ -225,7 +250,6 @@ impl SystemContractService for SuiSystemContractService {
         } else {
             tracing::info!(
                 node_name = config.name,
-                node_id = ?node_info.node_id,
                 "node parameters are in sync with on-chain values"
             );
         }
