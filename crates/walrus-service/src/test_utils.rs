@@ -628,6 +628,7 @@ impl Drop for SimStorageNodeHandle {
 /// See function level documentation for details on the various configuration settings.
 #[derive(Debug)]
 pub struct StorageNodeHandleBuilder {
+    name: Option<String>,
     storage: Option<WithTempDir<Storage>>,
     blocklist_path: Option<PathBuf>,
     event_provider: Box<dyn SystemEventProvider>,
@@ -786,6 +787,12 @@ impl StorageNodeHandleBuilder {
         self
     }
 
+    /// Specify the node's name.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
     /// Creates the configured [`StorageNodeHandle`].
     pub async fn build(self) -> anyhow::Result<StorageNodeHandle> {
         // Identify the storage being used, as it allows us to extract the shards
@@ -842,6 +849,7 @@ impl StorageNodeHandleBuilder {
 
         // Create the node's config using the previously generated keypair and address.
         let config = StorageNodeConfig {
+            name: self.name.unwrap_or_else(|| "node".to_string()),
             storage_path: temp_dir.path().to_path_buf(),
             protocol_key_pair: node_info.key_pair.into(),
             next_protocol_key_pair: None,
@@ -1059,6 +1067,7 @@ impl StorageNodeHandleBuilder {
 impl Default for StorageNodeHandleBuilder {
     fn default() -> Self {
         Self {
+            name: None,
             shard_sync_config: None,
             event_provider: Box::<Vec<ContractEvent>>::default(),
             blocklist_path: None,
@@ -1806,17 +1815,20 @@ impl TestClusterBuilder {
         let mut lookup_service_and_handle = None;
 
         for (
+            idx,
             (
                 (
                     (
-                        ((((config, event_provider), service), contract_service), capability),
-                        node_wallet_dir,
+                        (
+                            ((((config, event_provider), service), contract_service), capability),
+                            node_wallet_dir,
+                        ),
+                        start_node_from_beginning,
                     ),
-                    start_node_from_beginning,
+                    blocklist_file,
                 ),
-                blocklist_file,
+                disable_event_blob_writer,
             ),
-            disable_event_blob_writer,
         ) in self
             .storage_node_configs
             .into_iter()
@@ -1828,6 +1840,7 @@ impl TestClusterBuilder {
             .zip(self.start_node_from_beginning.into_iter())
             .zip(self.blocklist_files.into_iter())
             .zip(self.disable_event_blob_writer.into_iter())
+            .enumerate()
         {
             let local_identity = config.key_pair.public().clone();
             let builder = StorageNodeHandle::builder()
@@ -1840,7 +1853,8 @@ impl TestClusterBuilder {
                 .with_blocklist_file(blocklist_file)
                 .with_shard_sync_config(self.shard_sync_config.clone().unwrap_or_default())
                 .with_disabled_event_blob_writer(disable_event_blob_writer)
-                .with_enable_node_config_synchronizer(self.enable_node_config_synchronizer);
+                .with_enable_node_config_synchronizer(self.enable_node_config_synchronizer)
+                .with_name(format!("node-{}", idx));
             tracing::info!(
                 "test cluster builder build enable_node_config_synchronizer: {}",
                 self.enable_node_config_synchronizer
