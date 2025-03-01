@@ -352,10 +352,10 @@ pub enum CliCommands {
     ///
     /// This command is only available for blobs that are deletable.
     Delete {
-        /// The filename, or the blob ID, or the object ID of the blob to delete.
+        /// The filename(s), or the blob ID(s), or the object ID(s) of the blob(s) to delete.
         #[clap(flatten)]
         #[serde(flatten)]
-        target: FileOrBlobIdOrObjectId,
+        target: BlobIdentifiers,
         /// Proceed to delete the blob without confirmation.
         #[clap(long, action)]
         #[serde(default)]
@@ -938,76 +938,118 @@ impl FileOrBlobId {
     }
 }
 
+/// Represents a blob.
 #[serde_as]
-#[derive(Debug, Clone, Args, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Args, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-#[group(required = true, multiple = false)]
-pub struct FileOrBlobIdOrObjectId {
-    /// The file containing the blob to be deleted.
-    ///
-    /// This is equivalent to calling `blob-id` on the file, and then deleting with `--blob-id`.
-    #[clap(long)]
-    #[serde(default)]
-    pub(crate) file: Option<PathBuf>,
-    /// The blob ID to be deleted.
-    ///
-    /// This command deletes _all_ owned blob objects matching the provided blob ID.
-    #[clap(long, allow_hyphen_values = true, value_parser = parse_blob_id)]
+pub struct BlobIdentity {
     #[serde_as(as = "Option<DisplayFromStr>")]
-    #[serde(default)]
     pub(crate) blob_id: Option<BlobId>,
-    /// The object ID of the blob object to be deleted.
-    ///
-    /// This command deletes only the blob object with the given object ID.
-    #[clap(long)]
+    pub(crate) file: Option<PathBuf>,
     #[serde_as(as = "Option<DisplayFromStr>")]
-    #[serde(default)]
     pub(crate) object_id: Option<ObjectID>,
 }
 
-impl FileOrBlobIdOrObjectId {
-    pub(crate) fn get_or_compute_blob_id(
+impl std::fmt::Display for BlobIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut identity = String::new();
+        if let Some(blob_id) = &self.blob_id {
+            identity = format!("blob ID: {}", blob_id);
+        }
+        if let Some(file) = &self.file {
+            if !identity.is_empty() {
+                identity.push(' ');
+            }
+            identity.push_str(&format!("file: {}", file.display()));
+        }
+        if let Some(object_id) = &self.object_id {
+            if !identity.is_empty() {
+                identity.push(' ');
+            }
+            identity.push_str(&format!("object ID: {}", object_id));
+        }
+        write!(f, "{}", identity)
+    }
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Args, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobIdentifiers {
+    /// The file containing the blob to be deleted.
+    ///
+    /// This is equivalent to calling `blob-id` on the file, and then deleting with `--blob-id`.
+    #[clap(long, num_args = 0.., alias = "file")]
+    #[serde(default)]
+    pub(crate) files: Vec<PathBuf>,
+    /// The blob ID to be deleted.
+    ///
+    /// This command deletes _all_ owned blob objects matching the provided blob ID.
+    #[clap(
+        long,
+        allow_hyphen_values = true,
+        value_parser = parse_blob_id,
+        alias = "blob-id",
+        action = clap::ArgAction::Append
+    )]
+    #[serde_as(as = "Vec<DisplayFromStr>")]
+    #[serde(default)]
+    pub(crate) blob_ids: Vec<BlobId>,
+    /// The object ID of the blob object to be deleted.
+    ///
+    /// This command deletes only the blob object with the given object ID.
+    #[clap(long, num_args = 0.., alias = "object-id")]
+    #[serde_as(as = "Vec<DisplayFromStr>")]
+    #[serde(default)]
+    pub(crate) object_ids: Vec<ObjectID>,
+}
+
+impl BlobIdentifiers {
+    pub(crate) fn get_blob_identities(
         &self,
         encoding_config: &EncodingConfig,
         encoding_type: EncodingType,
-    ) -> Result<Option<BlobId>> {
-        match self {
-            FileOrBlobIdOrObjectId {
-                blob_id: Some(blob_id),
-                ..
-            } => Ok(Some(*blob_id)),
-            FileOrBlobIdOrObjectId {
-                file: Some(file), ..
-            } => {
-                tracing::debug!(
-                    file = %file.display(),
-                    "checking status of blob read from the filesystem"
-                );
-                Ok(Some(
-                    *encoding_config
-                        .get_for_type(encoding_type)
-                        .compute_metadata(&read_blob_from_file(file)?)?
-                        .blob_id(),
-                ))
-            }
-            // This case is required for JSON mode where we don't have the clap checking, or when
-            // an object ID is provided directly.
-            _ => Ok(None),
-        }
-    }
+    ) -> Result<Vec<BlobIdentity>> {
+        let mut result = Vec::new();
 
-    // Checks that the file, blob ID, and object ID are mutually exclusive.
-    pub(crate) fn exactly_one_is_some(&self) -> Result<()> {
-        match (
-            self.file.is_some(),
-            self.blob_id.is_some(),
-            self.object_id.is_some(),
-        ) {
-            (true, false, false) | (false, true, false) | (false, false, true) => Ok(()),
-            _ => Err(anyhow!(
-                "exactly one of `file`, `blob-id`, or `object-id` must be specified"
-            )),
+        for file in &self.files {
+            tracing::debug!(
+                file = %file.display(),
+                "computing blob ID for file from the filesystem"
+            );
+            let blob_id = *encoding_config
+                .get_for_type(encoding_type)
+                .compute_metadata(&read_blob_from_file(file)?)?
+                .blob_id();
+
+            result.push(BlobIdentity {
+                blob_id: Some(blob_id),
+                file: Some(file.clone()),
+                object_id: None,
+            });
         }
+
+        for blob_id in &self.blob_ids {
+            result.push(BlobIdentity {
+                blob_id: Some(*blob_id),
+                file: None,
+                object_id: None,
+            });
+        }
+
+        for object_id in &self.object_ids {
+            result.push(BlobIdentity {
+                blob_id: None,
+                file: None,
+                object_id: Some(*object_id),
+            });
+        }
+
+        if result.is_empty() {
+            return Err(anyhow!("no files, blob IDs, or object IDs specified"));
+        }
+
+        Ok(result)
     }
 }
 
