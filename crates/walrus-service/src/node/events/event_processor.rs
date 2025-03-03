@@ -19,13 +19,7 @@ use move_core_types::{
     account_address::AccountAddress,
     annotated_value::{MoveDatatypeLayout, MoveTypeLayout},
 };
-use prometheus::{
-    register_int_counter_with_registry,
-    register_int_gauge_with_registry,
-    IntCounter,
-    IntGauge,
-    Registry,
-};
+use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 use rocksdb::Options;
 use sui_package_resolver::{
     error::Error as PackageResolverError,
@@ -73,6 +67,7 @@ use walrus_utils::{
 };
 
 use crate::{
+    common::telemetry,
     node::events::{
         ensure_experimental_rest_endpoint_exists,
         event_blob::EventBlob,
@@ -115,13 +110,16 @@ pub struct LocalDBPackageStore {
     original_id_cache: Arc<RwLock<HashMap<AccountAddress, ObjectID>>>,
 }
 
-/// Metrics for the event processor.
-#[derive(Clone, Debug)]
-pub struct EventProcessorMetrics {
-    /// The latest downloaded full checkpoint.
-    pub latest_downloaded_checkpoint: IntGauge,
-    /// The number of checkpoints downloaded. Useful for computing the download rate.
-    pub total_downloaded_checkpoints: IntCounter,
+telemetry::define_metric_set! {
+    /// Metrics for the event processor.
+    pub struct EventProcessorMetrics {
+        #[help = "Latest downloaded full checkpoint"]
+        event_processor_latest_downloaded_checkpoint: IntGauge[],
+        #[help = "The number of checkpoints downloaded. Useful for computing the download rate"]
+        event_processor_total_downloaded_checkpoints: IntCounter[],
+        #[help = "The number of event blobs fetched with their source"]
+        event_processor_event_blob_fetched: IntCounterVec["blob_source"],
+    }
 }
 
 /// Stores for the event processor.
@@ -170,26 +168,6 @@ impl Debug for LocalDBPackageStore {
         f.debug_struct("LocalDBPackageStore")
             .field("package_store_table", &self.package_store_table)
             .finish()
-    }
-}
-
-impl EventProcessorMetrics {
-    /// Creates a new instance of the event processor metrics.
-    pub fn new(registry: &Registry) -> Self {
-        Self {
-            latest_downloaded_checkpoint: register_int_gauge_with_registry!(
-                "event_processor_latest_downloaded_checkpoint",
-                "Latest downloaded full checkpoint",
-                registry,
-            )
-            .expect("this is a valid metrics registration"),
-            total_downloaded_checkpoints: register_int_counter_with_registry!(
-                "event_processor_total_downloaded_checkpoints",
-                "Total number of checkpoints downloaded",
-                registry,
-            )
-            .expect("this is a valid metrics registration"),
-        }
     }
 }
 
@@ -453,9 +431,11 @@ impl EventProcessor {
                 checkpoint.checkpoint_summary.sequence_number()
             );
             self.metrics
-                .latest_downloaded_checkpoint
+                .event_processor_latest_downloaded_checkpoint
                 .set(next_checkpoint as i64);
-            self.metrics.total_downloaded_checkpoints.inc();
+            self.metrics
+                .event_processor_total_downloaded_checkpoints
+                .inc();
             let verified_checkpoint =
                 self.verify_checkpoint(&checkpoint, prev_verified_checkpoint)?;
             let mut write_batch = self.stores.event_store.batch();
@@ -650,6 +630,7 @@ impl EventProcessor {
                 system_config.clone(),
                 stores.clone(),
                 &recovery_path,
+                Some(&event_processor.metrics),
             )
             .await
             {
@@ -859,6 +840,7 @@ impl EventProcessor {
         system_objects: SystemConfig,
         stores: EventProcessorStores,
         recovery_path: &Path,
+        metrics: Option<&EventProcessorMetrics>,
     ) -> Result<()> {
         tracing::info!("Starting event catchup using event blobs");
         let next_checkpoint = stores
@@ -878,6 +860,7 @@ impl EventProcessor {
             system_objects.system_object_id,
             next_checkpoint,
             recovery_path,
+            metrics,
         )
         .await?;
 
