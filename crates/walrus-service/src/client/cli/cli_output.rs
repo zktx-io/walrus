@@ -74,26 +74,44 @@ pub trait CliOutput: Serialize {
 }
 impl CliOutput for Vec<BlobStoreResultWithPath> {
     fn print_cli_output(&self) {
-        for result in self {
-            result.print_cli_output();
+        let mut total_encoded_size = 0;
+        let mut total_cost = 0;
+        let mut reuse_and_extend_count = 0;
+        let total_count = self.len();
+
+        for res in self.iter() {
+            if let BlobStoreResult::NewlyCreated {
+                resource_operation,
+                cost,
+                ..
+            } = &res.blob_store_result
+            {
+                total_encoded_size += resource_operation.encoded_length();
+                total_cost += cost;
+                if let RegisterBlobOp::ReuseAndExtend { .. } = resource_operation {
+                    reuse_and_extend_count += 1;
+                }
+            }
         }
-        let total_encoded_size = self
-            .iter()
-            .map(|res| match &res.blob_store_result {
-                BlobStoreResult::NewlyCreated {
-                    resource_operation, ..
-                } => resource_operation.encoded_length(),
-                _ => 0,
-            })
-            .sum();
-        let total_cost = self
-            .iter()
-            .map(|res| match res.blob_store_result {
-                BlobStoreResult::NewlyCreated { cost, .. } => cost,
-                _ => 0,
-            })
-            .sum::<u64>();
-        println!("Summary for Newly Created Blobs");
+
+        let mut parts = Vec::new();
+        if total_count - reuse_and_extend_count > 0 {
+            parts.push(format!(
+                "{} newly certified",
+                total_count - reuse_and_extend_count
+            ));
+        }
+        if reuse_and_extend_count > 0 {
+            parts.push(format!("{} extended", reuse_and_extend_count));
+        }
+
+        let summary = if !parts.is_empty() {
+            format!("({})", parts.join(", "))
+        } else {
+            String::new()
+        };
+
+        println!("Summary for Modified or Created Blobs {}", summary);
         println!(
             "Total encoded size: {}",
             HumanReadableBytes(total_encoded_size)
