@@ -800,13 +800,23 @@ impl StorageNodeHandleBuilder {
         let WithTempDir {
             inner: storage,
             temp_dir,
-        } = self
-            .storage
-            .unwrap_or_else(|| empty_storage_with_shards(&[]));
+        } = {
+            if let Some(storage) = self.storage {
+                storage
+            } else {
+                empty_storage_with_shards(&[]).await
+            }
+        };
 
-        let node_info = self
-            .test_config
-            .unwrap_or_else(|| StorageNodeTestConfig::new(storage.shards_present(), false));
+        let node_info = {
+            if let Some(test_config) = self.test_config {
+                test_config
+            } else {
+                let shards = storage.shards_present().await;
+                StorageNodeTestConfig::new(shards, false)
+            }
+        };
+
         // To be in the committee, the node must have at least one shard assigned to it.
         let is_in_committee = !node_info.shards.is_empty();
 
@@ -1844,9 +1854,10 @@ impl TestClusterBuilder {
             .zip(self.disable_event_blob_writer.into_iter())
             .enumerate()
         {
+            let storage = empty_storage_with_shards(&config.shards).await;
             let local_identity = config.key_pair.public().clone();
             let builder = StorageNodeHandle::builder()
-                .with_storage(empty_storage_with_shards(&config.shards))
+                .with_storage(storage)
                 .with_test_config(config)
                 .with_rest_api_started(true)
                 .with_node_started(true)
@@ -2614,7 +2625,7 @@ async fn wait_for_event_processor_to_start(
 }
 
 /// Returns an empty storage, with the column families for the specified shards already created.
-pub fn empty_storage_with_shards(shards: &[ShardIndex]) -> WithTempDir<Storage> {
+pub async fn empty_storage_with_shards(shards: &[ShardIndex]) -> WithTempDir<Storage> {
     let temp_dir =
         nondeterministic!(tempfile::tempdir().expect("temporary directory creation must succeed"));
     let db_config = DatabaseConfig::default();
@@ -2623,6 +2634,7 @@ pub fn empty_storage_with_shards(shards: &[ShardIndex]) -> WithTempDir<Storage> 
 
     storage
         .create_storage_for_shards(shards)
+        .await
         .expect("should be able to create storage for shards");
 
     WithTempDir {
