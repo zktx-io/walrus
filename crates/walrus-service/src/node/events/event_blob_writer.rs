@@ -1169,11 +1169,6 @@ impl EventBlobWriter {
             return Ok(());
         };
 
-        self.node
-            .storage()
-            .update_blob_info_with_metadata(&blob_id)
-            .context("unable to update metadata")?;
-
         let attested = self.attested.clone();
         let failed_to_attest = self.failed_to_attest.clone();
         let metadata = self
@@ -1187,6 +1182,11 @@ impl EventBlobWriter {
         let Some(metadata) = metadata else {
             return Ok(());
         };
+
+        self.node
+            .storage()
+            .update_blob_info_with_metadata(&blob_id)
+            .context("unable to update metadata")?;
 
         self.metrics
             .latest_certified_event_index
