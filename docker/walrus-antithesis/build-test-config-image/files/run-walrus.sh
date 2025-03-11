@@ -22,9 +22,12 @@ SYSTEM_OBJECT=$(grep "system_object" /opt/walrus/outputs/deploy | awk '{print $2
 STAKING_OBJECT=$(grep "staking_object" /opt/walrus/outputs/deploy | awk '{print $2}')
 EXCHANGE_OBJECT=$(grep "exchange_object" /opt/walrus/outputs/deploy | awk '{print $2}')
 
+echo "Disk space usage:"
+df -h
+
 # copy binaries
 cp /root/sui_bin/sui /usr/local/bin/
-cp /opt/walrus/bin/walrus /usr/local/bin/
+# cp /opt/walrus/bin/walrus /usr/local/bin/
 
 cat <<EOF >/root/.config/walrus/client_config.yaml
 system_object: ${SYSTEM_OBJECT}
@@ -33,14 +36,18 @@ exchange_objects: [${EXCHANGE_OBJECT}]
 EOF
 
 # get some sui tokens
-sui client faucet --url http://sui-localnet:9123/gas
+sui client faucet --url http://10.0.0.20:9123/gas
 sleep 3
 
+echo "Exchange for WAL tokens (500 WAL)"
 # exchange for WAL tokens (500 WAL)
-walrus get-wal -a 500000000000
+walrus get-wal --amount 500000000000
+
+echo "WAL balance"
 sui client balance
 
+echo "starting walrus node"
 ## -----------------------------------------------------------------------------
 ## Start the node
 ## -----------------------------------------------------------------------------
-RUST_LOG=info /opt/walrus/bin/walrus-node run --config-path /opt/walrus/outputs/${HOSTNAME}.yaml
+RUST_BACKTRACE=1 RUST_LOG=info /opt/walrus/bin/walrus-node run --config-path /opt/walrus/outputs/${HOSTNAME}.yaml
