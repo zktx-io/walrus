@@ -22,6 +22,7 @@ use walrus_sui::{
         ReadClient as _,
         SuiClientError,
         SuiContractClient,
+        SuiReadClient,
     },
     types::{
         move_structs::{EpochState, EventBlob},
@@ -119,7 +120,11 @@ pub trait SystemContractService: std::fmt::Debug + Sync + Send {
 /// A [`SystemContractService`] that uses a [`SuiContractClient`] for chain interactions.
 #[derive(Debug, Clone)]
 pub struct SuiSystemContractService {
-    contract_client: Arc<TokioMutex<SuiContractClient>>,
+    // A client for sending transactions to the contract.
+    contract_tx_client: Arc<TokioMutex<SuiContractClient>>,
+    // A client for reading from the contract. Note that reading from the contract can be done
+    // concurrently.
+    read_client: Arc<SuiReadClient>,
     committee_service: Arc<dyn CommitteeService>,
     rng: Arc<StdMutex<StdRng>>,
 }
@@ -139,7 +144,8 @@ impl SuiSystemContractService {
         seed: u64,
     ) -> Self {
         Self {
-            contract_client: Arc::new(TokioMutex::new(contract_client)),
+            read_client: contract_client.read_client.clone(),
+            contract_tx_client: Arc::new(TokioMutex::new(contract_client)),
             committee_service,
             rng: Arc::new(StdMutex::new(StdRng::seed_from_u64(seed))),
         }
@@ -164,15 +170,13 @@ impl SuiSystemContractService {
         let node_capability = self
             .get_node_capability_object(Some(node_capability_object_id))
             .await?;
-        let contract_client: tokio::sync::MutexGuard<'_, SuiContractClient> =
-            self.contract_client.lock().await;
-        let pool = contract_client
+        let pool = self
             .read_client
             .get_staking_pool(node_capability.node_id)
             .await?;
 
         let node_info = pool.node_info.clone();
-        let metadata = contract_client
+        let metadata = self
             .read_client
             .get_node_metadata(node_info.metadata)
             .await?;
@@ -220,7 +224,7 @@ impl SystemContractService for SuiSystemContractService {
             synced_config.next_public_key.clone(),
         )?;
         let contract_client: tokio::sync::MutexGuard<'_, SuiContractClient> =
-            self.contract_client.lock().await;
+            self.contract_tx_client.lock().await;
         match action {
             ProtocolKeyAction::UpdateRemoteNextPublicKey(next_public_key) => {
                 tracing::info!(
@@ -268,27 +272,14 @@ impl SystemContractService for SuiSystemContractService {
         Ok(())
     }
 
-    async fn get_epoch_and_state(&self) -> Result<(Epoch, EpochState), anyhow::Error> {
-        let client = self.contract_client.lock().await;
-        let committees = client.get_committees_and_state().await?;
-        Ok((committees.current.epoch, committees.epoch_state))
-    }
-
     fn current_epoch(&self) -> Epoch {
         self.committee_service.active_committees().epoch()
     }
 
-    async fn fixed_system_parameters(&self) -> Result<FixedSystemParameters, anyhow::Error> {
-        let contract_client = self.contract_client.lock().await;
-        contract_client
-            .fixed_system_parameters()
-            .await
-            .context("failed to retrieve system parameters")
-    }
-
     async fn end_voting(&self) -> Result<(), anyhow::Error> {
-        let contract_client = self.contract_client.lock().await;
-        contract_client
+        self.contract_tx_client
+            .lock()
+            .await
             .voting_end()
             .await
             .context("failed to end voting for the next epoch")
@@ -302,7 +293,7 @@ impl SystemContractService for SuiSystemContractService {
             self.rng.lock().unwrap().gen(),
         );
         backoff::retry(backoff, || async {
-            self.contract_client
+            self.contract_tx_client
                 .lock()
                 .await
                 .invalidate_blob_id(certificate)
@@ -337,7 +328,7 @@ impl SystemContractService for SuiSystemContractService {
                 return Some(());
             }
             match self
-                .contract_client
+                .contract_tx_client
                 .lock()
                 .await
                 .epoch_sync_done(epoch, node_capability_object_id)
@@ -358,8 +349,11 @@ impl SystemContractService for SuiSystemContractService {
     }
 
     async fn initiate_epoch_change(&self) -> Result<(), anyhow::Error> {
-        let client = self.contract_client.lock().await;
-        client.initiate_epoch_change().await?;
+        self.contract_tx_client
+            .lock()
+            .await
+            .initiate_epoch_change()
+            .await?;
         Ok(())
     }
 
@@ -371,7 +365,7 @@ impl SystemContractService for SuiSystemContractService {
         node_capability_object_id: ObjectID,
     ) -> Result<(), SuiClientError> {
         let blob_metadata = blob_metadata.clone();
-        self.contract_client
+        self.contract_tx_client
             .lock()
             .await
             .certify_event_blob(
@@ -384,9 +378,27 @@ impl SystemContractService for SuiSystemContractService {
     }
 
     async fn refresh_contract_package(&self) -> Result<(), anyhow::Error> {
-        let client = self.contract_client.lock().await;
-        client.refresh_package_id().await?;
+        self.contract_tx_client
+            .lock()
+            .await
+            .refresh_package_id()
+            .await?;
         Ok(())
+    }
+
+    // Below are the methods that only read state from Sui, which do not require a lock on the
+    // contract client.
+
+    async fn get_epoch_and_state(&self) -> Result<(Epoch, EpochState), anyhow::Error> {
+        let committees = self.read_client.get_committees_and_state().await?;
+        Ok((committees.current.epoch, committees.epoch_state))
+    }
+
+    async fn fixed_system_parameters(&self) -> Result<FixedSystemParameters, anyhow::Error> {
+        self.read_client
+            .fixed_system_parameters()
+            .await
+            .context("failed to retrieve system parameters")
     }
 
     async fn get_node_capability_object(
@@ -394,17 +406,13 @@ impl SystemContractService for SuiSystemContractService {
         node_capability_object_id: Option<ObjectID>,
     ) -> Result<StorageNodeCap, SuiClientError> {
         let node_capability = if let Some(node_cap) = node_capability_object_id {
-            self.contract_client
-                .lock()
-                .await
+            self.read_client
                 .sui_client()
                 .get_sui_object(node_cap)
                 .await?
         } else {
-            let contract_client = self.contract_client.lock().await;
-            let address = contract_client.address();
-            contract_client
-                .read_client
+            let address = self.contract_tx_client.lock().await.address();
+            self.read_client
                 .get_address_capability_object(address)
                 .await?
                 .ok_or(SuiClientError::StorageNodeCapabilityObjectNotSet)?
@@ -414,19 +422,11 @@ impl SystemContractService for SuiSystemContractService {
     }
 
     async fn get_system_object_version(&self) -> Result<u64, SuiClientError> {
-        self.contract_client
-            .lock()
-            .await
-            .system_object_version()
-            .await
+        self.read_client.system_object_version().await
     }
 
     async fn last_certified_event_blob(&self) -> Result<Option<EventBlob>, SuiClientError> {
-        self.contract_client
-            .lock()
-            .await
-            .last_certified_event_blob()
-            .await
+        self.read_client.last_certified_event_blob().await
     }
 }
 
