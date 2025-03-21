@@ -2458,7 +2458,7 @@ pub mod test_cluster {
             .into_iter()
             .zip(committee_services.iter())
             .map(|(client, committee_service)| {
-                SuiSystemContractService::new(client, committee_service.clone())
+                SuiSystemContractService::builder().build(client, committee_service.clone())
             });
 
         let cluster_builder = cluster_builder
@@ -2623,6 +2623,7 @@ pub fn storage_node_config() -> WithTempDir<StorageNodeConfig> {
             config_synchronizer: Default::default(),
             storage_node_cap: None,
             num_uncertified_blob_threshold: Some(u32::MAX),
+            balance_check: Default::default(),
         },
         temp_dir,
     }
