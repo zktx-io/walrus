@@ -14,7 +14,7 @@ use std::{
     num::NonZeroU16,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -56,7 +56,7 @@ use walrus_sui::{
         FixedSystemParameters,
         SuiClientError,
     },
-    test_utils::{system_setup::SystemContext, TestClusterHandle},
+    test_utils::system_setup::SystemContext,
     types::{
         move_structs::{EpochState, EventBlob, NodeMetadata, VotingParams},
         Committee,
@@ -171,8 +171,8 @@ pub trait StorageNodeHandleTrait {
     /// Builds a new storage node handle, and starts the node.
     fn build_and_run(
         builder: StorageNodeHandleBuilder,
-        sui_cluster_handle: Option<Arc<TestClusterHandle>>,
         system_context: Option<SystemContext>,
+        sui_rpc_url: Option<String>,
         storage_dir: TempDir,
         start_node: bool,
         disable_event_blob_writer: bool,
@@ -251,8 +251,8 @@ impl StorageNodeHandleTrait for StorageNodeHandle {
 
     async fn build_and_run(
         builder: StorageNodeHandleBuilder,
-        _sui_cluster_handle: Option<Arc<TestClusterHandle>>,
         _system_context: Option<SystemContext>,
+        _sui_rpc_url: Option<String>,
         _storage_dir: TempDir,
         _start_node: bool,
         _disable_event_blob_writer: bool,
@@ -583,8 +583,8 @@ impl StorageNodeHandleTrait for SimStorageNodeHandle {
 
     async fn build_and_run(
         builder: StorageNodeHandleBuilder,
-        sui_cluster_handle: Option<Arc<TestClusterHandle>>,
         system_context: Option<SystemContext>,
+        sui_rpc_url: Option<String>,
         storage_dir: TempDir,
         start_node: bool,
         disable_event_blob_writer: bool,
@@ -596,8 +596,8 @@ impl StorageNodeHandleTrait for SimStorageNodeHandle {
         let node_capability = builder.storage_node_capability.as_ref().cloned();
         builder
             .start_node(
-                sui_cluster_handle.expect("SUI cluster handle must be provided in simtest"),
                 system_context.expect("System context must be provided"),
+                sui_rpc_url,
                 storage_dir,
                 start_node,
                 disable_event_blob_writer,
@@ -993,8 +993,8 @@ impl StorageNodeHandleBuilder {
     #[cfg(msim)]
     pub async fn start_node(
         self,
-        sui_cluster_handle: Arc<TestClusterHandle>,
         system_context: SystemContext,
+        sui_rpc_url: Option<String>,
         storage_dir: TempDir,
         start_node: bool,
         disable_event_blob_writer: bool,
@@ -1020,7 +1020,7 @@ impl StorageNodeHandleBuilder {
             use_legacy_event_provider: false,
             disable_event_blob_writer,
             sui: Some(SuiConfig {
-                rpc: sui_cluster_handle.cluster().rpc_url().to_string(),
+                rpc: sui_rpc_url.expect("SUI RPC URL must be provided in integration test"),
                 contract_config: ContractConfig::new(
                     system_context.system_object,
                     system_context.staking_object,
@@ -1228,7 +1228,7 @@ fn create_previous_committee(committee: &Committee) -> Option<Committee> {
 /// Does not perform any network operations.
 #[derive(Debug, Clone)]
 pub struct StubLookupService {
-    committees: Arc<Mutex<ActiveCommittees>>,
+    committees: Arc<std::sync::Mutex<ActiveCommittees>>,
 }
 
 impl StubLookupService {
@@ -1240,7 +1240,9 @@ impl StubLookupService {
     pub fn new(committee: Committee) -> Self {
         let previous = create_previous_committee(&committee);
         Self {
-            committees: Arc::new(Mutex::new(ActiveCommittees::new(committee, previous))),
+            committees: Arc::new(std::sync::Mutex::new(ActiveCommittees::new(
+                committee, previous,
+            ))),
         }
     }
 
@@ -1257,7 +1259,7 @@ impl StubLookupService {
 #[derive(Debug, Clone)]
 pub struct StubLookupServiceHandle {
     /// The active committees.
-    pub committees: Arc<Mutex<ActiveCommittees>>,
+    pub committees: Arc<std::sync::Mutex<ActiveCommittees>>,
 }
 
 impl StubLookupServiceHandle {
@@ -1623,7 +1625,7 @@ pub struct TestClusterBuilder {
     storage_node_configs: Vec<StorageNodeTestConfig>,
     shard_sync_config: Option<ShardSyncConfig>,
     system_context: Option<SystemContext>,
-    sui_cluster_handle: Option<Arc<TestClusterHandle>>,
+    sui_rpc_url: Option<String>,
     use_distinct_ip: bool,
     // INV: Reset if shard_assignment is changed.
     event_providers: Vec<Option<Box<dyn SystemEventProvider>>>,
@@ -1775,13 +1777,15 @@ impl TestClusterBuilder {
         self
     }
 
-    /// Sets the SUI cluster handle for the cluster.
-    pub fn with_sui_cluster_handle(mut self, sui_cluster_handle: Arc<TestClusterHandle>) -> Self {
-        self.sui_cluster_handle = Some(sui_cluster_handle);
+    /// Sets the SUI RPC URL for the cluster.
+    ///
+    /// This is required for the storage nodes to connect to the SUI network.
+    pub fn with_sui_rpc_url(mut self, sui_rpc_url: String) -> Self {
+        self.sui_rpc_url = Some(sui_rpc_url);
         self
     }
 
-    /// Sets the SUI cluster handle for the cluster.
+    /// Sets the number of checkpoints per event blob for the cluster.
     pub fn with_num_checkpoints_per_blob(mut self, num_checkpoints_per_blob: u32) -> Self {
         self.num_checkpoints_per_blob = Some(num_checkpoints_per_blob);
         self
@@ -1919,8 +1923,8 @@ impl TestClusterBuilder {
             // Build and run the storage nodes in parallel.
             node_futures.push(T::build_and_run(
                 builder,
-                self.sui_cluster_handle.clone(),
                 self.system_context.clone(),
+                self.sui_rpc_url.clone(),
                 nondeterministic!(
                     tempfile::tempdir().expect("temporary directory creation must succeed")
                 ),
@@ -2055,7 +2059,7 @@ impl Default for TestClusterBuilder {
                 .map(|shards| StorageNodeTestConfig::new(shards, false))
                 .collect(),
             system_context: None,
-            sui_cluster_handle: None,
+            sui_rpc_url: None,
             use_distinct_ip: false,
             num_checkpoints_per_blob: None,
             enable_node_config_synchronizer: false,
@@ -2192,7 +2196,7 @@ pub mod test_cluster {
     use std::sync::OnceLock;
 
     use futures::future;
-    use tokio::sync::Mutex;
+    use tokio::sync::Mutex as TokioMutex;
     use walrus_sui::{
         client::{SuiContractClient, SuiReadClient},
         test_utils::{
@@ -2226,7 +2230,7 @@ pub mod test_cluster {
     /// Performs the default setup for the test cluster using StorageNodeHandle as default storage
     /// node handle.
     pub async fn default_setup() -> anyhow::Result<(
-        Arc<TestClusterHandle>,
+        Arc<TokioMutex<TestClusterHandle>>,
         TestCluster,
         WithTempDir<client::Client<SuiContractClient>>,
     )> {
@@ -2236,7 +2240,7 @@ pub mod test_cluster {
     /// Performs the default setup for the test cluster using StorageNodeHandle as default storage
     /// node handle.
     pub async fn default_setup_with_subsidies() -> anyhow::Result<(
-        Arc<TestClusterHandle>,
+        Arc<TokioMutex<TestClusterHandle>>,
         TestCluster,
         WithTempDir<client::Client<SuiContractClient>>,
     )> {
@@ -2249,7 +2253,7 @@ pub mod test_cluster {
         epoch_duration: Duration,
         with_subsidies: bool,
     ) -> anyhow::Result<(
-        Arc<TestClusterHandle>,
+        Arc<TokioMutex<TestClusterHandle>>,
         TestCluster,
         WithTempDir<client::Client<SuiContractClient>>,
     )> {
@@ -2279,7 +2283,7 @@ pub mod test_cluster {
         communication_config: ClientCommunicationConfig,
         with_subsidies: bool,
     ) -> anyhow::Result<(
-        Arc<TestClusterHandle>,
+        Arc<TokioMutex<TestClusterHandle>>,
         TestCluster<T>,
         WithTempDir<client::Client<SuiContractClient>>,
     )> {
@@ -2308,7 +2312,7 @@ pub mod test_cluster {
         deploy_directory: Option<PathBuf>,
         delegate_governance_to_admin_wallet: bool,
     ) -> anyhow::Result<(
-        Arc<TestClusterHandle>,
+        Arc<TokioMutex<TestClusterHandle>>,
         TestCluster<T>,
         WithTempDir<client::Client<SuiContractClient>>,
         SystemContext,
@@ -2317,6 +2321,8 @@ pub mod test_cluster {
         let sui_cluster = test_utils::using_tokio::global_sui_test_cluster();
         #[cfg(msim)]
         let sui_cluster = test_utils::using_msim::global_sui_test_cluster().await;
+
+        let sui_rpc_url = sui_cluster.lock().await.cluster().rpc_url().to_string();
 
         // Get a wallet on the global sui test cluster
         let mut admin_wallet =
@@ -2476,7 +2482,7 @@ pub mod test_cluster {
         } else {
             setup_checkpoint_based_event_processors(
                 &event_processor_config,
-                &sui_cluster.rpc_url(),
+                sui_rpc_url.as_str(),
                 sui_read_client.clone(),
                 cluster_builder,
                 system_ctx.system_object,
@@ -2493,7 +2499,7 @@ pub mod test_cluster {
 
         let cluster_builder = cluster_builder
             .with_system_context(system_ctx.clone())
-            .with_sui_cluster_handle(sui_cluster.clone())
+            .with_sui_rpc_url(sui_rpc_url)
             .with_storage_capabilities(storage_capabilities)
             .with_node_wallet_dirs(node_wallet_dirs)
             .with_start_node_from_beginning(
@@ -2581,9 +2587,9 @@ pub mod test_cluster {
     }
 
     // Prevent tests running simultaneously to avoid interferences or race conditions.
-    fn global_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(Mutex::default)
+    fn global_test_lock() -> &'static TokioMutex<()> {
+        static LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(TokioMutex::default)
     }
 }
 
