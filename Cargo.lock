@@ -12051,6 +12051,7 @@ dependencies = [
  "jsonrpsee",
  "move-core-types",
  "move-package",
+ "prometheus",
  "rand 0.8.5",
  "regex",
  "reqwest",
