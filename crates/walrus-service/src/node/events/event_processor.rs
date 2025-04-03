@@ -224,7 +224,7 @@ impl SystemConfig {
 #[derive(Debug)]
 pub struct EventProcessorRuntimeConfig {
     /// The address of the RPC server.
-    pub rpc_address: String,
+    pub rpc_addresses: Vec<String>,
     /// The event polling interval.
     pub event_polling_interval: Duration,
     /// The path to the database.
@@ -593,7 +593,7 @@ impl EventProcessor {
         registry: &Registry,
     ) -> Result<Self, anyhow::Error> {
         let retry_client = Self::create_and_validate_client(
-            &runtime_config.rpc_address,
+            &runtime_config.rpc_addresses,
             config.checkpoint_request_timeout,
             runtime_config.rpc_fallback_config.as_ref(),
         )
@@ -652,7 +652,7 @@ impl EventProcessor {
         }
         let current_lag = latest_checkpoint.sequence_number - current_checkpoint;
 
-        let url = runtime_config.rpc_address.clone();
+        let url = runtime_config.rpc_addresses[0].clone();
         let sui_client = SuiClientBuilder::default()
             .build(&url)
             .await
@@ -705,20 +705,41 @@ impl EventProcessor {
     }
 
     async fn create_and_validate_client(
-        rest_url: &str,
+        rest_urls: &[String],
         request_timeout: Duration,
         rpc_fallback_config: Option<&RpcFallbackConfig>,
     ) -> Result<RetriableRpcClient, anyhow::Error> {
-        let client = sui_rpc_api::Client::new(rest_url)?;
-        // Ensure the experimental REST endpoint exists
-        ensure_experimental_rest_endpoint_exists(client.clone()).await?;
-        let retriable_client = RetriableRpcClient::new(
-            client,
+        let clients = rest_urls
+            .iter()
+            .map(
+                |rest_url| -> Result<(sui_rpc_api::Client, String), anyhow::Error> {
+                    let client = sui_rpc_api::Client::new(rest_url)?;
+                    Ok((client, rest_url.clone()))
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Validate each client and filter out invalid ones.
+        let mut valid_clients = Vec::new();
+        for (client, rest_url) in clients {
+            match ensure_experimental_rest_endpoint_exists(client.clone()).await {
+                Ok(()) => valid_clients.push((client, rest_url)),
+                Err(e) => {
+                    tracing::warn!("Client validation failed for {:?}: {:?}", rest_url, e);
+                }
+            }
+        }
+
+        if valid_clients.is_empty() {
+            anyhow::bail!("No valid clients found after validation");
+        }
+
+        RetriableRpcClient::new(
+            valid_clients,
             request_timeout,
             ExponentialBackoffConfig::default(),
             rpc_fallback_config.cloned(),
-        );
-        Ok(retriable_client)
+        )
     }
 
     /// Initializes the database for the event processor.
@@ -1257,13 +1278,14 @@ mod tests {
             &ReadWriteOptions::default(),
             false,
         )?;
-        let client = sui_rpc_api::Client::new("http://localhost:8080")?;
+        let rest_url = "http://localhost:8080";
+        let client = sui_rpc_api::Client::new(rest_url)?;
         let retry_client = RetriableRpcClient::new(
-            client.clone(),
+            vec![(client, rest_url.to_string())],
             Duration::from_secs(5),
             ExponentialBackoffConfig::default(),
             None,
-        );
+        )?;
         let package_store =
             LocalDBPackageStore::new(walrus_package_store.clone(), retry_client.clone());
         let checkpoint_downloader = ParallelCheckpointDownloader::new(
