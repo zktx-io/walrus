@@ -2461,6 +2461,7 @@ pub mod test_cluster {
             &protocol_keypairs,
             &contract_clients_refs,
             &amounts_to_stake,
+            None,
         )
         .await?;
 
