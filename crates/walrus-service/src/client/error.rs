@@ -141,12 +141,10 @@ pub enum ClientErrorKind {
     #[error("the blob ID {0} is blocked")]
     BlobIdBlocked(BlobId),
     /// No matching payment coin found for the transaction.
-    #[error("no compatible payment coin found")]
+    #[error("could not find WAL coins with sufficient balance")]
     NoCompatiblePaymentCoin,
     /// No gas coins with sufficient balance found for the transaction.
-    #[error(
-        "no compatible gas coins with sufficient total balance found [requested_amount={0:?}]"
-    )]
+    #[error("could not find SUI coins with sufficient balance [requested_amount={0:?}]")]
     NoCompatibleGasCoins(Option<u128>),
     /// The client was unable to open connections to any storage node.
     #[error("connecting to all storage nodes failed: {0}")]
