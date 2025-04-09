@@ -118,7 +118,7 @@ impl WriteClient {
             .first()
             .expect("should have one blob store result")
             .blob_id()
-            .to_owned();
+            .expect("blob id should be present");
 
         tracing::info!(
             duration = now.elapsed().as_secs(),
