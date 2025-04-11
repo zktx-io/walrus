@@ -24,12 +24,14 @@ use walrus_utils::metrics::Registry;
 
 use super::{NodeCommunication, NodeReadCommunication, NodeWriteCommunication};
 use crate::{
-    client::{ClientCommunicationConfig, ClientError, ClientErrorKind, ClientResult},
-    common::active_committees::ActiveCommittees,
+    active_committees::ActiveCommittees,
+    config::ClientCommunicationConfig,
+    error::{ClientError, ClientErrorKind, ClientResult},
 };
 
+/// Factory to create objects amenable to communication with storage nodes.
 #[derive(Clone, Debug)]
-pub(crate) struct NodeCommunicationFactory {
+pub struct NodeCommunicationFactory {
     config: ClientCommunicationConfig,
     encoding_config: Arc<EncodingConfig>,
     client_cache: Arc<Mutex<HashMap<(NetworkAddress, NetworkPublicKey), StorageNodeClient>>>,
@@ -37,9 +39,10 @@ pub(crate) struct NodeCommunicationFactory {
     metrics_registry: Option<Registry>,
 }
 
-/// Factory to create the vectors of [`NodeCommunication`][super::NodeCommunication] objects.
+/// Factory to create the vectors of `NodeCommunication` objects.
 impl NodeCommunicationFactory {
-    pub(crate) fn new(
+    /// Creates a new [`NodeCommunicationFactory`].
+    pub fn new(
         config: ClientCommunicationConfig,
         encoding_config: Arc<EncodingConfig>,
         metrics_registry: Option<Registry>,
@@ -137,8 +140,6 @@ impl NodeCommunicationFactory {
         })
     }
 
-    // Private functions
-
     /// Builds a [`NodeCommunication`] object for the identified storage node within the
     /// committee.
     ///
@@ -196,10 +197,8 @@ impl NodeCommunicationFactory {
         Ok(maybe_node_communication)
     }
 
-    pub(crate) fn create_client(
-        &self,
-        node: &StorageNode,
-    ) -> Result<StorageNodeClient, ClientBuildError> {
+    /// Create a new [`StorageNodeClient`] for the given storage node.
+    pub fn create_client(&self, node: &StorageNode) -> Result<StorageNodeClient, ClientBuildError> {
         let node_client_id = (
             node.network_address.clone(),
             node.network_public_key.clone(),

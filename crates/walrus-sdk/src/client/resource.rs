@@ -21,12 +21,13 @@ use walrus_sui::{
 };
 
 use super::{
-    client_types::{WalrusStoreBlob, WalrusStoreBlobApi as _},
+    client_types::WalrusStoreBlob,
     responses::{BlobStoreResult, EventOrObjectId},
-    ClientError,
-    ClientErrorKind,
-    ClientResult,
-    StoreWhen,
+};
+use crate::{
+    client::WalrusStoreBlobApi,
+    error::{ClientError, ClientErrorKind, ClientResult},
+    store_when::StoreWhen,
 };
 
 /// Struct to compute the cost of operations with blob and storage resources.
@@ -45,7 +46,7 @@ impl PriceComputation {
     }
 
     /// Computes the cost of the operation.
-    pub(crate) fn operation_cost(&self, operation: &RegisterBlobOp) -> u64 {
+    pub fn operation_cost(&self, operation: &RegisterBlobOp) -> u64 {
         match operation {
             RegisterBlobOp::RegisterFromScratch {
                 encoded_length,
@@ -87,26 +88,36 @@ impl PriceComputation {
 pub enum RegisterBlobOp {
     /// The storage and blob resources are purchased from scratch.
     RegisterFromScratch {
+        /// The size of the encoded blob in bytes.
         encoded_length: u64,
+        /// The number of epochs ahead for which the blob is registered.
         #[schema(value_type = u32)]
         epochs_ahead: EpochCount,
     },
     /// The storage is reused, but the blob was not registered.
-    ReuseStorage { encoded_length: u64 },
+    ReuseStorage {
+        /// The size of the encoded blob in bytes.
+        encoded_length: u64,
+    },
     /// A registration was already present.
-    ReuseRegistration { encoded_length: u64 },
+    ReuseRegistration {
+        /// The size of the encoded blob in bytes.
+        encoded_length: u64,
+    },
     /// The blob was already certified, but its lifetime is too short.
     ReuseAndExtend {
+        /// The size of the encoded blob in bytes.
         encoded_length: u64,
-        // The number of epochs extended wrt the original epoch end.
+        /// The number of epochs extended wrt the original epoch end.
         #[schema(value_type = u32)]
         epochs_extended: EpochCount,
     },
     /// The blob was registered, but not certified, and its lifetime is shorter than
     /// the desired one.
     ReuseAndExtendNonCertified {
+        /// The size of the encoded blob in bytes.
         encoded_length: u64,
-        // The number of epochs extended wrt the original epoch end.
+        /// The number of epochs extended wrt the original epoch end.
         #[schema(value_type = u32)]
         epochs_extended: EpochCount,
     },
@@ -170,12 +181,15 @@ pub enum StoreOp {
     NoOp(BlobStoreResult),
     /// A new blob registration needs to be created.
     RegisterNew {
+        /// The blob to be registered.
         blob: Blob,
+        /// The operation to be performed.
         operation: RegisterBlobOp,
     },
 }
 
 impl StoreOp {
+    /// Creates a new store operation.
     pub fn new(register_op: RegisterBlobOp, blob: Blob) -> Self {
         match register_op {
             RegisterBlobOp::ReuseRegistration { .. } => {

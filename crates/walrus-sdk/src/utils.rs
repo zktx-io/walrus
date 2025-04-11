@@ -3,15 +3,35 @@
 
 use std::{
     collections::HashMap,
-    fmt::{self, Display},
+    fmt::{self, Debug, Display},
+    future::Future,
     hash::Hash,
+    path::Path,
     time::Duration,
 };
 
-use anyhow::Result;
-use futures::{stream::FuturesUnordered, Future, StreamExt};
+use anyhow::{Context as _, Result};
+use futures::{stream::FuturesUnordered, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
+use serde::de::DeserializeOwned;
 use tokio::time;
 use tracing::Level;
+
+// TODO: WAL-764 Move this to walrus-utils.
+/// Load the config from a YAML file located at the provided path.
+pub fn load_from_yaml<P: AsRef<Path>, T: DeserializeOwned>(path: P) -> anyhow::Result<T> {
+    let path = path.as_ref();
+    tracing::debug!(path = %path.display(), "[load_from_yaml] reading from file");
+
+    let reader = std::fs::File::open(path).with_context(|| {
+        format!(
+            "[load_from_yaml] unable to load config from {}",
+            path.display()
+        )
+    })?;
+
+    Ok(serde_yaml::from_reader(reader)?)
+}
 
 /// A trait representing a result that has a weight.
 pub trait WeightedResult {
@@ -260,18 +280,21 @@ where
     }
 }
 
-/// Represents the reason why the [`WeightedFutures::execute_weight`] completed.
+/// Represents the reason why the `WeightedFutures::execute_weight` completed.
 #[derive(Debug, Clone, Copy)]
 pub enum CompletedReasonWeight {
+    /// The threshold was reached.
     ThresholdReached,
     /// Contains the weight of successful futures.
     FuturesConsumed(usize),
 }
 
-/// Represents the reason why the [`WeightedFutures::execute_time`] completed.
+/// Represents the reason why the `WeightedFutures::execute_time` completed.
 #[derive(Debug, Clone, Copy)]
 pub enum CompletedReasonTime {
+    /// The timeout was reached.
     Timeout,
+    /// The futures were all consumed.
     FuturesConsumed,
 }
 
@@ -288,9 +311,10 @@ impl Display for CompletedReasonTime {
     }
 }
 
-/// Represents the reason why the [`WeightedFutures::execute_until`] completed.
+/// Represents the reason why the `WeightedFutures::execute_until` completed.
 #[derive(Debug, Clone, Copy)]
 pub enum CompletedReason {
+    /// The threshold was reached.
     ThresholdReached,
     /// Contains the total weight of successful futures.
     Timeout(#[allow(dead_code)] usize),
@@ -326,6 +350,36 @@ pub fn string_prefix<T: ToString>(s: &T) -> String {
     let mut string = s.to_string();
     string.truncate(8);
     format!("{}...", string)
+}
+
+// TODO: See WAL-763. Move these helpers back into the `walrus-service` crate once we've created an
+// abstraction around progress callbacks in the SDK.
+
+/// Returns a progress bar with the given length and stlyle already applied
+pub fn styled_progress_bar(length: u64) -> ProgressBar {
+    let pb = ProgressBar::new(length);
+    pb.set_style(
+        ProgressStyle::with_template(
+            " {spinner:.122} {msg} [{elapsed_precise}] [{wide_bar:.122/177}] {pos}/{len} ({eta})",
+        )
+        .expect("the template is valid")
+        .tick_chars("•◉◎○◌○◎◉")
+        .progress_chars("#>-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
+/// Returns a pre-configured spinner.
+pub fn styled_spinner() -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template(" {spinner:.122} {msg} [{elapsed_precise}]")
+            .expect("the template is valid")
+            .tick_chars("•◉◎○◌○◎◉"),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    spinner
 }
 
 #[cfg(test)]
