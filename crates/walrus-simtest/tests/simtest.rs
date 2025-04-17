@@ -7,6 +7,7 @@
 #[cfg(msim)]
 mod tests {
     use std::{
+        collections::HashSet,
         sync::{atomic::AtomicBool, Arc},
         time::Duration,
     };
@@ -73,7 +74,8 @@ mod tests {
             .await
             .unwrap();
 
-        simtest_utils::write_read_and_check_random_blob(&client, 31415, false)
+        let mut blobs_written = HashSet::new();
+        simtest_utils::write_read_and_check_random_blob(&client, 31415, false, &mut blobs_written)
             .await
             .expect("workload should not fail");
 
