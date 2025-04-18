@@ -12,6 +12,7 @@ use std::{
     fmt::{self, Debug, Formatter},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 #[cfg(msim)]
@@ -50,7 +51,7 @@ use crate::{
         NetworkAddress,
         StorageNode,
     },
-    utils::{create_wallet, request_sui_from_faucet, SuiNetwork},
+    utils::create_wallet,
 };
 
 /// Default gas budget for some transactions in tests and benchmarks.
@@ -345,22 +346,18 @@ pub mod using_tokio {
     }
 }
 
-/// Creates a wallet for testing funded with 2 coins by the faucet of the provided network.
-pub async fn wallet_for_testing_from_faucet(
-    network: &SuiNetwork,
-) -> anyhow::Result<WithTempDir<WalletContext>> {
-    let mut wallet = temp_dir_wallet(network.env())?;
-    let address = wallet.as_mut().active_address()?;
-    let sui_client = wallet.as_ref().get_client().await?;
-    request_sui_from_faucet(address, network, &sui_client).await?;
-    request_sui_from_faucet(address, network, &sui_client).await?;
-    Ok(wallet)
-}
-
 /// Creates a wallet for testing in a temporary directory.
-pub fn temp_dir_wallet(env: SuiEnv) -> anyhow::Result<WithTempDir<WalletContext>> {
+pub fn temp_dir_wallet(
+    request_timeout: Option<Duration>,
+    env: SuiEnv,
+) -> anyhow::Result<WithTempDir<WalletContext>> {
     let temp_dir = tempfile::tempdir().expect("temporary directory creation must succeed");
-    let wallet = create_wallet(&temp_dir.path().join("wallet_config.yaml"), env, None)?;
+    let wallet = create_wallet(
+        &temp_dir.path().join("wallet_config.yaml"),
+        env,
+        None,
+        request_timeout,
+    )?;
 
     Ok(WithTempDir {
         inner: wallet,
@@ -411,7 +408,7 @@ pub async fn create_and_fund_wallets_on_cluster(
     // Load the cluster's wallet from file instead of using the wallet stored in the cluster.
     // This prevents tasks from being spawned in the current runtime that are expected by
     // the wallet to continue running.
-    let mut cluster_wallet = load_wallet_context_from_path(Some(path_guard.as_path()))?;
+    let mut cluster_wallet = load_wallet_context_from_path(Some(path_guard.as_path()), None)?;
 
     let mut wallets = vec![];
     let mut addresses = vec![];
@@ -441,7 +438,7 @@ pub async fn new_wallet_on_sui_test_cluster(
     // Load the cluster's wallet from file instead of using the wallet stored in the cluster.
     // This prevents tasks from being spawned in the current runtime that are expected by
     // the wallet to continue running.
-    let mut cluster_wallet = load_wallet_context_from_path(Some(path_guard.as_path()))?;
+    let mut cluster_wallet = load_wallet_context_from_path(Some(path_guard.as_path()), None)?;
     let wallet = wallet_for_testing(&mut cluster_wallet, true).await?;
     drop(path_guard);
     Ok(wallet)
@@ -487,6 +484,7 @@ pub async fn wallet_for_testing(
     let mut wallet = create_wallet(
         &temp_dir.path().join("wallet_config.yaml"),
         funding_wallet.config.get_active_env()?.to_owned(),
+        None,
         None,
     )?;
 
