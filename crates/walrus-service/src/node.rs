@@ -16,6 +16,7 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use blob_retirement_notifier::BlobRetirementNotifier;
 use committee::{BeginCommitteeChangeError, EndCommitteeChangeError};
+use consistency_check::StorageNodeConsistencyCheckConfig;
 use epoch_change_driver::EpochChangeDriver;
 use errors::{ListSymbolsError, Unavailable};
 use events::{CheckpointEventPosition, event_blob_writer::EventBlobWriter};
@@ -166,6 +167,7 @@ use crate::{
 
 pub mod committee;
 pub mod config;
+pub(crate) mod consistency_check;
 pub mod contract_service;
 pub mod dbtool;
 pub mod events;
@@ -176,7 +178,6 @@ pub(crate) mod metrics;
 
 mod blob_retirement_notifier;
 mod blob_sync;
-mod consistency_check;
 mod epoch_change_driver;
 mod node_recovery;
 mod recovery_symbol_service;
@@ -517,6 +518,7 @@ pub struct StorageNodeInner {
     thread_pool: BoundedThreadPool,
     registry: Registry,
     latest_event_epoch: AtomicU32, // The epoch of the latest event processed by the node.
+    consistency_check_config: StorageNodeConsistencyCheckConfig,
 }
 
 /// Parameters for configuring and initializing a node.
@@ -629,6 +631,7 @@ impl StorageNode {
             encoding_config,
             registry: registry.clone(),
             latest_event_epoch: AtomicU32::new(0),
+            consistency_check_config: config.consistency_check.clone(),
         });
 
         blocklist.start_refresh_task();
@@ -1329,17 +1332,20 @@ impl StorageNode {
             .wait_until_previous_task_done()
             .await;
 
-        if let Err(err) = consistency_check::schedule_background_consistency_check(
-            self.inner.clone(),
-            event.epoch,
-        )
-        .await
-        {
-            tracing::warn!(
-                ?err,
-                epoch = %event.epoch,
-                "failed to schedule background blob info consistency check"
-            );
+        if self.inner.consistency_check_config.enable_consistency_check {
+            if let Err(err) = consistency_check::schedule_background_consistency_check(
+                self.inner.clone(),
+                self.blob_sync_handler.clone(),
+                event.epoch,
+            )
+            .await
+            {
+                tracing::warn!(
+                    ?err,
+                    epoch = %event.epoch,
+                    "failed to schedule background blob info consistency check"
+                );
+            }
         }
 
         // During epoch change, we need to lock the read access to shard map until all the new
@@ -1874,8 +1880,16 @@ impl StorageNodeInner {
             None => self.owned_shards_at_latest_epoch(),
         };
 
+        self.is_stored_at_specific_shards(blob_id, &shards).await
+    }
+
+    async fn is_stored_at_specific_shards(
+        &self,
+        blob_id: &BlobId,
+        shards: &[ShardIndex],
+    ) -> anyhow::Result<bool> {
         for shard in shards {
-            match self.storage.is_stored_at_shard(blob_id, shard).await {
+            match self.storage.is_stored_at_shard(blob_id, *shard).await {
                 Ok(false) => return Ok(false),
                 Ok(true) => continue,
                 Err(error) => {
@@ -1905,6 +1919,27 @@ impl StorageNodeInner {
     ) -> anyhow::Result<bool> {
         self.is_stored_at_all_shards_impl(blob_id, Some(epoch))
             .await
+    }
+
+    /// Returns true if the blob is stored at all shards that are in Active state.
+    pub(crate) async fn is_stored_at_all_active_shards(
+        &self,
+        blob_id: &BlobId,
+    ) -> anyhow::Result<bool> {
+        let shards = self
+            .storage
+            .existing_shard_storages()
+            .await
+            .iter()
+            .filter_map(|shard_storage| {
+                shard_storage
+                    .status()
+                    .is_ok_and(|status| status == ShardStatus::Active)
+                    .then_some(shard_storage.id())
+            })
+            .collect::<Vec<_>>();
+
+        self.is_stored_at_specific_shards(blob_id, &shards).await
     }
 
     pub(crate) fn storage(&self) -> &Storage {
