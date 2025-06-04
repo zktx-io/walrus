@@ -1,6 +1,9 @@
 // Copyright (c) Walrus Foundation
 // SPDX-License-Identifier: Apache-2.0
 
+// Allowing casts and `unwrap`s in test utils.
+#![allow(clippy::cast_possible_truncation, clippy::unwrap_used)]
+
 //! Test utilities for using storage nodes in tests.
 //!
 //! For creating an instance of a single storage node in a test, see [`StorageNodeHandleBuilder`] .
@@ -2497,7 +2500,7 @@ pub mod test_cluster {
             let amounts_to_stake = test_nodes_config
                 .node_weights
                 .iter()
-                .map(|&weight| FROST_PER_NODE_WEIGHT * weight as u64)
+                .map(|&weight| FROST_PER_NODE_WEIGHT * u64::from(weight))
                 .collect::<Vec<_>>();
             let storage_capabilities = register_committee_and_stake(
                 admin_contract_client.as_ref(),

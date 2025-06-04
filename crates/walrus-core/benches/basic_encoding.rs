@@ -1,6 +1,9 @@
 // Copyright (c) Walrus Foundation
 // SPDX-License-Identifier: Apache-2.0
 
+// Allowing `unwrap`s in benchmarks.
+#![allow(clippy::unwrap_used)]
+
 //! Benchmarks for the basic encoding and decoding.
 
 use core::time::Duration;
@@ -88,7 +91,7 @@ fn basic_decoding(c: &mut Criterion) {
                 encoder
                     .encode_all()
                     .enumerate()
-                    .map(|(i, s)| DecodingSymbol::<Primary>::new(i as u16, s)),
+                    .map(|(i, s)| DecodingSymbol::<Primary>::new(i.try_into().unwrap(), s)),
                 usize::from(symbol_count) + 1,
             )
             .collect();
