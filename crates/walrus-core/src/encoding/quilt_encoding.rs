@@ -1625,6 +1625,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ignore long-running test by default"]
     fn test_quilt_with_random_blobs() {
         for _ in 0..1000 {
             let mut rng = rand::thread_rng();
