@@ -1178,6 +1178,12 @@ impl StorageNode {
                 // TODO: Implement DenyListEvent handling (WAL-424)
                 event_handle.mark_as_complete();
             }
+            EventStreamElement::ContractEvent(ContractEvent::ProtocolEvent(event)) => {
+                panic!(
+                    "unexpected protocol version update: {:?}",
+                    event.protocol_version()
+                );
+            }
             EventStreamElement::CheckpointBoundary => {
                 event_handle.mark_as_complete();
             }
