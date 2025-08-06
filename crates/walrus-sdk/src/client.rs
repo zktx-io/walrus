@@ -59,7 +59,12 @@ use walrus_sui::{
         ReadClient,
         SuiContractClient,
     },
-    types::{Blob, BlobEvent, StakedWal, move_structs::BlobWithAttribute},
+    types::{
+        Blob,
+        BlobEvent,
+        StakedWal,
+        move_structs::{BlobAttribute, BlobWithAttribute},
+    },
 };
 use walrus_utils::{backoff::BackoffStrategy, metrics::Registry};
 
@@ -854,10 +859,11 @@ impl Client<SuiContractClient> {
     pub async fn reserve_and_store_blobs_retry_committees(
         &self,
         blobs: &[&[u8]],
+        attributes: &[BlobAttribute],
         store_args: &StoreArgs,
     ) -> ClientResult<Vec<BlobStoreResult>> {
         let walrus_store_blobs =
-            WalrusStoreBlob::<String>::default_unencoded_blobs_from_slice(blobs);
+            WalrusStoreBlob::<String>::default_unencoded_blobs_from_slice(blobs, attributes);
         let start = Instant::now();
         let encoded_blobs = self.encode_blobs(walrus_store_blobs, store_args.encoding_type)?;
         store_args.maybe_observe_encoding_latency(start.elapsed());
@@ -894,7 +900,7 @@ impl Client<SuiContractClient> {
             .map(|(_, blob)| blob.as_slice())
             .collect::<Vec<_>>();
         let walrus_store_blobs =
-            WalrusStoreBlob::<String>::default_unencoded_blobs_from_slice(&blobs);
+            WalrusStoreBlob::<String>::default_unencoded_blobs_from_slice(&blobs, &[]);
 
         let encoded_blobs = self.encode_blobs(walrus_store_blobs, store_args.encoding_type)?;
 
@@ -936,7 +942,7 @@ impl Client<SuiContractClient> {
         store_args: &StoreArgs,
     ) -> ClientResult<Vec<BlobStoreResult>> {
         let walrus_store_blobs =
-            WalrusStoreBlob::<String>::default_unencoded_blobs_from_slice(blobs);
+            WalrusStoreBlob::<String>::default_unencoded_blobs_from_slice(blobs, &[]);
 
         let encoded_blobs = self.encode_blobs(walrus_store_blobs, store_args.encoding_type)?;
 
